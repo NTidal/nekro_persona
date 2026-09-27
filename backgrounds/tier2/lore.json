@@ -1,0 +1,33 @@
+{
+  "character": "示例角色",
+  "tier": 2,
+  "note": "2 档＝细节级，**提到才检索注入**。匹配顺序：triggers 关键词优先，未命中则走向量检索（以最近消息原文作 query，阈值见 TIER2_SIM_THRESHOLD，默认 0.35）。单轮最多注入 MAX_TIER2_ENTRIES 条 / MAX_TIER2_CHARS 字符。",
+  "entries": [
+    {
+      "id": "passerby_a",
+      "title": "路人甲",
+      "weight": 3,
+      "enabled": true,
+      "triggers": [
+        "路人甲",
+        "邻居",
+        "好人"
+      ],
+      "content": "路人甲是个好人。上次我搬东西，他二话不说就来帮忙，搬完连水都没喝就走了。这条演示「提到关键词才会注入的细节级记忆」：triggers 命中时取用，没提到就不会占用提示词预算。",
+      "min_favor": 0
+    },
+    {
+      "id": "rainy_day",
+      "title": "那天下雨",
+      "weight": 2,
+      "enabled": true,
+      "triggers": [
+        "下雨",
+        "雨伞",
+        "那天"
+      ],
+      "content": "有天下大雨，我没带伞，在便利店门口站了很久，等雨小了才走回去。这是件小事，只有聊到下雨或者提到那天时才想得起来。min_favor=20 表示：关系到「亲近」档以上才会讲这条。",
+      "min_favor": 20
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 插件运行数据与备份（不要提交自己的记忆内容）
+*.bak
+*.tgz
+*.tmp
+*.log
+Zone.Identifier*
+
+# 运行期向量缓存（写在数据目录，正常情况下不会出现在包里）
+.vec_cache.json
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
