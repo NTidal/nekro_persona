@@ -1077,6 +1077,23 @@
         <div class="head-actions"><span id="rulesDirtyBadge" class="badge warning" hidden>有未保存修改</span></div>
       </div>
 
+      <section class="panel rule-section" data-rule-section="backup">
+        <div class="panel-head">
+          <div><h2 class="panel-title">导入 / 导出</h2><div class="panel-subtitle">整套人设打包成 zip：1/2/3 档 + 门控 + 人设文本。用于入库（GitHub）或实例间迁移。</div></div>
+        </div>
+        <div class="panel-body rule-grid">
+          <div class="config-box">
+            <button class="btn" id="exportPersonaBtn" type="button">导出整套人设（zip）</button>
+            <div class="hint" style="margin-top:8px">包含 backgrounds/tier1、tier2、tier3、favor.json、preset.md 与元信息。解压后即是仓库目录结构。</div>
+          </div>
+          <div class="config-box">
+            <input id="importPersonaFile" class="field" type="file" accept=".zip">
+            <button class="btn primary" id="importPersonaBtn" type="button" style="margin-top:8px">导入并覆盖</button>
+            <div class="hint" style="margin-top:8px">导入前自动备份当前文件到 persona_import_backups/；包内 JSON 必须合法，否则整体拒绝。</div>
+          </div>
+        </div>
+      </section>
+
       <section class="panel rule-section" data-rule-section="scale">
         <div class="panel-head">
           <div><h2 class="panel-title">好感度松紧档位</h2><div class="panel-subtitle">一档决定：单次上限、最小间隔、每日加减上限、边际递减曲线、理由校验强度。</div></div>
@@ -2615,7 +2632,7 @@ function wireEvents() {
   $$('.nav-item').forEach(button => button.addEventListener('click', () => activateTab(button.dataset.tab)));
   $('#globalRefresh').addEventListener('click', refreshCurrent);
   window.addEventListener('hashchange', () => activateTab((location.hash || '#overview').slice(1), { fromHash: true }));
-  $('#overviewContent').addEventListener('click', event => {
+  $('#page-overview').addEventListener('click', event => {
     const jump = event.target.closest('[data-jump]');
     if (jump) activateTab(jump.dataset.jump);
     const retry = event.target.closest('[data-retry]');
@@ -2861,6 +2878,48 @@ function wireEvents() {
   $('#scoreForm').addEventListener('input', () => { state.dialogDirty = true; });
 
   $$('[data-save-rule]').forEach(button => button.addEventListener('click', () => saveRule(button.dataset.saveRule, button)));
+
+  const personaExportBtn = $('#exportPersonaBtn');
+  if (personaExportBtn) personaExportBtn.addEventListener('click', async () => {
+    await withButton(personaExportBtn, async () => {
+      try {
+        const resp = await fetch('./api/backup/export', { headers: { 'X-WebUI-Key': getAccessKey() || '' } });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const blob = await resp.blob();
+        const m = (resp.headers.get('content-disposition') || '').match(/filename="?([^";]+)"?/);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = m ? m[1] : 'persona_bundle.zip';
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+        toast('已导出整套人设（zip）', 'ok');
+      } catch (error) { toast(`导出失败：${error.message}`, 'error'); }
+    });
+  });
+
+  const personaImportFile = $('#importPersonaFile');
+  const personaImportBtn = $('#importPersonaBtn');
+  if (personaImportBtn) personaImportBtn.addEventListener('click', async () => {
+    const file = (personaImportFile.files || [])[0];
+    if (!file) { toast('请先选择 .zip 包', 'error'); return; }
+    if (!confirm('导入会覆盖当前的 1/2/3 档与门控文件（会先自动备份）。确定继续？')) return;
+    await withButton(personaImportBtn, async () => {
+      try {
+        const resp = await fetch('./api/backup/import', {
+          method: 'POST',
+          headers: { 'X-WebUI-Key': getAccessKey() || '', 'Content-Type': 'application/zip' },
+          body: file,
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok || !data || data.ok !== true) {
+          throw new Error((data && data.detail) || ('HTTP ' + resp.status));
+        }
+        toast('导入成功：' + (data.applied || []).join('、'), 'ok');
+        if (typeof loadRules === 'function') { await loadRules(); }
+      } catch (error) { toast(`导入失败：${error.message}`, 'error'); }
+    });
+  });
+
   $('#addStage').addEventListener('click', () => {
     const stages = collectStages();
     const previous = stages.length ? Number(stages[stages.length - 1].max || 0) : -1;

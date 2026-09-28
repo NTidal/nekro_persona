@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 BG_DIR = Path(__file__).parent / "backgrounds"   # 兜底；实际在 build_router 里按插件数据目录覆盖
 # 合法档位（扩展：新增 tier3 世界知识）
@@ -1260,6 +1260,167 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "action": action,
             "id": result_id,
             "total": len(state.memos),
+        }
+
+    @router.get("/api/backup/export", summary="导出整套人设（zip 包）")
+    async def api_backup_export(request: Request):
+        _check_key(request)
+        import io as _io
+        import zipfile as _zipfile
+        from datetime import datetime as _datetime
+
+        from fastapi.responses import Response as _Resp
+
+        try:
+            await memory.ensure_loaded()
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        files = [
+            ("backgrounds/tier1/core.json", BG_DIR / "tier1" / "core.json"),
+            ("backgrounds/tier2/lore.json", BG_DIR / "tier2" / "lore.json"),
+            ("backgrounds/tier3/world.json", BG_DIR / "tier3" / "world.json"),
+            ("backgrounds/favor.json", BG_DIR / "favor.json"),
+        ]
+        buf = _io.BytesIO()
+        stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
+        counts: Dict[str, Any] = {}
+        with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as zf:
+            meta: Dict[str, Any] = {
+                "bundle_version": 1,
+                "plugin": str(plugin.key),
+                "exported_at": _datetime.now().isoformat(timespec="seconds"),
+                "files": counts,
+            }
+            for arc, fp in files:
+                if not fp.is_file():
+                    continue
+                raw = fp.read_bytes()
+                zf.writestr(arc, raw)
+                try:
+                    counts[arc] = len(json.loads(raw.decode("utf-8")).get("entries") or [])
+                except Exception:  # noqa: BLE001
+                    counts[arc] = -1
+            try:
+                from nekro_agent.models.db_preset import DBPreset
+
+                for row in await DBPreset.all():
+                    text = str(row.content or "").replace("\\n", "\n")
+                    if not text.strip():
+                        continue
+                    zf.writestr(f"presets/{row.id}.md", text)
+                    meta.setdefault("presets", []).append(
+                        {"id": row.id, "name": row.name, "chars": len(text)},
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+            zf.writestr("persona.bundle.json", json.dumps(meta, ensure_ascii=False, indent=1))
+        data = buf.getvalue()
+        return _Resp(
+            content=data,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="persona_bundle_{stamp}.zip"'
+            },
+        )
+
+    @router.post("/api/backup/import", summary="导入整套人设（zip 包）")
+    async def api_backup_import(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        body = await request.body()
+        if not body:
+            raise HTTPException(status_code=400, detail="没有收到文件内容")
+        import io as _io
+        import zipfile as _zipfile
+        from datetime import datetime as _datetime
+
+        try:
+            zf = _zipfile.ZipFile(_io.BytesIO(body))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"不是有效的 zip 包：{exc}") from exc
+        names = set(zf.namelist())
+
+        def _pick(arc: str) -> str | None:
+            for cand in (f"backgrounds/{arc}", arc):
+                if cand in names:
+                    return cand
+            return None
+
+        targets = {
+            "tier1/core.json": BG_DIR / "tier1" / "core.json",
+            "tier2/lore.json": BG_DIR / "tier2" / "lore.json",
+            "tier3/world.json": BG_DIR / "tier3" / "world.json",
+            "favor.json": BG_DIR / "favor.json",
+        }
+        parsed = {}
+        for arc, dst in targets.items():
+            src = _pick(arc)
+            if src is None:
+                continue
+            raw = zf.read(src)
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"{arc} 不是合法 JSON：{exc}")
+            if arc == "favor.json":
+                if not isinstance(data, dict) or "stages" not in data:
+                    raise HTTPException(status_code=400, detail=f"{arc} 缺少 stages，拒绝导入")
+                n = -1
+            else:
+                if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+                    raise HTTPException(status_code=400, detail=f"{arc} 结构不对（缺 entries）")
+                n = len(data["entries"])
+            parsed[arc] = (raw, dst, n)
+        if not parsed:
+            raise HTTPException(
+                status_code=400,
+                detail="包里没有可导入的人设文件（需要 backgrounds/tier1、tier2、tier3 或 favor.json）",
+            )
+
+        # 导入前先备份当前文件
+        stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
+        bdir = BG_DIR.parent / "persona_import_backups" / stamp
+        bdir.mkdir(parents=True, exist_ok=True)
+        for arc, dst in targets.items():
+            if dst.is_file():
+                shutil.copy2(dst, bdir / arc.replace("/", "_"))
+
+        applied = []
+        for arc, (raw, dst, n) in parsed.items():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(raw)
+            applied.append(f"{arc}（{n} 条）" if n >= 0 else f"{arc}")
+        preset_applied = []
+        try:
+            from nekro_agent.models.db_preset import DBPreset
+
+            for n_ in sorted(x for x in names if x.startswith('presets/') and x.endswith('.md')):
+                pid = int(n_.split('/')[-1].split('.')[0])
+                ptext = zf.read(n_).decode('utf-8')
+                if not ptext.strip():
+                    continue
+                content_db = ptext.replace('\\n', '\\\\n')
+                row = await DBPreset.get_or_none(id=pid)
+                if row:
+                    row.content = content_db
+                    await row.save(update_fields=['content'])
+                else:
+                    await DBPreset.create(id=pid, name=f'导入人设 {pid}', content=content_db)
+                preset_applied.append(pid)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"人设文本导入失败：{exc}")
+
+        reload_state = await _reload_after_write()
+        plugin.logger.info(
+            f"[persona] WebUI 导入整套人设: {list(parsed)} preset={preset_applied}",
+        )
+        return {
+            "ok": True,
+            "applied": applied,
+            "preset_applied": preset_applied,
+            "backup_dir": str(bdir),
+            **reload_state,
         }
 
     @router.post("/api/reload", summary="重载背景记忆")
