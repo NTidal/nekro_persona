@@ -196,6 +196,21 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             _write_trash(records)
             return trash_record
 
+    def _tier1_cfg() -> Dict[str, Any]:
+        """1 档运行参数（来自插件配置）。"""
+        return {
+            "max_chars": int(getattr(config, "TIER1_MAX_CHARS", 2000) or 2000),
+        }
+
+    def _tier2_cfg() -> Dict[str, Any]:
+        """2 档运行参数（来自插件配置）。"""
+        return {
+            "max_entries": int(getattr(config, "TIER2_MAX_ENTRIES", 2) or 2),
+            "max_chars": int(getattr(config, "TIER2_MAX_CHARS", 500) or 500),
+            "threshold": float(getattr(config, "TIER2_SIM_THRESHOLD", 0.35) or 0.35),
+            "scan_msgs": int(getattr(config, "TIER2_SCAN_MSGS", 6) or 6),
+        }
+
     def _t3_cfg() -> Dict[str, Any]:
         """3 档运行参数（来自插件配置，扩展）。"""
         return {
@@ -415,12 +430,14 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         t1, t2 = memory._state["tier1"], memory._state["tier2"]
         t3 = memory._state.get("tier3", [])
         vecs3 = memory._state.get("tier3_vecs", [])
+        t1s = memory.tier1_settings(_tier1_cfg())
+        t2s = memory.tier2_settings(_tier2_cfg())
         t3s = memory.tier3_settings(_t3_cfg())
         t1_chars = sum(
             len(str(e.get("content", ""))) + len(str(e.get("trigger", ""))) for e in t1
         )
         t1_rendered_chars = sum(_entry_render_chars(e) for e in t1)
-        t1_limit = int(memory.MAX_TIER1_CHARS)
+        t1_limit = int(t1s["max_chars"])
         vecs = memory._state["tier2_vecs"]
 
         def _dist(entries: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -449,9 +466,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "tier2": {
                 "count": len(t2),
                 "vectors": sum(1 for v in vecs if v),
-                "threshold": memory.TIER2_SIM_THRESHOLD,
-                "max_entries": memory.MAX_TIER2_ENTRIES,
-                "max_chars": memory.MAX_TIER2_CHARS,
+                "threshold": t2s["threshold"],
+                "max_entries": t2s["max_entries"],
+                "max_chars": t2s["max_chars"],
+                "scan_msgs": t2s["scan_msgs"],
             },
             "tier3": {
                 "count": len(t3),
@@ -459,6 +477,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "threshold": t3s["threshold"],
                 "max_entries": t3s["max_entries"],
                 "max_chars": t3s["max_chars"],
+                "scan_msgs": t3s["scan_msgs"],
                 "enabled": t3s["enabled"],
                 "gated": False,
                 "label": _TIER_LABEL["tier3"],
@@ -938,7 +957,8 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         cfg = memory.load_favor_cfg()
         gating = bool(cfg) and bool(cfg.get("enabled", True))
         text = await memory.render_memory_block(
-            ctx, effective_score, gating=gating, tier3_cfg=_t3_cfg(),
+            ctx, effective_score, gating=gating,
+            tier1_cfg=_tier1_cfg(), tier2_cfg=_tier2_cfg(), tier3_cfg=_t3_cfg(),
         )
         return {
             "chat_key": chat_key,
@@ -957,7 +977,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "tier3_count": len(memory._state.get("tier3", [])),
                 "tier3_hit": str(memory._state.get("last_hit_tier3") or ""),
                 "tier3_enabled": memory.tier3_settings(_t3_cfg())["enabled"],
-                "message_scan_limit": int(getattr(memory, "TIER2_SCAN_MSGS", 6)),
+                "message_scan_limit": int(memory.tier2_settings(_tier2_cfg())["scan_msgs"]),
             },
         }
 
@@ -977,6 +997,12 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "RECOVER_ENABLED": (bool, None, None),
             "RECOVER_INTERVAL_HOURS": (int, 1, 168),
             "RECOVER_PERCENT": (int, 1, 50),
+            # 扩展：1/2 档预算与阈值（原先写死在 memory.py）
+            "TIER1_MAX_CHARS": (int, 100, 10000),
+            "TIER2_MAX_ENTRIES": (int, 1, 10),
+            "TIER2_MAX_CHARS": (int, 50, 3000),
+            "TIER2_SIM_THRESHOLD": (float, 0.0, 1.0),
+            "TIER2_SCAN_MSGS": (int, 1, 30),
             # 扩展：3 档（世界知识）
             "TIER3_ENABLED": (bool, None, None),
             "TIER3_MAX_ENTRIES": (int, 1, 10),

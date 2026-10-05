@@ -32,6 +32,8 @@ from nekro_agent.core.logger import get_sub_logger
 logger = get_sub_logger("persona_memory")
 
 # ---------------- 预算与阈值 ----------------
+# 这些是**默认值**：运行时由 plugin.py 的配置项覆盖（见 tier1_settings / tier2_settings）。
+# 保留模块级常量是为了：① 老代码/第三方 import 不炸；② 单测可直接引用默认值。
 MAX_TIER1_CHARS = 2000       # 1 档硬上限，超限按 weight 降序截断
 MAX_TIER2_ENTRIES = 2        # 2 档单轮最多注入条数
 MAX_TIER2_CHARS = 500        # 2 档单轮字符预算
@@ -118,6 +120,29 @@ _state: Dict[str, Any] = {
     "last_hit": "",
     "last_hit_tier3": "",
 }
+
+
+def tier1_settings(override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """1 档运行参数（配置可覆盖模块默认值）。
+
+    1 档是「每轮直接注入、静态不变」的身份级记忆，**不涉及检索**，
+    所以只有字符预算一项，没有阈值 / 扫描条数。
+    """
+    o = override or {}
+    return {
+        "max_chars": max(50, int(o.get("max_chars", MAX_TIER1_CHARS) or MAX_TIER1_CHARS)),
+    }
+
+
+def tier2_settings(override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """2 档运行参数（配置可覆盖模块默认值）。"""
+    o = override or {}
+    return {
+        "max_entries": max(1, int(o.get("max_entries", MAX_TIER2_ENTRIES) or MAX_TIER2_ENTRIES)),
+        "max_chars": max(50, int(o.get("max_chars", MAX_TIER2_CHARS) or MAX_TIER2_CHARS)),
+        "threshold": float(o.get("threshold", TIER2_SIM_THRESHOLD) or TIER2_SIM_THRESHOLD),
+        "scan_msgs": max(1, int(o.get("scan_msgs", TIER2_SCAN_MSGS) or TIER2_SCAN_MSGS)),
+    }
 
 
 def tier3_settings(override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -494,7 +519,7 @@ def render_rubric() -> str:
 
 
 # ---------------- 渲染 ----------------
-def _render_tier1(entries: List[Dict[str, Any]]) -> str:
+def _render_tier1(entries: List[Dict[str, Any]], max_chars: int = MAX_TIER1_CHARS) -> str:
     lines: List[str] = []
     used = 0
     dropped = 0
@@ -504,14 +529,14 @@ def _render_tier1(entries: List[Dict[str, Any]]) -> str:
             continue
         trig = str(e.get("trigger", "")).strip()
         block = f"· {trig}\n  {content}" if trig else f"· {content}"
-        if used + len(block) > MAX_TIER1_CHARS:
+        if used + len(block) > max_chars:
             dropped += 1
             continue
         lines.append(block)
         used += len(block)
     if dropped:
         logger.warning(
-            f"[persona] 1 档超出上限 {MAX_TIER1_CHARS} 字符，"
+            f"[persona] 1 档超出上限 {max_chars} 字符，"
             f"本轮按 weight 降序截断丢弃 {dropped} 条（请考虑降档到 tier2）",
         )
     if not lines:
@@ -607,17 +632,24 @@ async def _vector_hits(
     return [s for s in scored if s[0] >= threshold]
 
 
-async def _match_tier2(ctx: Any) -> Tuple[List[Dict[str, Any]], str]:
-    """返回 (命中条目, 命中方式)。关键词优先，未命中再走向量。"""
+async def _match_tier2(
+    ctx: Any,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """返回 (命中条目, 命中方式)。关键词优先，未命中再走向量。
+
+    cfg: 2 档运行参数（scan_msgs / threshold），缺省用模块默认值。
+    """
+    s = tier2_settings(cfg)
     if not _state["tier2"]:
         return [], ""
-    text = await _recent_text(ctx)
+    text = await _recent_text(ctx, limit=int(s["scan_msgs"]))
     if not text:
         return [], ""
     hits = _keyword_hits(text)
     if hits:
         return hits, "keyword"
-    vh = await _vector_hits(text)
+    vh = await _vector_hits(text, threshold=s["threshold"])
     return [e for _s, e in vh], "vector"
 
 
@@ -638,14 +670,18 @@ async def _match_tier3(ctx: Any, cfg: Dict[str, Any]) -> Tuple[List[Dict[str, An
     return [e for _s, e in vh], "vector"
 
 
-def _render_tier2(entries: List[Dict[str, Any]]) -> str:
+def _render_tier2(
+    entries: List[Dict[str, Any]],
+    max_entries: int = MAX_TIER2_ENTRIES,
+    max_chars: int = MAX_TIER2_CHARS,
+) -> str:
     lines: List[str] = []
     used = 0
-    for e in entries[:MAX_TIER2_ENTRIES]:
+    for e in entries[:max_entries]:
         content = str(e.get("content", "")).strip()
         if not content:
             continue
-        if used + len(content) > MAX_TIER2_CHARS:
+        if used + len(content) > max_chars:
             break
         lines.append(f"· {content}")
         used += len(content)
@@ -708,6 +744,8 @@ async def render_memory_block(
     score: int,
     gating: bool = True,
     tier3_cfg: Optional[Dict[str, Any]] = None,
+    tier1_cfg: Optional[Dict[str, Any]] = None,
+    tier2_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """渲染记忆块（1 档 + 2 档 + 3 档 + 门控回避）。
 
@@ -715,11 +753,18 @@ async def render_memory_block(
         ctx: AgentCtx
         score: 当前用户好感度（gating=False 时忽略）
         gating: 是否启用好感度门控（**只作用于 1/2 档**）
+        tier1_cfg: 1 档运行参数（max_chars）
+        tier2_cfg: 2 档运行参数（max_entries/max_chars/threshold/scan_msgs）
         tier3_cfg: 3 档运行参数（enabled/max_entries/max_chars/threshold/scan_msgs）
 
+    三档预算与阈值全部由配置注入（缺省回落模块默认值），
+    模块内不再有硬编码的魔法数字。
     3 档（世界知识）刻意**不参与好感度门控**：常识不该因为不熟就不说。
     """
     await ensure_loaded()
+
+    t1s = tier1_settings(tier1_cfg)
+    t2s = tier2_settings(tier2_cfg)
 
     parts: List[str] = []
     blocked: List[Dict[str, Any]] = []
@@ -729,20 +774,20 @@ async def render_memory_block(
         blocked.extend(t1_blk)
     else:
         t1_ok = _state["tier1"]
-    t1 = _render_tier1(t1_ok)
+    t1 = _render_tier1(t1_ok, t1s["max_chars"])
     if t1:
         parts.append(t1)
 
-    hits, src = await _match_tier2(ctx)
+    hits, src = await _match_tier2(ctx, t2s)
     if hits:
         if gating:
             t2_ok, t2_blk = split_by_favor(hits, score)
             blocked.extend(t2_blk)
         else:
             t2_ok = hits
-        t2 = _render_tier2(t2_ok)
+        t2 = _render_tier2(t2_ok, t2s["max_entries"], t2s["max_chars"])
         if t2:
-            names = ",".join(str(e.get("id", "?")) for e in t2_ok[:MAX_TIER2_ENTRIES])
+            names = ",".join(str(e.get("id", "?")) for e in t2_ok[: t2s["max_entries"]])
             _state["last_hit"] = f"{src}:{names}"
             logger.info(f"[persona] 2 档命中({src}): {names}")
             parts.append(t2)
@@ -779,7 +824,11 @@ async def render_memory_block(
     return "\n\n".join(parts)
 
 
-def status(tier3_cfg: Optional[Dict[str, Any]] = None) -> str:
+def status(
+    tier3_cfg: Optional[Dict[str, Any]] = None,
+    tier1_cfg: Optional[Dict[str, Any]] = None,
+    tier2_cfg: Optional[Dict[str, Any]] = None,
+) -> str:
     """状态摘要（供管理工具返回）。"""
     t1, t2, t3 = _state["tier1"], _state["tier2"], _state["tier3"]
     t1_chars = sum(len(str(e.get("content", ""))) + len(str(e.get("trigger", ""))) for e in t1)
@@ -788,10 +837,12 @@ def status(tier3_cfg: Optional[Dict[str, Any]] = None) -> str:
     g1 = sum(1 for e in t1 if int(e.get("min_favor", 0) or 0) > 0)
     g2 = sum(1 for e in t2 if int(e.get("min_favor", 0) or 0) > 0)
     cfg = load_favor_cfg()
+    t1s = tier1_settings(tier1_cfg)
+    t2s = tier2_settings(tier2_cfg)
     t3s = tier3_settings(tier3_cfg)
     return (
-        f"1 档 {len(t1)} 条（{t1_chars}/{MAX_TIER1_CHARS} 字符，{g1} 条受门控），"
-        f"2 档 {len(t2)} 条（向量 {vec_ok} 条，阈值 {TIER2_SIM_THRESHOLD}，{g2} 条受门控），"
+        f"1 档 {len(t1)} 条（{t1_chars}/{t1s['max_chars']} 字符，{g1} 条受门控），"
+        f"2 档 {len(t2)} 条（向量 {vec_ok} 条，阈值 {t2s['threshold']}，{g2} 条受门控），"
         f"3 档 {len(t3)} 条（向量 {vec3_ok} 条，阈值 {t3s['threshold']}，"
         f"{'启用' if t3s['enabled'] else '停用'}，不受门控）。"
         f"门控配置：{'启用' if cfg.get('enabled', True) else '关闭'}"

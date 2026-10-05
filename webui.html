@@ -1361,6 +1361,7 @@ const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selec
 const state = {
   tab: 'overview',
   overview: null,
+  budgetDirty: false,
   memory: { tier: 'tier1', data: { tier1: [], tier2: [], tier3: [], stages: [] } },
   trash: [],
   lastTrashId: '',
@@ -1445,7 +1446,8 @@ function updateMemoryBudget() {
     const t3 = state.overview?.tier3 || {};
     hint.innerHTML = `<div>3 档为<b>世界知识</b>（客观见闻，非她的回忆），按需检索；单轮预算 ${Number(t3.max_entries || 3)} 条 / ${Number(t3.max_chars || 700)} 字，阈值 ${escapeHtml(t3.threshold ?? '—')}。<b>不受好感度门控</b>。本条约 ${contentLength} 字。</div>`;
   } else {
-    hint.innerHTML = `<div>2 档为按需检索；单轮预算为 2 条 / 500 字。本条内容约 ${contentLength} 字。</div>`;
+    const t2 = state.overview?.tier2 || {};
+    hint.innerHTML = `<div>2 档为按需检索；单轮预算 ${Number(t2.max_entries || 2)} 条 / ${Number(t2.max_chars || 500)} 字，阈值 ${escapeHtml(t2.threshold ?? '—')}。本条内容约 ${contentLength} 字。</div>`;
   }
 }
 function formatTime(timestamp) {
@@ -1713,12 +1715,32 @@ function renderOverview(data) {
         </div>
       </section>
       <section class="panel">
-        <div class="panel-head"><div><h2 class="panel-title">门控与安全</h2><div class="panel-subtitle">控制背景记忆的披露深度</div></div>${gating.enabled ? '<span class="badge success">已启用</span>' : '<span class="badge warning">已关闭</span>'}</div>
+        <div class="panel-head"><div><h2 class="panel-title">三档预算与阈值</h2><div class="panel-subtitle">直接写回插件配置，保存后立即生效</div></div><div class="panel-actions"><span id="budgetDirtyBadge" class="badge warning" hidden>有未保存修改</span><button class="btn primary" id="saveBudget" type="button">保存预算</button></div></div>
         <div class="panel-body">
-          <div class="status-line"><span class="status-name">单轮 2 档预算</span><span class="status-value">${Number(tier2.max_entries || 0)} 条 / ${Number(tier2.max_chars || 0)} 字</span></div>
-          <div class="status-line"><span class="status-name">单轮 3 档预算</span><span class="status-value">${Number(tier3.max_entries || 0)} 条 / ${Number(tier3.max_chars || 0)} 字 · 阈值 ${escapeHtml(tier3.threshold ?? '—')}</span></div>
-          <div class="status-line"><span class="status-name">防黑规则</span><span class="status-value">${escapeHtml((data.guard || {}).desc || '—')}</span></div>
+          <div class="hint" style="margin-bottom:7px">1 档 · 常驻（身份级，只有字符预算）</div>
+          <div class="field-grid-3">
+            <label class="field-label">字符预算<input id="budgetTier1Chars" class="field" type="number" min="100" max="10000" step="50" aria-label="1 档字符预算"></label>
+          </div>
+          <div class="hint" style="margin:14px 0 7px">2 档 · 按需检索（细节级）</div>
+          <div class="field-grid-3">
+            <label class="field-label">单轮条数上限<input id="budgetTier2Entries" class="field" type="number" min="1" max="10" aria-label="2 档条数上限"></label>
+            <label class="field-label">单轮字符预算<input id="budgetTier2Chars" class="field" type="number" min="50" max="3000" step="50" aria-label="2 档字符预算"></label>
+            <label class="field-label">向量阈值<input id="budgetTier2Threshold" class="field" type="number" min="0" max="1" step="0.01" aria-label="2 档向量阈值"></label>
+            <label class="field-label">扫描消息条数<input id="budgetTier2Scan" class="field" type="number" min="1" max="30" aria-label="2 档扫描条数"></label>
+          </div>
+          <div class="switch-row" style="margin-top:14px">
+            <div class="switch-copy"><strong>启用 3 档 · 世界知识</strong><small>关闭后完全不检索、不注入（不受好感度门控）</small></div>
+            <label class="switch"><input id="budgetTier3Enabled" type="checkbox" aria-label="启用 3 档世界知识"><span></span></label>
+          </div>
+          <div class="field-grid-3">
+            <label class="field-label">单轮条数上限<input id="budgetTier3Entries" class="field" type="number" min="1" max="10" aria-label="3 档条数上限"></label>
+            <label class="field-label">单轮字符预算<input id="budgetTier3Chars" class="field" type="number" min="100" max="3000" step="50" aria-label="3 档字符预算"></label>
+            <label class="field-label">向量阈值<input id="budgetTier3Threshold" class="field" type="number" min="0" max="1" step="0.01" aria-label="3 档向量阈值"></label>
+            <label class="field-label">扫描消息条数<input id="budgetTier3Scan" class="field" type="number" min="1" max="30" aria-label="3 档扫描条数"></label>
+          </div>
+          <div class="status-line" style="margin-top:14px"><span class="status-name">防黑规则</span><span class="status-value">${escapeHtml((data.guard || {}).desc || '—')}</span></div>
           <div class="status-line"><span class="status-name">最近命中</span><span class="status-value mono">${escapeHtml(data.last_hit || '暂无')}</span></div>
+          <div class="overview-note" style="margin-top:12px"><div>1 档每轮直接注入，只受字符预算约束（不检索，故无阈值/扫描项）；2/3 档提到才检索。<strong>阈值越低越容易命中，噪声也越多</strong>——条目变多后噪声上限会上升，需要重新标定。</div></div>
         </div>
       </section>
     </div>
@@ -1736,6 +1758,56 @@ function renderOverview(data) {
       <div class="table-wrap"><table class="data-table"><thead><tr><th>量级</th><th>场景</th></tr></thead><tbody>${rubricRows}</tbody></table></div>
       ${(rubric.rules || []).length ? `<div class="panel-body muted" style="border-top:1px solid var(--line);font-size:10px">${escapeHtml(rubric.rules.join('；'))}</div>` : ''}
     </section>`;
+  fillBudgetInputs({ tier1, tier2, tier3 });
+}
+
+/** 把概览里的三档参数填进「三档预算与阈值」表单（不覆盖用户正在编辑的脏值）。 */
+function fillBudgetInputs(data) {
+  if (state.budgetDirty) return;
+  const t1 = data.tier1 || {}, t2 = data.tier2 || {}, t3 = data.tier3 || {};
+  const set = (sel, value) => { const el = $(sel); if (el) el.value = value; };
+  set('#budgetTier1Chars', Number(t1.limit ?? 2000));
+  set('#budgetTier2Entries', Number(t2.max_entries ?? 2));
+  set('#budgetTier2Chars', Number(t2.max_chars ?? 500));
+  set('#budgetTier2Threshold', Number(t2.threshold ?? 0.35));
+  set('#budgetTier2Scan', Number(t2.scan_msgs ?? 6));
+  const enabled = $('#budgetTier3Enabled');
+  if (enabled) enabled.checked = t3.enabled !== false;
+  set('#budgetTier3Entries', Number(t3.max_entries ?? 3));
+  set('#budgetTier3Chars', Number(t3.max_chars ?? 700));
+  set('#budgetTier3Threshold', Number(t3.threshold ?? 0.35));
+  set('#budgetTier3Scan', Number(t3.scan_msgs ?? 6));
+  state.budgetDirty = false;
+  syncBudgetDirty();
+}
+
+function syncBudgetDirty() {
+  const badge = $('#budgetDirtyBadge');
+  if (badge) badge.hidden = !state.budgetDirty;
+}
+
+/** 收集并校验三档预算表单，返回可直接 POST /api/config 的 body。 */
+function collectBudget() {
+  const num = (selector, min, max, label, isFloat) => {
+    const raw = ($(selector)?.value ?? '').trim();
+    const value = Number(raw);
+    if (!raw || !Number.isFinite(value) || value < min || value > max) {
+      throw new Error(`${label}必须在 ${min} ~ ${max} 之间`);
+    }
+    return isFloat ? value : Math.round(value);
+  };
+  return {
+    TIER1_MAX_CHARS: num('#budgetTier1Chars', 100, 10000, '1 档字符预算'),
+    TIER2_MAX_ENTRIES: num('#budgetTier2Entries', 1, 10, '2 档条数上限'),
+    TIER2_MAX_CHARS: num('#budgetTier2Chars', 50, 3000, '2 档字符预算'),
+    TIER2_SIM_THRESHOLD: num('#budgetTier2Threshold', 0, 1, '2 档向量阈值', true),
+    TIER2_SCAN_MSGS: num('#budgetTier2Scan', 1, 30, '2 档扫描条数'),
+    TIER3_ENABLED: Boolean($('#budgetTier3Enabled')?.checked),
+    TIER3_MAX_ENTRIES: num('#budgetTier3Entries', 1, 10, '3 档条数上限'),
+    TIER3_MAX_CHARS: num('#budgetTier3Chars', 100, 3000, '3 档字符预算'),
+    TIER3_SIM_THRESHOLD: num('#budgetTier3Threshold', 0, 1, '3 档向量阈值', true),
+    TIER3_SCAN_MSGS: num('#budgetTier3Scan', 1, 30, '3 档扫描条数')
+  };
 }
 
 async function loadMemory(options = {}) {
@@ -2637,6 +2709,43 @@ function wireEvents() {
     if (jump) activateTab(jump.dataset.jump);
     const retry = event.target.closest('[data-retry]');
     if (retry?.dataset.retry === 'overview') loadOverview();
+  });
+
+  // 三档预算：用事件委托绑定 —— #overviewContent 每次 loadOverview 都会重建，
+  // 直接给元素 addEventListener 会在重绘后失效（实测：改动不触发脏标记、保存无效）。
+  const budgetSelectors = ['#budgetTier1Chars', '#budgetTier2Entries', '#budgetTier2Chars',
+    '#budgetTier2Threshold', '#budgetTier2Scan', '#budgetTier3Enabled', '#budgetTier3Entries',
+    '#budgetTier3Chars', '#budgetTier3Threshold', '#budgetTier3Scan'];
+  const markBudgetDirty = event => {
+    if (event.target.closest?.(budgetSelectors.join(','))) {
+      state.budgetDirty = true;
+      syncBudgetDirty();
+    }
+  };
+  $('#overviewContent').addEventListener('input', markBudgetDirty);
+  $('#overviewContent').addEventListener('change', markBudgetDirty);
+  $('#overviewContent').addEventListener('click', async event => {
+    const button = event.target.closest('#saveBudget');
+    if (!button) return;
+    let body;
+    try {
+      body = collectBudget();
+    } catch (error) {
+      toast(error.message, 'error');
+      return;
+    }
+    button.disabled = true;
+    try {
+      await api('config', { method: 'POST', body });
+      state.budgetDirty = false;
+      syncBudgetDirty();
+      toast('预算已保存并生效', 'success');
+      await loadOverview({ quiet: true });
+    } catch (error) {
+      toast(`保存失败：${error.message}`, 'error');
+    } finally {
+      button.disabled = false;
+    }
   });
 
   $('#memorySearch').addEventListener('input', renderMemory);

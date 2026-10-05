@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控",
-    version="1.3.0",
+    version="1.4.0",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -132,6 +132,31 @@ class FavorabilityConfig(ConfigBase):
     )
 
     # ==================== 三档记忆 ====================
+    TIER1_MAX_CHARS: int = _fav_field(
+        2000, "1 档单轮字符预算",
+        "身份级记忆每轮直接注入，这是其硬上限；超出按 weight 降序截断（被丢弃的条目请考虑降到 2 档）。",
+        en_title="Tier 1 Char Budget",
+        en_desc="Hard cap for always-injected identity memories; overflow is dropped by weight",
+    )
+    TIER2_MAX_ENTRIES: int = _fav_field(
+        2, "2 档单轮条数上限", "单轮最多注入几条「想起来的往事」",
+        en_title="Tier 2 Entry Limit", en_desc="Max tier 2 entries injected per turn",
+    )
+    TIER2_MAX_CHARS: int = _fav_field(
+        500, "2 档单轮字符预算", "单轮注入的 2 档记忆字符数上限",
+        en_title="Tier 2 Char Budget", en_desc="Char budget for tier 2 injection per turn",
+    )
+    TIER2_SIM_THRESHOLD: float = _fav_field(
+        0.35, "2 档向量阈值",
+        "细节级记忆的检索阈值。原按 30 条实测标定（噪声上限 0.311 / 相关下限 0.351）；"
+        "条目变多后噪声上限会上升，需要重新标定。",
+        en_title="Tier 2 Similarity Threshold",
+        en_desc="Retrieval threshold for tier 2; recalibrate as the library grows",
+    )
+    TIER2_SCAN_MSGS: int = _fav_field(
+        6, "2 档扫描消息条数", "判断「是否提到」时回看多少条最近消息",
+        en_title="Tier 2 Scan Depth", en_desc="Recent messages scanned to decide whether a topic came up",
+    )
     TIER3_ENABLED: bool = _fav_field(
         True, "启用 3 档（世界知识）",
         "关闭后完全不检索、不注入 3 档。3 档不受好感度门控。",
@@ -601,6 +626,23 @@ def _render_memo_block(state: "ChannelArchive", score: int, recent_text: str) ->
     if not lines:
         return _MEMO_GUIDE if guide_always else ""
     return _MEMO_GUIDE + "\n" + "\n".join(lines)
+
+
+def _tier1_cfg() -> dict:
+    """从插件配置收集 1 档运行参数。"""
+    return {
+        "max_chars": int(getattr(config, "TIER1_MAX_CHARS", 2000) or 2000),
+    }
+
+
+def _tier2_cfg() -> dict:
+    """从插件配置收集 2 档运行参数。"""
+    return {
+        "max_entries": int(getattr(config, "TIER2_MAX_ENTRIES", 2) or 2),
+        "max_chars": int(getattr(config, "TIER2_MAX_CHARS", 500) or 500),
+        "threshold": float(getattr(config, "TIER2_SIM_THRESHOLD", 0.35) or 0.35),
+        "scan_msgs": int(getattr(config, "TIER2_SCAN_MSGS", 6) or 6),
+    }
 
 
 def _tier3_cfg() -> dict:
@@ -1843,7 +1885,8 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
     score = int(profile.score) if profile is not None else 0
     try:
         block = await persona_memory.render_memory_block(
-            _ctx, score, gating=gating, tier3_cfg=_tier3_cfg(),
+            _ctx, score, gating=gating,
+            tier1_cfg=_tier1_cfg(), tier2_cfg=_tier2_cfg(), tier3_cfg=_tier3_cfg(),
         )
         if block:
             parts.append(block)
@@ -2516,7 +2559,9 @@ async def reload_persona_memory(_ctx: schemas.AgentCtx) -> str:
     数据目录＝插件数据目录下的 backgrounds/（可在 WebUI 概览页看到实际路径）。
     """
     await persona_memory.ensure_loaded(force=True)
-    return "背景记忆已重载：" + persona_memory.status(tier3_cfg=_tier3_cfg())
+    return "背景记忆已重载：" + persona_memory.status(
+        tier1_cfg=_tier1_cfg(), tier2_cfg=_tier2_cfg(), tier3_cfg=_tier3_cfg(),
+    )
 
 
 @plugin.mount_router()
