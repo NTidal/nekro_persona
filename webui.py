@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import glob
+import hmac
 import json
 import os
 import shutil
@@ -50,15 +51,25 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
 
     # ---------------- 鉴权 ----------------
     def _check_key(request: Request) -> None:
+        """校验 WebUI 访问密钥。
+
+        安全约束（v1.4.1）：
+        · 只接受 `X-WebUI-Key` 请求头，不再接受 `?key=` 查询参数
+          （查询参数会进访问日志 / 浏览器历史 / Referer，等于泄露密钥）。
+        · 用 hmac.compare_digest 做常数时间比较，避免按字节短路泄露密钥长度与前缀。
+        · 未配置密钥时：只读（GET）放行，写操作（非 GET）一律 403——
+          防止插件路由在 NA 全局鉴权之外「裸奔」改人设记忆与人格预设。
+        """
         expect = str(getattr(config, "WEBUI_ACCESS_KEY", "") or "").strip()
+        got = str(request.headers.get("X-WebUI-Key") or "").strip()
         if not expect:
+            if request.method.upper() != "GET":
+                raise HTTPException(
+                    status_code=403,
+                    detail="未配置 WEBUI_ACCESS_KEY，写操作已禁用；请在插件配置中设置访问密钥后再试",
+                )
             return
-        got = (
-            request.headers.get("X-WebUI-Key")
-            or request.query_params.get("key")
-            or ""
-        ).strip()
-        if got != expect:
+        if not hmac.compare_digest(got, expect):
             raise HTTPException(status_code=401, detail="访问密钥不正确")
 
     # ---------------- 数据读写 ----------------
@@ -494,6 +505,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "dist_tier2": _dist(t2),
             },
             "last_hit": memory._state.get("last_hit", ""),
+            # 写权限状态（v1.4.2）：未配置 WEBUI_ACCESS_KEY 时后端一律 403 拒绝写操作
+            # （v1.4.1 安全约束：插件路由不受 NA 全局鉴权保护，匿名不得改人设）。
+            # 前端据此把「保存」按钮置灰并给出可操作提示，而不是等提交后才吃 403。
+            "writable": bool(str(getattr(config, "WEBUI_ACCESS_KEY", "") or "").strip()),
             "score_limit": {"max_abs": helpers["max_abs_score"]()},
             "scale": {
                 "mode": int(getattr(config, "FAVOR_SCALE_MODE", 2) or 2),

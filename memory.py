@@ -677,14 +677,23 @@ def _render_tier2(
 ) -> str:
     lines: List[str] = []
     used = 0
+    dropped = 0
     for e in entries[:max_entries]:
         content = str(e.get("content", "")).strip()
         if not content:
             continue
+        # 超预算的条目跳过而非 break：否则一条过长记忆会永久阻断其后所有条目，
+        # 且作者收不到任何提示（与 _render_tier1 的截断口径保持一致）。
         if used + len(content) > max_chars:
-            break
+            dropped += 1
+            continue
         lines.append(f"· {content}")
         used += len(content)
+    if dropped:
+        logger.warning(
+            f"[persona] 2 档超出单轮预算 {max_chars} 字符，"
+            f"本轮跳过 {dropped} 条过长记忆（请缩短 content 或提高 TIER2_MAX_CHARS）",
+        )
     if not lines:
         return ""
     return "#想起来的往事\n刚才的话题提到了，你自然想起这些细节，别复述格式。\n" + "\n".join(lines)

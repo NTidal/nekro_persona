@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控",
-    version="1.4.0",
+    version="1.4.3",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -959,49 +959,50 @@ async def _decay_pass() -> int:
         chat_key = row.target_chat_key or ""
         if not chat_key:
             continue
-        try:
-            state = await _open_archive(chat_key)
-        except Exception:  # noqa: BLE001
-            continue
-        changed = False
-        for prof in state.profiles.values():
-            if prof.score <= 0:
+        async with await _archive_lock(chat_key):
+            try:
+                state = await _open_archive(chat_key)
+            except Exception:  # noqa: BLE001
                 continue
-            anchor = max(int(prof.last_interaction_at or 0), int(prof.last_decay_at or 0))
-            if anchor <= 0:
-                continue
-            periods = int((now - anchor) // interval)
-            if periods < 1:
-                continue
-            idle_hours = (now - anchor) / 3600.0
-            stage_before = _stage_of(prof.score)[0]
-            total = 0
-            for _ in range(min(periods, 200)):
-                # 每步重算允许下界：分数跨档后基准跟着变
-                allowed = _decay_floor(prof.score, idle_hours, grace_hours)
-                new_score = _decay_step(prof.score, percent, keep_tier, allowed)
-                if new_score >= prof.score:
-                    break
-                total += prof.score - new_score
-                prof.score = new_score
-            prof.last_decay_at = anchor + periods * interval
-            if total > 0:
-                hours = periods * int(config.DECAY_INTERVAL_HOURS)
-                prof.updated_at = now
-                stage_after = _stage_of(prof.score)[0]
-                if stage_after != stage_before:
-                    prof.last_reason = (
-                        f"{hours} 小时未互动，关系冷却（{stage_before} → {stage_after}）"
-                    )
-                else:
-                    prof.last_reason = f"{hours} 小时未互动，好感度自然衰减"
-                # 扩展：机械结算不写进 recent_events ——
-                # 否则 8 个槽位会被衰减记录吃满，把真实互动挤出去。
-                # 分数变化本身 + last_reason + last_decay_at 已足够追溯。
-                changed = True
-                touched += 1
-        if changed:
-            await _store_archive(chat_key, state)
+            changed = False
+            for prof in state.profiles.values():
+                if prof.score <= 0:
+                    continue
+                anchor = max(int(prof.last_interaction_at or 0), int(prof.last_decay_at or 0))
+                if anchor <= 0:
+                    continue
+                periods = int((now - anchor) // interval)
+                if periods < 1:
+                    continue
+                idle_hours = (now - anchor) / 3600.0
+                stage_before = _stage_of(prof.score)[0]
+                total = 0
+                for _ in range(min(periods, 200)):
+                    # 每步重算允许下界：分数跨档后基准跟着变
+                    allowed = _decay_floor(prof.score, idle_hours, grace_hours)
+                    new_score = _decay_step(prof.score, percent, keep_tier, allowed)
+                    if new_score >= prof.score:
+                        break
+                    total += prof.score - new_score
+                    prof.score = new_score
+                prof.last_decay_at = anchor + periods * interval
+                if total > 0:
+                    hours = periods * int(config.DECAY_INTERVAL_HOURS)
+                    prof.updated_at = now
+                    stage_after = _stage_of(prof.score)[0]
+                    if stage_after != stage_before:
+                        prof.last_reason = (
+                            f"{hours} 小时未互动，关系冷却（{stage_before} → {stage_after}）"
+                        )
+                    else:
+                        prof.last_reason = f"{hours} 小时未互动，好感度自然衰减"
+                    # 扩展：机械结算不写进 recent_events ——
+                    # 否则 8 个槽位会被衰减记录吃满，把真实互动挤出去。
+                    # 分数变化本身 + last_reason + last_decay_at 已足够追溯。
+                    changed = True
+                    touched += 1
+            if changed:
+                await _store_archive(chat_key, state)
     return touched
 
 
@@ -1021,37 +1022,38 @@ async def _recover_pass() -> int:
         chat_key = row.target_chat_key or ""
         if not chat_key:
             continue
-        try:
-            state = await _open_archive(chat_key)
-        except Exception:  # noqa: BLE001
-            continue
-        changed = False
-        for prof in state.profiles.values():
-            if prof.score >= 0:
+        async with await _archive_lock(chat_key):
+            try:
+                state = await _open_archive(chat_key)
+            except Exception:  # noqa: BLE001
                 continue
-            anchor = max(int(prof.last_interaction_at or 0), int(prof.last_recover_at or 0))
-            if anchor <= 0:
-                continue
-            periods = int((now - anchor) // interval)
-            if periods < 1:
-                continue
-            total = 0
-            for _ in range(min(periods, 200)):
-                new_score = _recover_step(prof.score, percent)
-                if new_score <= prof.score:
-                    break
-                total += new_score - prof.score
-                prof.score = new_score
-            prof.last_recover_at = anchor + periods * interval
-            if total > 0:
-                hours = periods * int(config.RECOVER_INTERVAL_HOURS)
-                prof.updated_at = now
-                prof.last_reason = f"{hours} 小时未互动，好感度缓慢回升"
-                # 扩展：同衰减，机械结算不占事件位
-                changed = True
-                touched += 1
-        if changed:
-            await _store_archive(chat_key, state)
+            changed = False
+            for prof in state.profiles.values():
+                if prof.score >= 0:
+                    continue
+                anchor = max(int(prof.last_interaction_at or 0), int(prof.last_recover_at or 0))
+                if anchor <= 0:
+                    continue
+                periods = int((now - anchor) // interval)
+                if periods < 1:
+                    continue
+                total = 0
+                for _ in range(min(periods, 200)):
+                    new_score = _recover_step(prof.score, percent)
+                    if new_score <= prof.score:
+                        break
+                    total += new_score - prof.score
+                    prof.score = new_score
+                prof.last_recover_at = anchor + periods * interval
+                if total > 0:
+                    hours = periods * int(config.RECOVER_INTERVAL_HOURS)
+                    prof.updated_at = now
+                    prof.last_reason = f"{hours} 小时未互动，好感度缓慢回升"
+                    # 扩展：同衰减，机械结算不占事件位
+                    changed = True
+                    touched += 1
+            if changed:
+                await _store_archive(chat_key, state)
     return touched
 
 
@@ -1152,6 +1154,15 @@ class UserArchive:
     last_decay_at: int = 0
     last_recover_at: int = 0
     recent_events: List[ArchiveEvent] = field(default_factory=list)
+    # ---- 每日预算累计器（v1.4.2）----
+    # 与 recent_events 解耦：日限/间隔不再从「最近 8 条事件」反推
+    # （高频调整下旧事件被挤出窗口会导致统计失真，且靠 reason 字符串剔除机械事件太脆）。
+    # day_key   = 当日 0 点时间戳（_day_start_ts），跨天自动归零
+    # day_net   = 当日真实调整的净分值（带符号），机械结算与描述-only 改动不计入
+    # last_adjust_at = 最近一次真实调分的时间戳，用于最小间隔判定
+    day_key: int = 0
+    day_net: int = 0
+    last_adjust_at: int = 0
 
     # ---------- 构造 ----------
     @staticmethod
@@ -1182,6 +1193,9 @@ class UserArchive:
             last_interaction_at=int(data.get("last_interaction_at") or 0),
             last_decay_at=int(data.get("last_decay_at") or 0),
             last_recover_at=int(data.get("last_recover_at") or 0),
+            day_key=int(data.get("day_key") or 0),
+            day_net=int(data.get("day_net") or 0),
+            last_adjust_at=int(data.get("last_adjust_at") or 0),
         )
         item.recent_events = [
             ArchiveEvent.from_raw(x) for x in (data.get("recent_events") or [])
@@ -1202,6 +1216,9 @@ class UserArchive:
             "last_decay_at": self.last_decay_at,
             "last_recover_at": self.last_recover_at,
             "recent_events": [e.to_raw() for e in self.recent_events],
+            "day_key": self.day_key,
+            "day_net": self.day_net,
+            "last_adjust_at": self.last_adjust_at,
         }
 
     # ---------- 变更 ----------
@@ -1223,6 +1240,26 @@ class UserArchive:
         keep = max(1, int(config.MAX_EVENT_HISTORY))
         if len(self.recent_events) > keep:
             self.recent_events = self.recent_events[-keep:]
+
+    def roll_day(self, now: int) -> None:
+        """跨天则把当日累计归零。每次读取 day_net 前先调用。"""
+        dk = _day_start_ts(int(now))
+        if self.day_key != dk:
+            self.day_key = dk
+            self.day_net = 0
+
+    def record_adjust(self, delta: int, now: int) -> None:
+        """记录一次**真实调分**：刷新间隔锚点与当日净累计。
+
+        只有真正改了分数才调用（delta != 0）；机械结算（衰减/回升）与
+        描述-only 改动都不走这里，因此不会污染日预算，也不受 reason 文案影响。
+        """
+        delta = int(delta)
+        if delta == 0:
+            return
+        self.last_adjust_at = int(now)
+        self.roll_day(now)
+        self.day_net += delta
 
     def nudge(self, delta: int, reason: str, *, summary: str = "", hint: str = "",
               tags: object = None, display_name: str = "") -> None:
@@ -1370,6 +1407,27 @@ async def _store_archive(chat_key: str, state: ChannelArchive) -> None:
     """写回频道档案。"""
     await store.set(chat_key=chat_key, store_key=STATE_KEY,
                     value=json.dumps(state.to_raw(), ensure_ascii=False))
+
+
+# ---- 频道档案并发锁（v1.4.2）----
+# _open_archive → 改 → _store_archive 是整 blob 的 read-modify-write。
+# sync_user_profile（每条消息）、衰减/回升循环（每 30 分钟全库）、WebUI 与
+# LLM 工具都会写同一 blob；不加锁时并发写会 last-writer-wins 丢更新
+# （典型：衰减刚扣的分被并发的 sync 用旧 blob 覆盖回去）。
+# 用 per-chat_key 的 asyncio.Lock 把每个频道的临界区串行化；不同频道互不阻塞。
+# 注意：asyncio.Lock 不可重入——已确认各写路径之间无同 key 嵌套调用。
+_archive_locks: Dict[str, asyncio.Lock] = {}
+_archive_locks_guard = asyncio.Lock()
+
+
+async def _archive_lock(chat_key: str) -> asyncio.Lock:
+    """取（或建）某频道的档案锁。建表过程本身用全局 guard 保护，避免竞态建两把锁。"""
+    async with _archive_locks_guard:
+        lk = _archive_locks.get(chat_key)
+        if lk is None:
+            lk = asyncio.Lock()
+            _archive_locks[chat_key] = lk
+        return lk
 
 
 async def _resolve_target_user_id(_ctx: schemas.AgentCtx, target_user_id: str) -> str:
@@ -1851,13 +1909,14 @@ async def sync_user_profile(_ctx: schemas.AgentCtx, message: ChatMessage):
     if who in ("", "-1"):
         return None
 
-    state = await _open_archive(message.chat_key)
-    state.profile_for(
-        user_id=who,
-        display_name=message.sender_nickname or message.sender_name,
-    ).last_interaction_at = _ts_now()
-    state.last_active_user_id = who
-    await _store_archive(message.chat_key, state)
+    async with await _archive_lock(message.chat_key):
+        state = await _open_archive(message.chat_key)
+        state.profile_for(
+            user_id=who,
+            display_name=message.sender_nickname or message.sender_name,
+        ).last_interaction_at = _ts_now()
+        state.last_active_user_id = who
+        await _store_archive(message.chat_key, state)
     return None
 
 
@@ -1975,99 +2034,93 @@ async def adjust_favorability(
                 "不接受直接索要或要求。用你的人格自然回应即可。"
             )
 
-    state = await _open_archive(_ctx.chat_key)
-    profile = state.profile_for(resolved_user_id, display_name=display_name)
-    now = _ts_now()
+    async with await _archive_lock(_ctx.chat_key):
+        state = await _open_archive(_ctx.chat_key)
+        profile = state.profile_for(resolved_user_id, display_name=display_name)
+        now = _ts_now()
 
-    # ---- 约束层（扩展）----
-    # ① 证据门槛：只堆主观氛围词的理由不加分
-    _sc = favor_scale()
-    if delta > 0 and _sc.get("require_concrete_reason") and _reason_is_vague(cleaned_reason):
-        plugin.logger.info(
-            f"[favorability] 理由过于空泛，本次不加分: user={resolved_user_id} reason={cleaned_reason[:40]}",
-        )
-        return (
-            f"本次未加分：理由「{cleaned_reason[:40]}」只有氛围描述，没有可验证的具体行为。"
-            "好感度只在关系发生了稳定、可解释的变化时才调整。"
-        )
-
-    # ② 同用户最小间隔
-    _stamps = [
-        int(e.timestamp) for e in (profile.recent_events or [])
-        if "衰减" not in str(e.reason) and "记忆校正" not in str(e.reason)
-    ]
-    _min_gap = max(0, int(_sc.get("min_interval_minutes", 120))) * 60
-    if _stamps and _min_gap and (now - max(_stamps)) < _min_gap:
-        _wait = (_min_gap - (now - max(_stamps))) // 60
-        plugin.logger.info(
-            f"[favorability] 距上次调整不足，跳过: user={resolved_user_id} 还需 {_wait} 分钟",
-        )
-        return (f"本次未调整：距上次调整不足 {int(_sc.get('min_interval_minutes', 120))} 分钟（还需约 {_wait} 分钟）。")
-
-    # ③ 单次上限
-    _cap = max(1, int(_sc.get("max_single_delta", 10)))
-    _capped = max(-_cap, min(_cap, int(delta)))
-    if _capped != int(delta):
-        plugin.logger.info(f"[favorability] 单次调整钳制: {delta} → {_capped} (user={resolved_user_id})")
-        delta = _capped
-
-    # ④ 边际递减
-    #    取整方向很关键：正分向上取整、负分向下取整。
-    #    用 round() 会让 delta=1 在高档位变成 0，等价于"这次互动不存在"——
-    #    那正是"好感度增减不明显"的直接原因。
-    if _sc.get("marginal_decay") and delta > 0:
-        _f = _marginal_factor(int(profile.score))
-        _scaled = delta * _f
-        _adj = int(math.ceil(_scaled)) if _scaled > 0 else int(math.floor(_scaled))
-        _adj = max(1, _adj)  # 正分至少进 1 分
-        if _adj != delta:
+        # ---- 约束层（扩展）----
+        # ① 证据门槛：只堆主观氛围词的理由不加分
+        _sc = favor_scale()
+        if delta > 0 and _sc.get("require_concrete_reason") and _reason_is_vague(cleaned_reason):
             plugin.logger.info(
-                f"[favorability] 边际递减: 分数 {profile.score} 系数 {_f} → delta {delta} → {_adj}",
+                f"[favorability] 理由过于空泛，本次不加分: user={resolved_user_id} reason={cleaned_reason[:40]}",
             )
-            delta = _adj
-        if delta <= 0:
             return (
-                f"本次未加分：当前好感度 {profile.score} 已在高档位，"
-                "日常互动不再累加。只有发生重要事件时才可能提升。"
+                f"本次未加分：理由「{cleaned_reason[:40]}」只有氛围描述，没有可验证的具体行为。"
+                "好感度只在关系发生了稳定、可解释的变化时才调整。"
             )
 
-    # ⑤ 每日累计上限
-    _gain_cap = int(_sc.get("max_daily_gain", 15))
-    _loss_cap = int(_sc.get("max_daily_loss", 10))
-    _today = _day_start_ts(now)
-    _net = sum(
-        int(e.delta) for e in (profile.recent_events or [])
-        if int(e.timestamp or 0) >= _today
-        and "衰减" not in str(e.reason) and "记忆校正" not in str(e.reason)
-    )
+        # ② 同用户最小间隔（用持久化锚点 last_adjust_at，不再从 recent_events 反推）
+        profile.roll_day(now)   # 跨天先把当日累计归零，⑤ 直接读 day_net
+        _min_gap = max(0, int(_sc.get("min_interval_minutes", 120))) * 60
+        if profile.last_adjust_at and _min_gap and (now - profile.last_adjust_at) < _min_gap:
+            _wait = (_min_gap - (now - profile.last_adjust_at)) // 60
+            plugin.logger.info(
+                f"[favorability] 距上次调整不足，跳过: user={resolved_user_id} 还需 {_wait} 分钟",
+            )
+            return (f"本次未调整：距上次调整不足 {int(_sc.get('min_interval_minutes', 120))} 分钟（还需约 {_wait} 分钟）。")
 
-    if delta > 0 and _net + delta > _gain_cap:
-        _left = max(0, _gain_cap - _net)
-        plugin.logger.info(
-            f"[favorability] 触及每日加分上限: user={resolved_user_id} 今日已 {_net:+} 剩余 {_left}",
+        # ③ 单次上限
+        _cap = max(1, int(_sc.get("max_single_delta", 10)))
+        _capped = max(-_cap, min(_cap, int(delta)))
+        if _capped != int(delta):
+            plugin.logger.info(f"[favorability] 单次调整钳制: {delta} → {_capped} (user={resolved_user_id})")
+            delta = _capped
+
+        # ④ 边际递减
+        #    取整方向很关键：正分向上取整、负分向下取整。
+        #    用 round() 会让 delta=1 在高档位变成 0，等价于"这次互动不存在"——
+        #    那正是"好感度增减不明显"的直接原因。
+        if _sc.get("marginal_decay") and delta > 0:
+            _f = _marginal_factor(int(profile.score))
+            _scaled = delta * _f
+            _adj = int(math.ceil(_scaled)) if _scaled > 0 else int(math.floor(_scaled))
+            _adj = max(1, _adj)  # 正分至少进 1 分
+            if _adj != delta:
+                plugin.logger.info(
+                    f"[favorability] 边际递减: 分数 {profile.score} 系数 {_f} → delta {delta} → {_adj}",
+                )
+                delta = _adj
+            if delta <= 0:
+                return (
+                    f"本次未加分：当前好感度 {profile.score} 已在高档位，"
+                    "日常互动不再累加。只有发生重要事件时才可能提升。"
+                )
+
+        # ⑤ 每日累计上限（用持久化当日净累计 day_net；② 处已 roll_day，跨天自动归零）
+        _gain_cap = int(_sc.get("max_daily_gain", 15))
+        _loss_cap = int(_sc.get("max_daily_loss", 10))
+        _net = int(profile.day_net)
+
+        if delta > 0 and _net + delta > _gain_cap:
+            _left = max(0, _gain_cap - _net)
+            plugin.logger.info(
+                f"[favorability] 触及每日加分上限: user={resolved_user_id} 今日已 {_net:+} 剩余 {_left}",
+            )
+            if _left <= 0:
+                return f"本次未加分：今日对该用户的好感度加分已达上限（+{_gain_cap}）。"
+            delta = _left
+        elif delta < 0 and _net + delta < -_loss_cap:
+            _left = max(0, _loss_cap + _net)
+            if _left <= 0:
+                return f"本次未扣分：今日对该用户的扣分已达上限（-{_loss_cap}）。"
+            delta = -_left
+
+        if delta == 0:
+            return "本次未调整：经过约束后分值为 0。"
+
+        profile.nudge(
+            delta,
+            cleaned_reason,
+            summary=summary,
+            hint=interaction_hint,
+            tags=list(tags or []),
+            display_name=display_name,
         )
-        if _left <= 0:
-            return f"本次未加分：今日对该用户的好感度加分已达上限（+{_gain_cap}）。"
-        delta = _left
-    elif delta < 0 and _net + delta < -_loss_cap:
-        _left = max(0, _loss_cap + _net)
-        if _left <= 0:
-            return f"本次未扣分：今日对该用户的扣分已达上限（-{_loss_cap}）。"
-        delta = -_left
-
-    if delta == 0:
-        return "本次未调整：经过约束后分值为 0。"
-
-    profile.nudge(
-        delta,
-        cleaned_reason,
-        summary=summary,
-        hint=interaction_hint,
-        tags=list(tags or []),
-        display_name=display_name,
-    )
-    state.last_active_user_id = resolved_user_id
-    await _store_archive(_ctx.chat_key, state)
+        profile.record_adjust(delta, now)   # 刷新间隔锚点与当日净累计
+        state.last_active_user_id = resolved_user_id
+        await _store_archive(_ctx.chat_key, state)
 
     _tail = "（档案里的禁写词已自动移除。）" if _blocked else ""
     return (
@@ -2095,6 +2148,10 @@ async def set_favorability_profile(
 
     先前那份档案明显偏了、要一次性铺好完整关系卡、或者关系刚发生大跨越时，用它。
 
+    注意：对**已有档案**改分同样受每日预算与最小间隔约束（与 adjust_favorability
+    共享同一套防刷规则），超出会被钳制或拒绝；初始化新档案、或只改 summary/hint/tags
+    而不动分数时不受限。别用它绕过日常互动的加分节奏。
+
     Args:
         score (int): 重写后的内部评分。
         summary (str): 稳定印象的概括。
@@ -2120,18 +2177,85 @@ async def set_favorability_profile(
             f"[favorability] 档案重设已清洗禁写词: user={resolved_user_id} 命中={_sblocked}",
         )
 
-    state = await _open_archive(_ctx.chat_key)
-    profile = state.profile_for(resolved_user_id, display_name=display_name)
-    profile.reset_to(
-        score,
-        safe_reason or "手动重设好感度档案",
-        summary=kept_summary,
-        hint=safe_hint,
-        tags=list(safe_tags or []),
-        display_name=display_name,
-    )
-    state.last_active_user_id = resolved_user_id
-    await _store_archive(_ctx.chat_key, state)
+    async with await _archive_lock(_ctx.chat_key):
+        state = await _open_archive(_ctx.chat_key)
+        is_new = resolved_user_id not in state.profiles
+        profile = state.profile_for(resolved_user_id, display_name=display_name)
+
+        # ---- 约束层（v1.4.1）：堵住 set_profile 绕过 adjust 防刷体系的旁路 ----
+        # 原先本工具直接 reset_to，无间隔 / 日限 / 索要检测，模型可反复重设刷分，
+        # 令 FAVOR_SCALE 全套约束形同虚设。现在：
+        #   · 初始化新档案（is_new）或只改描述不动分数（implied==0）→ 不受限；
+        #   · 对已有档案改分 → 套用与 adjust_favorability 相同的
+        #     索要拦截 / 最小间隔 / 每日净上限（共享同一预算，过滤口径一致）。
+        # 不做单次钳制与边际递减——保留「大幅修正」的正当用途，但受每日预算封顶。
+        target = _bound_score(int(score))
+        now = _ts_now()
+        before = int(profile.score)
+        implied = target - before
+        if not is_new and implied != 0:
+            _sc = favor_scale()
+            # ① 索要式抬分拦截（仅抬分时；与 adjust 同款）
+            if implied > 0:
+                hit = await _detect_favor_manipulation(_ctx.chat_key, resolved_user_id)
+                if hit:
+                    plugin.logger.warning(
+                        f"[favorability] 拦截 set_profile 索要式抬分: user={resolved_user_id} "
+                        f"implied={implied:+} 命中={hit!r}",
+                    )
+                    return (
+                        "本次重设已被拒绝：好感度只随真实言行自然变化，"
+                        "不接受直接索要或要求。用你的人格自然回应即可。"
+                    )
+            # ② 同用户最小间隔（持久化锚点 last_adjust_at，与 adjust 同源）
+            profile.roll_day(now)
+            _min_gap = max(0, int(_sc.get("min_interval_minutes", 120))) * 60
+            if profile.last_adjust_at and _min_gap and (now - profile.last_adjust_at) < _min_gap:
+                _wait = (_min_gap - (now - profile.last_adjust_at)) // 60
+                plugin.logger.info(
+                    f"[favorability] set_profile 距上次调整不足，跳过: "
+                    f"user={resolved_user_id} 还需 {_wait} 分钟",
+                )
+                return (
+                    f"本次未重设：距上次调整不足 {int(_sc.get('min_interval_minutes', 120))} 分钟"
+                    f"（还需约 {_wait} 分钟）。"
+                )
+            # ③ 每日净上限（持久化 day_net，与 adjust 共享同一预算）
+            _gain_cap = int(_sc.get("max_daily_gain", 15))
+            _loss_cap = int(_sc.get("max_daily_loss", 10))
+            _net = int(profile.day_net)
+            if implied > 0 and _net + implied > _gain_cap:
+                _left = max(0, _gain_cap - _net)
+                if _left <= 0:
+                    return f"本次未重设：今日对该用户的好感度加分已达上限（+{_gain_cap}）。"
+                target = _bound_score(before + _left)
+                plugin.logger.info(
+                    f"[favorability] set_profile 触及每日加分上限，钳制: user={resolved_user_id} "
+                    f"implied {implied:+} → {target - before:+}",
+                )
+            elif implied < 0 and _net + implied < -_loss_cap:
+                _left = max(0, _loss_cap + _net)
+                if _left <= 0:
+                    return f"本次未重设：今日对该用户的扣分已达上限（-{_loss_cap}）。"
+                target = _bound_score(before - _left)
+                plugin.logger.info(
+                    f"[favorability] set_profile 触及每日扣分上限，钳制: user={resolved_user_id} "
+                    f"implied {implied:+} → {target - before:+}",
+                )
+
+        profile.reset_to(
+            target,
+            safe_reason or "手动重设好感度档案",
+            summary=kept_summary,
+            hint=safe_hint,
+            tags=list(safe_tags or []),
+            display_name=display_name,
+        )
+        _applied = target - before
+        if _applied != 0:
+            profile.record_adjust(_applied, now)   # 初始化/大幅修正同样计入当日预算与间隔锚点
+        state.last_active_user_id = resolved_user_id
+        await _store_archive(_ctx.chat_key, state)
 
     _stail = "（档案里的禁写词已自动移除。）" if _sblocked else ""
     return (
@@ -2155,13 +2279,14 @@ async def remove_favorability_profile(
         target_user_id (str): 目标用户的平台用户 ID。留空表示就用当前触发本轮的这位用户。
     """
     resolved_user_id = await _resolve_target_user_id(_ctx, target_user_id)
-    state = await _open_archive(_ctx.chat_key)
-    if resolved_user_id not in state.profiles:
-        raise ValueError(f"本频道没有 `{resolved_user_id}` 的关系档案。")
-    gone = state.profiles.pop(resolved_user_id)
-    if state.last_active_user_id == resolved_user_id:
-        state.last_active_user_id = ""
-    await _store_archive(_ctx.chat_key, state)
+    async with await _archive_lock(_ctx.chat_key):
+        state = await _open_archive(_ctx.chat_key)
+        if resolved_user_id not in state.profiles:
+            raise ValueError(f"本频道没有 `{resolved_user_id}` 的关系档案。")
+        gone = state.profiles.pop(resolved_user_id)
+        if state.last_active_user_id == resolved_user_id:
+            state.last_active_user_id = ""
+        await _store_archive(_ctx.chat_key, state)
     return f"已删除 {gone.display_name or gone.user_id} 的好感度档案。"
 
 
@@ -2209,43 +2334,44 @@ async def save_memo(
             "请压缩成要点——长资料应该写进背景库，而不是塞进备忘录。",
         )
 
-    state = await _open_archive(_ctx.chat_key)
-    now = _ts_now()
-    ttl = max(0, int(ttl_hours or 0))
-    expire_at = now + ttl * 3600 if ttl else 0
-    favor = max(0, min(100, int(min_favor or 0)))
-    clean_tags = [str(x).strip()[:12] for x in (tags or []) if str(x).strip()][:6]
+    async with await _archive_lock(_ctx.chat_key):
+        state = await _open_archive(_ctx.chat_key)
+        now = _ts_now()
+        ttl = max(0, int(ttl_hours or 0))
+        expire_at = now + ttl * 3600 if ttl else 0
+        favor = max(0, min(100, int(min_favor or 0)))
+        clean_tags = [str(x).strip()[:12] for x in (tags or []) if str(x).strip()][:6]
 
-    existing, _idx = _find_memo(state, clean_title)
-    if existing is not None:
-        existing.title = clean_title
-        existing.content = clean_content
-        if clean_tags:
-            existing.tags = clean_tags
-        existing.min_favor = favor
-        existing.expire_at = expire_at
-        existing.updated_at = now
-        action = "已更新"
-    else:
-        if len(state.memos) >= cfg2["max_items"]:
-            raise ValueError(
-                f"备忘录已达上限 {cfg2['max_items']} 条，先用 `forget_memo` 清理不用的。",
+        existing, _idx = _find_memo(state, clean_title)
+        if existing is not None:
+            existing.title = clean_title
+            existing.content = clean_content
+            if clean_tags:
+                existing.tags = clean_tags
+            existing.min_favor = favor
+            existing.expire_at = expire_at
+            existing.updated_at = now
+            action = "已更新"
+        else:
+            if len(state.memos) >= cfg2["max_items"]:
+                raise ValueError(
+                    f"备忘录已达上限 {cfg2['max_items']} 条，先用 `forget_memo` 清理不用的。",
+                )
+            state.memos.append(
+                ChannelMemo(
+                    id=f"memo_{uuid.uuid4().hex[:10]}",
+                    title=clean_title,
+                    content=clean_content,
+                    tags=clean_tags,
+                    min_favor=favor,
+                    expire_at=expire_at,
+                    created_at=now,
+                    updated_at=now,
+                    source_user_id=(_ctx.from_platform_userid or "").strip(),
+                ),
             )
-        state.memos.append(
-            ChannelMemo(
-                id=f"memo_{uuid.uuid4().hex[:10]}",
-                title=clean_title,
-                content=clean_content,
-                tags=clean_tags,
-                min_favor=favor,
-                expire_at=expire_at,
-                created_at=now,
-                updated_at=now,
-                source_user_id=(_ctx.from_platform_userid or "").strip(),
-            ),
-        )
-        action = "已记下"
-    await _store_archive(_ctx.chat_key, state)
+            action = "已记下"
+        await _store_archive(_ctx.chat_key, state)
     ttl_text = f"{ttl} 小时后过期" if ttl else "永久"
     return f"{action}备忘「{clean_title}」（{ttl_text}，好感门槛 {favor}）。"
 
@@ -2261,13 +2387,14 @@ async def forget_memo(_ctx: schemas.AgentCtx, title: str) -> str:
     Args:
         title (str): 备忘标题（支持模糊匹配）
     """
-    state = await _open_archive(_ctx.chat_key)
-    memo, idx = _find_memo(state, title)
-    if memo is None:
-        titles = "、".join(m.title for m in state.memos[:12]) or "（当前没有备忘）"
-        raise ValueError(f"没有找到匹配「{title}」的备忘。现有：{titles}")
-    state.memos.pop(idx)
-    await _store_archive(_ctx.chat_key, state)
+    async with await _archive_lock(_ctx.chat_key):
+        state = await _open_archive(_ctx.chat_key)
+        memo, idx = _find_memo(state, title)
+        if memo is None:
+            titles = "、".join(m.title for m in state.memos[:12]) or "（当前没有备忘）"
+            raise ValueError(f"没有找到匹配「{title}」的备忘。现有：{titles}")
+        state.memos.pop(idx)
+        await _store_archive(_ctx.chat_key, state)
     return f"已忘掉备忘「{memo.title}」。"
 
 
@@ -2355,11 +2482,12 @@ async def _favor_write_command(
     `mutate(state)` 负责修改档案并返回成功文案；
     若它直接返回一个 CommandResponse（例如失败分支），则原样透传、不落库。
     """
-    state = await _open_archive(context.chat_key)
-    outcome = mutate(state)
-    if isinstance(outcome, CommandResponse):
-        return outcome
-    await _store_archive(context.chat_key, state)
+    async with await _archive_lock(context.chat_key):
+        state = await _open_archive(context.chat_key)
+        outcome = mutate(state)
+        if isinstance(outcome, CommandResponse):
+            return outcome
+        await _store_archive(context.chat_key, state)
     return CmdCtl.success(outcome)
 
 
@@ -2465,7 +2593,9 @@ async def favor_rank_cmd(context: CommandExecutionContext) -> CommandResponse:
 
     out_dir = plugin.get_plugin_data_dir() / "rank_cards"
     out_dir.mkdir(parents=True, exist_ok=True)
-    file_path = out_dir / f"favor_rank_{context.chat_key}_{int(time.time() * 1000)}.png"
+    # 清洗 chat_key：与 _send_via_adapter 同款，避免 Windows 下含 ":" 等非法字符炸路径
+    safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in context.chat_key)[:60]
+    file_path = out_dir / f"favor_rank_{safe}_{int(time.time() * 1000)}.png"
     file_path.write_bytes(png)
     return CmdCtl.success(
         [
@@ -2631,24 +2761,23 @@ async def run_favorability_recover(_ctx: schemas.AgentCtx) -> str:
 
 @plugin.mount_init_method()
 async def _start_decay_loop() -> None:
-    """插件加载时启动好感度衰减后台任务。"""
+    """插件加载时启动好感度结算后台任务。
+
+    循环**常驻**：DECAY_ENABLED / RECOVER_ENABLED 在每轮结算时实时读取
+    （见 _decay_pass / _recover_pass 开头的开关检查），因此运行期经 WebUI
+    打开或关闭无需重启即可生效（最迟一个 30 分钟检查周期后生效）。
+    """
     global _decay_task
-    if not config.DECAY_ENABLED:
-        plugin.logger.info("[favorability] 好感度衰减已关闭（DECAY_ENABLED=false）")
-        return
     if _decay_task is not None and not _decay_task.done():
         return
     _decay_task = asyncio.create_task(_decay_loop())
+    _decay_state = "启用" if config.DECAY_ENABLED else "关闭（运行期可经配置开启）"
+    _recover_state = "启用" if config.RECOVER_ENABLED else "关闭（运行期可经配置开启）"
     plugin.logger.info(
-        f"[favorability] 好感度衰减任务已启动：每 {config.DECAY_INTERVAL_HOURS} 小时 "
-        f"-{config.DECAY_PERCENT}%（保底={config.DECAY_KEEP_TIER}"
-        f"/{config.DECAY_TIER_GRACE_HOURS}h 逐级解锁）"
-        + (
-            f"；回升已启用：每 {config.RECOVER_INTERVAL_HOURS} 小时 "
-            f"+{config.RECOVER_PERCENT}%（封顶 0）"
-            if config.RECOVER_ENABLED
-            else "；回升已关闭"
-        ),
+        f"[favorability] 好感度结算任务已启动（每 30 分钟检查一次）："
+        f"衰减={_decay_state}，每 {config.DECAY_INTERVAL_HOURS} 小时 -{config.DECAY_PERCENT}%"
+        f"（保底={config.DECAY_KEEP_TIER}/{config.DECAY_TIER_GRACE_HOURS}h 逐级解锁）；"
+        f"回升={_recover_state}，每 {config.RECOVER_INTERVAL_HOURS} 小时 +{config.RECOVER_PERCENT}%（封顶 0）"
     )
 
 

@@ -1695,6 +1695,10 @@ function renderOverview(data) {
     return `<tr><td data-label="档位">${stageBadge(stage.name)}</td><td data-label="分数区间" class="mono">${escapeHtml(range)}</td><td data-label="互动指引" class="muted">${escapeHtml(stage.unlock_hint || '—')}</td></tr>`;
   }).join('') || '<tr><td class="empty" colspan="3">尚未配置档位</td></tr>';
   const rubricRows = (rubric.items || []).map(item => `<tr><td data-label="量级">${stageBadge(item[0])}</td><td data-label="场景">${escapeHtml(item[1] || '')}</td></tr>`).join('') || '<tr><td class="empty" colspan="2">尚未配置评分量级</td></tr>';
+  // 后端在未配置 WEBUI_ACCESS_KEY 时一律 403 拒绝写操作（v1.4.1 安全约束），
+  // 这里据此把预算表单降级为只读，避免用户改了半天才发现存不进去。
+  const writable = data.writable !== false;
+  const ro = writable ? '' : ' disabled';
 
   $('#overviewContent').innerHTML = `
     <div class="metric-grid">
@@ -1715,28 +1719,29 @@ function renderOverview(data) {
         </div>
       </section>
       <section class="panel">
-        <div class="panel-head"><div><h2 class="panel-title">三档预算与阈值</h2><div class="panel-subtitle">直接写回插件配置，保存后立即生效</div></div><div class="panel-actions"><span id="budgetDirtyBadge" class="badge warning" hidden>有未保存修改</span><button class="btn primary" id="saveBudget" type="button">保存预算</button></div></div>
+        <div class="panel-head"><div><h2 class="panel-title">三档预算与阈值</h2><div class="panel-subtitle">${writable ? '直接写回插件配置，保存后立即生效' : '当前只读 —— 未配置访问密钥，后端拒绝写操作'}</div></div><div class="panel-actions"><span id="budgetDirtyBadge" class="badge warning" hidden>有未保存修改</span><button class="btn primary" id="saveBudget" type="button"${writable ? '' : ' disabled'}>保存预算</button></div></div>
         <div class="panel-body">
+          ${writable ? '' : `<div class="overview-note" style="margin-bottom:12px;border-color:var(--warning,#b8860b)"><div><strong>写操作已禁用</strong>：本插件路由不受 NA 全局鉴权保护，为防止匿名改人设，未配置 <code>WEBUI_ACCESS_KEY</code> 时后端一律拒绝写入（403）。<br>要在此处直接改预算，请在 <strong>NA 插件配置</strong>里给本插件设置一个访问密钥并保存，然后刷新本页；设置后浏览器会弹窗询问一次，之后无需重复输入。<br>不设密钥也可以改：到 NA 插件配置里直接修改 <code>TIER*</code> 各项。</div></div>`}
           <div class="hint" style="margin-bottom:7px">1 档 · 常驻（身份级，只有字符预算）</div>
           <div class="field-grid-3">
-            <label class="field-label">字符预算<input id="budgetTier1Chars" class="field" type="number" min="100" max="10000" step="50" aria-label="1 档字符预算"></label>
+            <label class="field-label">字符预算<input id="budgetTier1Chars" class="field" type="number" min="100" max="10000" step="50" aria-label="1 档字符预算"${ro}></label>
           </div>
           <div class="hint" style="margin:14px 0 7px">2 档 · 按需检索（细节级）</div>
           <div class="field-grid-3">
-            <label class="field-label">单轮条数上限<input id="budgetTier2Entries" class="field" type="number" min="1" max="10" aria-label="2 档条数上限"></label>
-            <label class="field-label">单轮字符预算<input id="budgetTier2Chars" class="field" type="number" min="50" max="3000" step="50" aria-label="2 档字符预算"></label>
-            <label class="field-label">向量阈值<input id="budgetTier2Threshold" class="field" type="number" min="0" max="1" step="0.01" aria-label="2 档向量阈值"></label>
-            <label class="field-label">扫描消息条数<input id="budgetTier2Scan" class="field" type="number" min="1" max="30" aria-label="2 档扫描条数"></label>
+            <label class="field-label">单轮条数上限<input id="budgetTier2Entries" class="field" type="number" min="1" max="10" aria-label="2 档条数上限"${ro}></label>
+            <label class="field-label">单轮字符预算<input id="budgetTier2Chars" class="field" type="number" min="50" max="3000" step="50" aria-label="2 档字符预算"${ro}></label>
+            <label class="field-label">向量阈值<input id="budgetTier2Threshold" class="field" type="number" min="0" max="1" step="0.01" aria-label="2 档向量阈值"${ro}></label>
+            <label class="field-label">扫描消息条数<input id="budgetTier2Scan" class="field" type="number" min="1" max="30" aria-label="2 档扫描条数"${ro}></label>
           </div>
           <div class="switch-row" style="margin-top:14px">
             <div class="switch-copy"><strong>启用 3 档 · 世界知识</strong><small>关闭后完全不检索、不注入（不受好感度门控）</small></div>
-            <label class="switch"><input id="budgetTier3Enabled" type="checkbox" aria-label="启用 3 档世界知识"><span></span></label>
+            <label class="switch"><input id="budgetTier3Enabled" type="checkbox" aria-label="启用 3 档世界知识"${ro}><span></span></label>
           </div>
           <div class="field-grid-3">
-            <label class="field-label">单轮条数上限<input id="budgetTier3Entries" class="field" type="number" min="1" max="10" aria-label="3 档条数上限"></label>
-            <label class="field-label">单轮字符预算<input id="budgetTier3Chars" class="field" type="number" min="100" max="3000" step="50" aria-label="3 档字符预算"></label>
-            <label class="field-label">向量阈值<input id="budgetTier3Threshold" class="field" type="number" min="0" max="1" step="0.01" aria-label="3 档向量阈值"></label>
-            <label class="field-label">扫描消息条数<input id="budgetTier3Scan" class="field" type="number" min="1" max="30" aria-label="3 档扫描条数"></label>
+            <label class="field-label">单轮条数上限<input id="budgetTier3Entries" class="field" type="number" min="1" max="10" aria-label="3 档条数上限"${ro}></label>
+            <label class="field-label">单轮字符预算<input id="budgetTier3Chars" class="field" type="number" min="100" max="3000" step="50" aria-label="3 档字符预算"${ro}></label>
+            <label class="field-label">向量阈值<input id="budgetTier3Threshold" class="field" type="number" min="0" max="1" step="0.01" aria-label="3 档向量阈值"${ro}></label>
+            <label class="field-label">扫描消息条数<input id="budgetTier3Scan" class="field" type="number" min="1" max="30" aria-label="3 档扫描条数"${ro}></label>
           </div>
           <div class="status-line" style="margin-top:14px"><span class="status-name">防黑规则</span><span class="status-value">${escapeHtml((data.guard || {}).desc || '—')}</span></div>
           <div class="status-line"><span class="status-name">最近命中</span><span class="status-value mono">${escapeHtml(data.last_hit || '暂无')}</span></div>
@@ -2742,7 +2747,14 @@ function wireEvents() {
       toast('预算已保存并生效', 'success');
       await loadOverview({ quiet: true });
     } catch (error) {
-      toast(`保存失败：${error.message}`, 'error');
+      // 403 = 后端因未配置访问密钥而拒绝写操作：给出可操作的指引，
+      // 而不是丢一句「保存失败」让人猜。（401 由 api() 内部弹窗要密钥后自动重试）
+      if (/WEBUI_ACCESS_KEY|写操作已禁用/.test(error.message)) {
+        toast('保存被拒绝：未配置 WEBUI_ACCESS_KEY，写操作已禁用。请在 NA 插件配置里设置访问密钥后刷新本页。', 'error');
+        await loadOverview({ quiet: true });   // 重绘为只读态
+      } else {
+        toast(`保存失败：${error.message}`, 'error');
+      }
     } finally {
       button.disabled = false;
     }
