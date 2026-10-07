@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控",
-    version="1.4.3",
+    version="1.4.4",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -330,6 +330,20 @@ class FavorabilityConfig(ConfigBase):
         "不用相似度阈值：实测「小明生日」与「小红生日」相似度 0.75，会被误合并。",
         en_title="Dedup Min Key Length",
         en_desc="Containment-based dedup: a shorter title fully contained in a longer one is treated as the same memo",
+    )
+
+    # ==================== 频道重置行为 ====================
+    RESET_CHANNEL_CLEARS_FAVOR: bool = _fav_field(
+        False, "「重置上下文」时清空本频道好感度",
+        "关闭（默认）：重置上下文只清对话历史，关系档案与备忘**完整保留**。"
+        "开启：模拟旧行为，把本频道的全部关系档案与备忘一起删除（不可逆）。"
+        "注意旧版本默认就是删除，且不会提示——若你曾被「重置上下文」清掉过关系数据，"
+        "保持关闭即可。无论开关如何，删除前都会先自动备份一份，见 "
+        "{插件数据目录}/reset_backups/。",
+        en_title="Reset Channel Clears Favorability",
+        en_desc="Off (default): resetting context keeps all relationship archives and memos. "
+                "On: reproduces the legacy behavior of deleting them (irreversible). "
+                "A backup is always written before any deletion.",
     )
 
     # ==================== 排行榜卡片 ====================
@@ -2672,8 +2686,68 @@ async def favor_remove_cmd(
 
 @plugin.mount_on_channel_reset()
 async def on_channel_reset(_ctx: schemas.AgentCtx):
-    """在频道重置时清空当前频道的好感度数据（备忘与档案一起丢）"""
-    await store.delete(chat_key=_ctx.chat_key, store_key=STATE_KEY)
+    """「重置上下文」时的处理。
+
+    ⚠️ 历史行为（1.4.3 及以前）：无条件 `store.delete(STATE_KEY)` —— 一次
+    「重置上下文」会把本频道的**全部关系档案与备忘**一起删掉，且不可逆、无提示。
+    重置上下文是高频轻量操作（清对话历史），把不可逆的档案删除绑在它上面，
+    误触代价过大；且用户直觉上不会认为「重置上下文」等于「清空关系」。
+
+    现在：默认**保留**（RESET_CHANNEL_CLEARS_FAVOR=false），开关可恢复旧行为。
+    无论开关如何，删除前都先落一份备份到 {数据目录}/reset_backups/，
+    保证「删了也能捞回来」。
+    """
+    chat_key = _ctx.chat_key
+    try:
+        blob = await store.get(chat_key=chat_key, store_key=STATE_KEY)
+    except Exception as e:  # noqa: BLE001
+        plugin.logger.warning(f"[favorability] 重置时读取档案失败，跳过：{e}")
+        return
+
+    if not blob:
+        return
+
+    # 先备份（无论后续是否删除）—— 一次误触不该造成不可逆损失
+    backup_path = _write_reset_backup(chat_key, blob)
+
+    if not bool(getattr(config, "RESET_CHANNEL_CLEARS_FAVOR", False)):
+        plugin.logger.info(
+            f"[favorability] 频道 {chat_key} 上下文重置：关系档案与备忘已保留"
+            f"（如需跟随清空，请开启「「重置上下文」时清空本频道好感度」）"
+            + (f"；备份：{backup_path}" if backup_path else ""),
+        )
+        return
+
+    try:
+        await store.delete(chat_key=chat_key, store_key=STATE_KEY)
+        plugin.logger.warning(
+            f"[favorability] 频道 {chat_key} 上下文重置：已按配置清空本频道关系档案与备忘"
+            + (f"（备份：{backup_path}）" if backup_path else ""),
+        )
+    except Exception as e:  # noqa: BLE001
+        plugin.logger.warning(f"[favorability] 重置时清空档案失败：{e}")
+
+
+def _write_reset_backup(chat_key: str, blob: str) -> str:
+    """把重置前的原始 blob 落一份备份，返回路径（失败返回空串，不抛）。"""
+    try:
+        out_dir = plugin.get_plugin_data_dir() / "reset_backups"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in chat_key)[:60]
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        fp = out_dir / f"{safe}_{stamp}.json"
+        # 保留原始文本，不做解析，确保任何格式都能原样恢复
+        payload = {
+            "chat_key": chat_key,
+            "store_key": STATE_KEY,
+            "backed_up_at": stamp,
+            "raw": blob,
+        }
+        fp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return str(fp)
+    except Exception as e:  # noqa: BLE001
+        plugin.logger.warning(f"[favorability] 重置前备份失败（继续执行）：{e}")
+        return ""
 
 
 @plugin.mount_sandbox_method(
