@@ -1411,10 +1411,14 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     raise HTTPException(status_code=400, detail=f"{arc} 结构不对（缺 entries）")
                 n = len(data["entries"])
             parsed[arc] = (raw, dst, n)
-        if not parsed:
+        # 只有 backgrounds 而没有 preset 也能导入；反过来（只导入预设文本）同样应该允许：
+        # 导出包允许「只要人设文本」这一用法，此处不该拦。
+        has_presets = any(x.startswith('presets/') and x.endswith('.md') for x in names)
+        if not parsed and not has_presets:
             raise HTTPException(
                 status_code=400,
-                detail="包里没有可导入的人设文件（需要 backgrounds/tier1、tier2、tier3 或 favor.json）",
+                detail="包里没有可导入的人设文件（需要 backgrounds/tier1、tier2、tier3、"
+                       "favor.json，或 presets/*.md）",
             )
 
         # 导入前先备份当前文件
@@ -1431,35 +1435,78 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             dst.write_bytes(raw)
             applied.append(f"{arc}（{n} 条）" if n >= 0 else f"{arc}")
         preset_applied = []
+        preset_failed = []
         try:
             from nekro_agent.models.db_preset import DBPreset
 
+            # 从 bundle 元信息里取预设名（导出时写过），找不到就用回退名。
+            # 目的：新建的 preset 记录 name/title 不该是「导入人设 N」这种占位。
+            bundle_presets: Dict[int, str] = {}
+            if "persona.bundle.json" in names:
+                try:
+                    _meta = json.loads(zf.read("persona.bundle.json").decode("utf-8"))
+                    for item in (_meta.get("presets") or []):
+                        try:
+                            bundle_presets[int(item.get("id"))] = str(item.get("name") or "")
+                        except (TypeError, ValueError):
+                            continue
+                except Exception:  # noqa: BLE001
+                    bundle_presets = {}
+
             for n_ in sorted(x for x in names if x.startswith('presets/') and x.endswith('.md')):
-                pid = int(n_.split('/')[-1].split('.')[0])
-                ptext = zf.read(n_).decode('utf-8')
-                if not ptext.strip():
+                try:
+                    pid = int(n_.split('/')[-1].split('.')[0])
+                except (ValueError, IndexError):
                     continue
-                content_db = ptext.replace('\\n', '\\\\n')
-                row = await DBPreset.get_or_none(id=pid)
-                if row:
-                    row.content = content_db
-                    await row.save(update_fields=['content'])
-                else:
-                    await DBPreset.create(id=pid, name=f'导入人设 {pid}', content=content_db)
-                preset_applied.append(pid)
-        except HTTPException:
-            raise
+                try:
+                    ptext = zf.read(n_).decode('utf-8')
+                    if not ptext.strip():
+                        continue
+                    content_db = ptext.replace('\\n', '\\\\n')
+                    row = await DBPreset.get_or_none(id=pid)
+                    if row:
+                        row.content = content_db
+                        await row.save(update_fields=['content'])
+                    else:
+                        # ⚠️ DBPreset 除 content 外还有多个 NOT NULL 列
+                        #    （name/title/avatar/description/tags/author），
+                        #    只传 id+name+content 会抛「title: Value must not be None」，
+                        #    导致整个导入 500 —— 而 backgrounds 其实已经写入了。
+                        #    这里补齐全部必填字段，缺省用空串/回退名。
+                        pname = (bundle_presets.get(pid) or "").strip() or f'导入人设 {pid}'
+                        await DBPreset.create(
+                            id=pid,
+                            name=pname,
+                            title=pname,
+                            avatar="",
+                            content=content_db,
+                            description="",
+                            tags="",
+                            author="persona-import",
+                            on_shared=False,
+                        )
+                    preset_applied.append(pid)
+                except Exception as exc:  # noqa: BLE001
+                    # 单条预设失败不牵连其它预设，也不让整体 500
+                    plugin.logger.warning(f"[persona] 预设 {n_} 导入失败：{exc}")
+                    preset_failed.append(f"{n_}: {exc}")
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=f"人设文本导入失败：{exc}")
+            # 预设导入失败**不再**让整个导入返回 500：backgrounds 已经落盘，
+            # 报整体失败会让用户误以为什么都没导入、进而重复导入。
+            # 改为逐条记录失败原因，随响应返回，由前端提示。
+            plugin.logger.warning(f"[persona] 预设文本导入部分失败：{exc}")
+            preset_failed.append(str(exc))
 
         reload_state = await _reload_after_write()
         plugin.logger.info(
-            f"[persona] WebUI 导入整套人设: {list(parsed)} preset={preset_applied}",
+            f"[persona] WebUI 导入整套人设: {list(parsed)} "
+            f"preset={preset_applied} preset_failed={len(preset_failed)}",
         )
         return {
             "ok": True,
             "applied": applied,
             "preset_applied": preset_applied,
+            "preset_failed": preset_failed,
             "backup_dir": str(bdir),
             **reload_state,
         }
