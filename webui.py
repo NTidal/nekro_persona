@@ -213,6 +213,23 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "max_chars": int(getattr(config, "TIER1_MAX_CHARS", 2000) or 2000),
         }
 
+    def _lifecycle_cfg() -> Dict[str, Any]:
+        """生命周期（热度排序）参数，与 plugin._lifecycle_cfg 同口径。
+
+        ⚠️ 仅 None 才回落默认（不用 `x or default`），否则作者显式设的 0 会被吞。
+        """
+        def _n(key: str, default, cast):
+            v = getattr(config, key, None)
+            return cast(default) if v is None else cast(v)
+
+        return {
+            "enabled": bool(getattr(config, "LIFECYCLE_ENABLED", False)),
+            "half_life_days": _n("LIFECYCLE_HALF_LIFE_DAYS", 30, int),
+            "floor": _n("LIFECYCLE_FLOOR", 0.6, float),
+            "protect_weight": _n("LIFECYCLE_PROTECT_WEIGHT", 4, int),
+            "reinforce_bonus": _n("LIFECYCLE_REINFORCE_BONUS", 10, int) / 100.0,
+        }
+
     def _tier2_cfg() -> Dict[str, Any]:
         """2 档运行参数（来自插件配置）。"""
         return {
@@ -220,6 +237,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "max_chars": int(getattr(config, "TIER2_MAX_CHARS", 500) or 500),
             "threshold": float(getattr(config, "TIER2_SIM_THRESHOLD", 0.35) or 0.35),
             "scan_msgs": int(getattr(config, "TIER2_SCAN_MSGS", 6) or 6),
+            "lifecycle": _lifecycle_cfg(),
         }
 
     def _t3_cfg() -> Dict[str, Any]:
@@ -230,6 +248,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "max_chars": int(getattr(config, "TIER3_MAX_CHARS", 700) or 700),
             "threshold": float(getattr(config, "TIER3_SIM_THRESHOLD", 0.35) or 0.35),
             "scan_msgs": int(getattr(config, "TIER3_SCAN_MSGS", 6) or 6),
+            "lifecycle": _lifecycle_cfg(),
         }
 
     def _new_entry(tier: str, entry: Dict[str, Any]) -> str:
@@ -438,6 +457,17 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             cfg = memory.load_favor_cfg()
         except ValueError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        def _ov_num(key: str, default, cast):
+            """读配置数值：仅 None/缺失才回落默认，honor 显式 0（与运行期同口径）。"""
+            v = getattr(config, key, None)
+            if v is None:
+                return cast(default)
+            try:
+                return cast(v)
+            except (TypeError, ValueError):
+                return cast(default)
+
         t1, t2 = memory._state["tier1"], memory._state["tier2"]
         t3 = memory._state.get("tier3", [])
         vecs3 = memory._state.get("tier3_vecs", [])
@@ -541,6 +571,30 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "guard": {
                 "patterns": 1,
                 "desc": "索要好感度的正向调整会被拒绝",
+            },
+            # 记忆生命周期（A2/A3，1.5.0）：前端「高级设置」面板读写
+            # ⚠️ 与运行期同源：仅 None 才回落默认（不用 `x or default`），
+            # 否则作者显式设的 protect_weight=0 / reinforce_bonus=0 会被吞成默认，
+            # 概览显示 0、运行期却按 4/0.1 生效 → 面板看到的与引擎实际用的对不上。
+            "lifecycle": {
+                "enabled": bool(getattr(config, "LIFECYCLE_ENABLED", False)),
+                "half_life_days": _ov_num("LIFECYCLE_HALF_LIFE_DAYS", 30, int),
+                "floor": _ov_num("LIFECYCLE_FLOOR", 0.6, float),
+                "protect_weight": _ov_num("LIFECYCLE_PROTECT_WEIGHT", 4, int),
+                "reinforce_bonus": _ov_num("LIFECYCLE_REINFORCE_BONUS", 10, int),
+            },
+            # 独立嵌入后端（v1.6.0）：API Key **不回传明文**，只给 has_key，
+            # 前端留空即「不修改」，避免密钥泄漏到浏览器/概览响应里。
+            # v1.6.3：并入 embed_health() 的降级状态——custom 端点连续失败时
+            # degraded=true，概览页据此告警「检索已降级为纯关键词」。
+            "embed": {
+                "provider": str(getattr(config, "EMBED_PROVIDER", "na") or "na"),
+                "base_url": str(getattr(config, "EMBED_BASE_URL", "") or ""),
+                "model": str(getattr(config, "EMBED_MODEL", "") or ""),
+                "dimensions": _ov_num("EMBED_DIMENSIONS", 0, int),
+                "batch_size": _ov_num("EMBED_BATCH_SIZE", 10, int),
+                "has_key": bool(str(getattr(config, "EMBED_API_KEY", "") or "").strip()),
+                **memory.embed_health(),
             },
         }
 
@@ -996,6 +1050,101 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             },
         }
 
+    @router.post("/api/recall_test", summary="检索实验（A5：为什么命中/为什么落选）")
+    async def api_recall_test(request: Request) -> Dict[str, Any]:
+        """对一段模拟对话文本跑真实检索，逐条标注分数/来源/门控/预算/热度与去留原因。
+
+        只读，不改任何数据。直接用 _match_tierN_text 纯文本核心（A7 解耦后无需 ctx）。
+        """
+        _check_key(request)
+        body = await request.json()
+        text = str(body.get("text") or "").strip()
+        tier = "tier3" if str(body.get("tier") or "tier2") == "tier3" else "tier2"
+        if not text:
+            raise HTTPException(status_code=400, detail="请输入模拟对话文本")
+        score = helpers["clamp_score"](int(body.get("score") or 0))
+        await memory.ensure_loaded()
+        cfg_favor = memory.load_favor_cfg()
+        gating = bool(body.get("gating", True)) and bool(cfg_favor.get("enabled", True))
+
+        import time as _time
+        now = _time.time()
+        tier_num = 3 if tier == "tier3" else 2
+        cfg = _t3_cfg() if tier_num == 3 else _tier2_cfg()
+        tset = memory.tier3_settings(cfg) if tier_num == 3 else memory.tier2_settings(cfg)
+        lc = memory.lifecycle_settings(cfg.get("lifecycle"))
+        if tier_num == 3:
+            scored, src = await memory._match_tier3_text(text, cfg)
+        else:
+            scored, src = await memory._match_tier2_text(text, cfg)
+
+        max_entries = int(tset["max_entries"])
+        max_chars = int(tset["max_chars"])
+        ok_scored, _blocked = memory.apply_gating(scored, score, gating, tier=tier_num)
+
+        def _blen(e: Dict[str, Any]) -> int:
+            content = str(e.get("content", "")).strip()
+            if tier_num == 3:
+                fam = str(e.get("familiarity", "")).strip()
+                return len(f"· 【{fam}】{content}" if fam else f"· {content}")
+            return len(content)
+
+        # 复刻渲染层预算：2/3 档一致=skip（跳过超长条目、继续处理其后）。
+        # ⚠️ v1.6.3：3 档渲染器已从 break 改为 continue（#5），此处必须同步，
+        # 否则召回测试台会给 3 档显示错误的去留原因（谎报「其后全停」）。
+        kept_ids: List[str] = []
+        used = 0
+        for _s, _src, e in ok_scored[:max_entries]:
+            content = str(e.get("content", "")).strip()
+            if not content:
+                continue
+            if used + _blen(e) > max_chars:
+                continue
+            kept_ids.append(str(e.get("id", "?")))
+            used += _blen(e)
+        kept_set = set(kept_ids)
+
+        # #9：用公开只读快照替代直接读私有 memory._state["hit_stats"]（改善封装、防误改）。
+        # 循环外取一次，避免每条候选都全量拷贝。
+        hit_snap = memory.hit_stats_snapshot()
+        rows: List[Dict[str, Any]] = []
+        for s, source, e in scored:
+            eid = str(e.get("id", "?"))
+            try:
+                need = int(e.get("min_favor", 0) or 0)
+            except (TypeError, ValueError):
+                need = 0
+            gated_ok = (not gating) or tier_num == 3 or need <= score
+            content = str(e.get("content", "")).strip()
+            kept = eid in kept_set
+            if kept:
+                reason = "入选"
+            elif not gated_ok:
+                reason = f"门控拦截（min_favor={need} > score={score}）"
+            elif not content:
+                reason = "内容为空"
+            elif eid not in [str(x[2].get("id", "?")) for x in ok_scored[:max_entries]]:
+                reason = f"超出条数上限（前 {max_entries} 条才参与预算）"
+            else:
+                reason = f"超出字符预算（{max_chars}），跳过（其后条目仍继续参与）"
+            stat = hit_snap.get(memory._hit_key(tier_num, eid)) or {}
+            rows.append({
+                "id": eid,
+                "title": str(e.get("title", "")),
+                "score": round(float(s), 4),
+                "source": source,
+                "gating_passed": gated_ok,
+                "kept": kept,
+                "heat": round(memory.heat_factor(stat, now, lc), 3),
+                "hits": int(stat.get("hits", 0)),
+                "reason": reason,
+            })
+        return {
+            "tier": tier, "text": text, "src": src, "score": score, "gating": gating,
+            "lifecycle_enabled": lc["enabled"], "threshold": float(tset["threshold"]),
+            "candidate_count": len(rows), "kept": kept_ids, "candidates": rows[:40],
+        }
+
     @router.post("/api/config", summary="修改插件配置（好感度衰减等）")
     async def api_config(request: Request) -> Dict[str, Any]:
         _check_key(request)
@@ -1024,6 +1173,19 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "TIER3_MAX_CHARS": (int, 100, 3000),
             "TIER3_SIM_THRESHOLD": (float, 0.0, 1.0),
             "TIER3_SCAN_MSGS": (int, 1, 30),
+            # 扩展：记忆生命周期（A2/A3，1.5.0）
+            "LIFECYCLE_ENABLED": (bool, None, None),
+            "LIFECYCLE_HALF_LIFE_DAYS": (int, 1, 3650),
+            "LIFECYCLE_FLOOR": (float, 0.0, 1.0),
+            "LIFECYCLE_PROTECT_WEIGHT": (int, 0, 100),
+            "LIFECYCLE_REINFORCE_BONUS": (int, 0, 100),
+            # 扩展：独立嵌入后端（v1.6.0）
+            "EMBED_PROVIDER": (str, None, None),
+            "EMBED_BASE_URL": (str, None, None),
+            "EMBED_API_KEY": (str, None, None),
+            "EMBED_MODEL": (str, None, None),
+            "EMBED_DIMENSIONS": (int, 0, 8192),
+            "EMBED_BATCH_SIZE": (int, 1, 256),
             # 扩展：备忘录
             "MEMO_ENABLED": (bool, None, None),
             "MEMO_MAX_ITEMS": (int, 1, 500),

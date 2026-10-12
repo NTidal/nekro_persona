@@ -1232,6 +1232,28 @@
         </div>
         <pre id="previewOutput" class="code-output placeholder">选择频道与好感度后，点击「渲染预览」。</pre>
       </div>
+      <div class="panel" id="recallPanel">
+        <div class="panel-head">
+          <div><h2 class="panel-title">检索实验</h2><div class="panel-subtitle">输入一段模拟对话，看 2/3 档每条候选的分数、来源、门控与预算去留（只读，不改数据）</div></div>
+        </div>
+        <div class="panel-body">
+          <div class="field-row">
+            <label class="field-label">档位
+              <select id="recallTier" class="select" aria-label="检索档位"><option value="tier2">2 档·往事</option><option value="tier3">3 档·世界知识</option></select>
+            </label>
+            <label class="field-label">模拟好感度<input id="recallScore" class="field" type="number" step="1" value="0" aria-label="模拟好感度"></label>
+            <label class="field-label" style="justify-content:end">门控
+              <span class="switch" title="启用好感度门控"><input id="recallGating" type="checkbox" checked aria-label="启用门控"><span></span></span>
+            </label>
+          </div>
+          <label class="field-label">模拟对话文本<input id="recallText" class="field" placeholder="例如：上次那座桥怎么样了" aria-label="模拟对话文本"></label>
+          <div class="row" style="display:flex;gap:8px;align-items:center;margin-top:8px">
+            <button class="btn primary" id="runRecall" type="button">测试检索</button>
+            <span id="recallMeta" class="hint">尚未测试</span>
+          </div>
+          <div id="recallResult" style="margin-top:10px"><div class="hint">输入文本后点「测试检索」。</div></div>
+        </div>
+      </div>
     </section>
   </main>
 </div>
@@ -1362,6 +1384,15 @@ const state = {
   tab: 'overview',
   overview: null,
   budgetDirty: false,
+  lcDirty: false,
+  emDirty: false,
+  // 脏表单快照（v1.6.3 修复 #1）：renderOverview 每次用 innerHTML 整体重建 #overviewContent，
+  // 会销毁所有 input（模板 input 无 value 属性 → 新元素 .value 为空）。脏值若只活在 DOM 里，
+  // 任何一次重绘（全局刷新 / 切 tab 回来 / 后台 quiet reload）都会把它抹成空白且无法保存。
+  // 所以编辑时把整面板字段快照进这里，重绘后由 fill* 从快照回写。
+  budgetForm: null,
+  lcForm: null,
+  emForm: null,
   memory: { tier: 'tier1', data: { tier1: [], tier2: [], tier3: [], stages: [] } },
   trash: [],
   lastTrashId: '',
@@ -1678,6 +1709,8 @@ function renderOverview(data) {
   const tier3 = data.tier3 || {};
   const decay = data.decay || {};
   const gating = data.gating || {};
+  const lc = data.lifecycle || {};
+  const em = data.embed || {};
   const vectors = Number(tier2.vectors || 0);
   const vectorPct = tier2.count ? clampPercent(vectors / tier2.count * 100) : 0;
   const renderedChars = Number(tier1.rendered_chars ?? tier1.chars ?? 0);
@@ -1749,6 +1782,39 @@ function renderOverview(data) {
         </div>
       </section>
     </div>
+    <div class="two-col">
+      <section class="panel">
+        <div class="panel-head"><div><h2 class="panel-title">记忆生命周期 · 热度排序</h2><div class="panel-subtitle">常想起的记忆更稳，冷门的在超预算时优先让位</div></div><div class="panel-actions"><span id="lcDirtyBadge" class="badge warning" hidden>有未保存修改</span><button class="btn primary" id="saveLifecycle" type="button"${writable ? '' : ' disabled'}>保存</button></div></div>
+        <div class="panel-body">
+          <div class="switch-row">
+            <div class="switch-copy"><strong>启用热度排序</strong><small>只影响 2/3 档的排序与截断，绝不删除或改写你的内容；关闭时行为完全不变</small></div>
+            <label class="switch"><input id="lcEnabled" type="checkbox" aria-label="启用记忆生命周期"${ro}><span></span></label>
+          </div>
+          <div class="field-grid-3" style="margin-top:12px">
+            <label class="field-label">热度半衰期（天）<input id="lcHalfLife" class="field" type="number" min="1" max="3650" aria-label="热度半衰期天数"${ro}></label>
+            <label class="field-label">热度下限（0~1）<input id="lcFloor" class="field" type="number" min="0" max="1" step="0.05" aria-label="热度下限"${ro}></label>
+            <label class="field-label">豁免降权 weight≥<input id="lcProtect" class="field" type="number" min="0" max="100" aria-label="豁免降权的 weight 阈值"${ro}></label>
+            <label class="field-label">命中强化（×0.01）<input id="lcReinforce" class="field" type="number" min="0" max="100" aria-label="命中强化步进"${ro}></label>
+          </div>
+          <div class="overview-note" style="margin-top:12px"><div>半衰期越短，冷门记忆降权越快；下限保证再冷也不会彻底消失。<code>weight ≥ 豁免值</code> 的核心设定完全不受降权。命中强化填 10 = 每次命中回补 0.10 热度。</div></div>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><div><h2 class="panel-title">独立嵌入后端</h2><div class="panel-subtitle">给角色记忆单独挂一个 OpenAI 兼容嵌入端点</div></div><div class="panel-actions"><span id="emDirtyBadge" class="badge warning" hidden>有未保存修改</span><button class="btn primary" id="saveEmbed" type="button"${writable ? '' : ' disabled'}>保存</button></div></div>
+        <div class="panel-body">
+          ${em.degraded ? `<div class="overview-note" style="margin-bottom:12px;border-color:var(--danger,#c0392b)"><div><strong>⚠ 嵌入端点不可用，检索已降级</strong>：custom 端点连续 ${Number(em.fail_streak || 0)} 次失败（${escapeHtml(em.reason || '未知原因')}），2/3 档现在<strong>只靠关键词命中</strong>，语义召回已暂停。<br>为避免向量空间混算（NA 查询向量比 custom 条目向量会得到无意义相似度），<strong>不会自动回落 NA 内置嵌入</strong>。请检查 Base URL / API Key / 模型名与端点可用性；恢复后下次检索自动复原。</div></div>` : ''}
+          <div class="field-grid-3">
+            <label class="field-label">后端<select id="emProvider" class="select" aria-label="嵌入后端"${ro}><option value="na">na · NekroAgent 内置</option><option value="custom">custom · 自配端点</option></select></label>
+            <label class="field-label">维度（0=模型默认）<input id="emDim" class="field" type="number" min="0" max="8192" aria-label="嵌入维度"${ro}></label>
+            <label class="field-label">批量大小<input id="emBatch" class="field" type="number" min="1" max="256" aria-label="嵌入批量大小"${ro}></label>
+          </div>
+          <label class="field-label" style="margin-top:10px">Base URL<input id="emBaseUrl" class="field mono" type="text" placeholder="https://your-endpoint.example/v1" aria-label="嵌入端点 Base URL"${ro}></label>
+          <label class="field-label" style="margin-top:10px">模型名<input id="emModel" class="field mono" type="text" placeholder="your-embedding-model" aria-label="嵌入模型名"${ro}></label>
+          <label class="field-label" style="margin-top:10px">API Key<input id="emKey" class="field mono" type="password" placeholder="${em.has_key ? '已配置 · 留空则不修改' : 'custom 密钥，本地端点可留空'}" aria-label="嵌入 API Key" autocomplete="off"${ro}></label>
+          <div class="overview-note" style="margin-top:12px;border-color:var(--warning,#b8860b)"><div><strong>切换模型后必做两件事</strong>：① 向量缓存按签名自动整体作废，首轮会重新嵌入全部条目（限流较严的端点会较慢，已内置退避重试）；② <strong>阈值必须重新标定</strong>——不同模型分数分布不同，跑 <code>scripts/calibrate_threshold.py</code> 再定 2/3 档阈值。<br>部分端点对单次请求的条数有上限（常见为 10 条，超了会 400，插件会自动对半拆重试）；不确定时把批量大小设小一些。改配置无需重启，下次检索即生效。</div></div>
+        </div>
+      </section>
+    </div>
     <section class="panel">
       <div class="panel-head"><div><h2 class="panel-title">好感度门控</h2><div class="panel-subtitle">分数区间与对应的互动指引</div></div><button class="btn" type="button" data-jump="rules">编辑规则</button></div>
       <div class="table-wrap"><table class="data-table"><thead><tr><th>档位</th><th>分数区间</th><th>互动指引</th></tr></thead><tbody>${stageRows}</tbody></table></div>
@@ -1764,11 +1830,47 @@ function renderOverview(data) {
       ${(rubric.rules || []).length ? `<div class="panel-body muted" style="border-top:1px solid var(--line);font-size:10px">${escapeHtml(rubric.rules.join('；'))}</div>` : ''}
     </section>`;
   fillBudgetInputs({ tier1, tier2, tier3 });
+  fillAdvancedInputs(data);
 }
 
-/** 把概览里的三档参数填进「三档预算与阈值」表单（不覆盖用户正在编辑的脏值）。 */
+// 各面板字段清单（模块级，供脏标记委托与快照/回写共用，避免两处重复维护选择器）。
+const BUDGET_FIELDS = ['#budgetTier1Chars', '#budgetTier2Entries', '#budgetTier2Chars',
+  '#budgetTier2Threshold', '#budgetTier2Scan', '#budgetTier3Enabled', '#budgetTier3Entries',
+  '#budgetTier3Chars', '#budgetTier3Threshold', '#budgetTier3Scan'];
+const LC_FIELDS = ['#lcEnabled', '#lcHalfLife', '#lcFloor', '#lcProtect', '#lcReinforce'];
+const EM_FIELDS = ['#emProvider', '#emDim', '#emBatch', '#emBaseUrl', '#emModel', '#emKey'];
+
+/** 把一组字段的当前值快照成普通对象（checkbox 存 checked，其余存 value）。 */
+function snapshotForm(selectors) {
+  const snap = {};
+  for (const sel of selectors) {
+    const el = $(sel);
+    if (!el) continue;
+    snap[sel] = (el.type === 'checkbox') ? { c: el.checked } : { v: el.value };
+  }
+  return snap;
+}
+/** 把快照写回 DOM（重绘后元素是全新的、无 value 属性，必须靠这里恢复脏值）。 */
+function restoreForm(snap) {
+  if (!snap) return;
+  for (const sel of Object.keys(snap)) {
+    const el = $(sel);
+    if (!el) continue;
+    const rec = snap[sel];
+    if (rec && 'c' in rec) el.checked = rec.c;
+    else if (rec) el.value = rec.v;
+  }
+}
+
+/** 把概览里的三档参数填进「三档预算与阈值」表单。
+ *  v1.6.3 修复 #1：dirty 时不再早退留空，而是从 state.budgetForm 快照回写用户未保存的编辑
+ *  （renderOverview 会销毁重建 input，脏值只活在 DOM 里会被抹掉）；徽章同步无条件执行。 */
 function fillBudgetInputs(data) {
-  if (state.budgetDirty) return;
+  if (state.budgetDirty) {
+    restoreForm(state.budgetForm);
+    syncBudgetDirty();
+    return;
+  }
   const t1 = data.tier1 || {}, t2 = data.tier2 || {}, t3 = data.tier3 || {};
   const set = (sel, value) => { const el = $(sel); if (el) el.value = value; };
   set('#budgetTier1Chars', Number(t1.limit ?? 2000));
@@ -1782,6 +1884,7 @@ function fillBudgetInputs(data) {
   set('#budgetTier3Chars', Number(t3.max_chars ?? 700));
   set('#budgetTier3Threshold', Number(t3.threshold ?? 0.35));
   set('#budgetTier3Scan', Number(t3.scan_msgs ?? 6));
+  state.budgetForm = null;
   state.budgetDirty = false;
   syncBudgetDirty();
 }
@@ -1813,6 +1916,89 @@ function collectBudget() {
     TIER3_SIM_THRESHOLD: num('#budgetTier3Threshold', 0, 1, '3 档向量阈值', true),
     TIER3_SCAN_MSGS: num('#budgetTier3Scan', 1, 30, '3 档扫描条数')
   };
+}
+
+/** 把概览里的生命周期/嵌入参数填进「高级设置」表单。
+ *  v1.6.3 修复 #1：dirty 时从 state.lcForm/emForm 快照回写（而非跳过留空——重绘已销毁旧 input），
+ *  徽章同步移出 if、无条件执行，避免「值空了、徽章也没了」。 */
+function fillAdvancedInputs(data) {
+  const lc = data.lifecycle || {}, em = data.embed || {};
+  const set = (sel, value) => { const el = $(sel); if (el) el.value = value; };
+  if (state.lcDirty) {
+    restoreForm(state.lcForm);
+  } else {
+    const en = $('#lcEnabled'); if (en) en.checked = !!lc.enabled;
+    set('#lcHalfLife', Number(lc.half_life_days ?? 30));
+    set('#lcFloor', Number(lc.floor ?? 0.6));
+    set('#lcProtect', Number(lc.protect_weight ?? 4));
+    set('#lcReinforce', Number(lc.reinforce_bonus ?? 10));
+    state.lcForm = null;
+  }
+  syncAdvDirty('lc');
+  if (state.emDirty) {
+    restoreForm(state.emForm);
+  } else {
+    set('#emProvider', em.provider || 'na');
+    set('#emDim', Number(em.dimensions ?? 0));
+    set('#emBatch', Number(em.batch_size ?? 10));
+    set('#emBaseUrl', em.base_url || '');
+    set('#emModel', em.model || '');
+    const key = $('#emKey'); if (key) key.value = '';   // 永不回填明文密钥
+    state.emForm = null;
+  }
+  syncAdvDirty('em');
+}
+
+function syncAdvDirty(which) {
+  const badge = $(which === 'lc' ? '#lcDirtyBadge' : '#emDirtyBadge');
+  if (badge) badge.hidden = !(which === 'lc' ? state.lcDirty : state.emDirty);
+}
+
+/** 收集并校验生命周期表单。 */
+function collectLifecycle() {
+  const num = (selector, min, max, label, isFloat) => {
+    const raw = ($(selector)?.value ?? '').trim();
+    const value = Number(raw);
+    if (!raw || !Number.isFinite(value) || value < min || value > max) {
+      throw new Error(`${label}必须在 ${min} ~ ${max} 之间`);
+    }
+    return isFloat ? value : Math.round(value);
+  };
+  return {
+    LIFECYCLE_ENABLED: Boolean($('#lcEnabled')?.checked),
+    LIFECYCLE_HALF_LIFE_DAYS: num('#lcHalfLife', 1, 3650, '热度半衰期'),
+    LIFECYCLE_FLOOR: num('#lcFloor', 0, 1, '热度下限', true),
+    LIFECYCLE_PROTECT_WEIGHT: num('#lcProtect', 0, 100, '豁免降权 weight'),
+    LIFECYCLE_REINFORCE_BONUS: num('#lcReinforce', 0, 100, '命中强化步进')
+  };
+}
+
+/** 收集并校验嵌入后端表单。API Key 留空则不提交（= 不修改）。 */
+function collectEmbed() {
+  const provider = ($('#emProvider')?.value || 'na').trim();
+  const baseUrl = ($('#emBaseUrl')?.value || '').trim();
+  const model = ($('#emModel')?.value || '').trim();
+  const num = (selector, min, max, label) => {
+    const raw = ($(selector)?.value ?? '').trim();
+    const value = Number(raw);
+    if (!raw || !Number.isFinite(value) || value < min || value > max) {
+      throw new Error(`${label}必须在 ${min} ~ ${max} 之间`);
+    }
+    return Math.round(value);
+  };
+  if (provider === 'custom' && (!baseUrl || !model)) {
+    throw new Error('custom 后端必须填写 Base URL 与模型名');
+  }
+  const body = {
+    EMBED_PROVIDER: provider,
+    EMBED_BASE_URL: baseUrl,
+    EMBED_MODEL: model,
+    EMBED_DIMENSIONS: num('#emDim', 0, 8192, '嵌入维度'),
+    EMBED_BATCH_SIZE: num('#emBatch', 1, 256, '批量大小')
+  };
+  const key = ($('#emKey')?.value || '').trim();
+  if (key) body.EMBED_API_KEY = key;   // 留空 = 保持原密钥不变
+  return body;
 }
 
 async function loadMemory(options = {}) {
@@ -2686,6 +2872,41 @@ async function doPreview() {
     $('#previewDebug').innerHTML = '<div class="error-state"><strong>预览失败</strong>请检查频道后重试。</div>';
   }
 }
+async function runRecallTest(button) {
+  const text = ($('#recallText').value || '').trim();
+  if (!text) { toast('请先输入模拟对话文本', 'error'); return; }
+  const tier = $('#recallTier').value || 'tier2';
+  const score = Number($('#recallScore').value || 0);
+  const gating = $('#recallGating').checked;
+  const result = $('#recallResult');
+  await withButton(button, async () => {
+    try {
+      const data = await api('recall_test', { method: 'POST', body: { text, tier, score, gating } });
+      const rows = data.candidates || [];
+      const total = Number(data.candidate_count || rows.length);
+      // #10：后端只回传前 40 条候选，candidate_count 却是全量——不提示会让人以为
+      // 「候选 87」都在下面，其实只渲染了 40 行。截断时明确告知。
+      const truncNote = total > rows.length
+        ? ` <span class="badge warning">共 ${total} 条，仅列前 ${rows.length}</span>` : '';
+      $('#recallMeta').innerHTML = `${escapeHtml(data.tier)} · 命中方式 ${escapeHtml(data.src || '无')} · 候选 ${total} · 入选 ${(data.kept || []).length} · 阈值 ${escapeHtml(String(data.threshold))} · 生命周期${data.lifecycle_enabled ? '开' : '关'}${truncNote}`;
+      if (!rows.length) { result.innerHTML = '<div class="hint">没有匹配到任何候选（关键词未命中且向量低于阈值）。</div>'; return; }
+      // #7：用项目既有的 .data-table + .table-wrap（7 列在窄视口靠 table-wrap 横向滚动），
+      // 原来的 class="table" 在 CSS 里根本不存在 → 表格无样式且会溢出。
+      result.innerHTML = `<div class="table-wrap"><table class="data-table"><thead><tr><th>条目</th><th>分数</th><th>来源</th><th>热度</th><th>命中</th><th>门控</th><th>结果</th></tr></thead><tbody>${rows.map(r => `<tr${r.kept ? ' style="background:rgba(46,160,67,0.08)"' : ''}>
+        <td data-label="条目"><span class="entry-title">${escapeHtml(r.title || r.id)}</span><span class="entry-id">${escapeHtml(r.id)}</span></td>
+        <td data-label="分数" class="mono">${Number(r.score).toFixed(3)}</td>
+        <td data-label="来源">${escapeHtml(r.source)}</td>
+        <td data-label="热度" class="mono">${Number(r.heat).toFixed(2)}</td>
+        <td data-label="命中" class="mono">${Number(r.hits || 0)}</td>
+        <td data-label="门控">${r.gating_passed ? '通过' : '拦截'}</td>
+        <td data-label="结果">${r.kept ? '<span class="badge success">入选</span>' : `<span class="badge">${escapeHtml(r.reason || '落选')}</span>`}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+    } catch (error) {
+      $('#recallMeta').textContent = '测试失败';
+      result.innerHTML = `<div class="error-state"><strong>检索实验失败</strong>${escapeHtml(error.message)}</div>`;
+    }
+  });
+}
 async function copyPreview() {
   const text = $('#previewOutput').textContent;
   try {
@@ -2718,17 +2939,80 @@ function wireEvents() {
 
   // 三档预算：用事件委托绑定 —— #overviewContent 每次 loadOverview 都会重建，
   // 直接给元素 addEventListener 会在重绘后失效（实测：改动不触发脏标记、保存无效）。
-  const budgetSelectors = ['#budgetTier1Chars', '#budgetTier2Entries', '#budgetTier2Chars',
-    '#budgetTier2Threshold', '#budgetTier2Scan', '#budgetTier3Enabled', '#budgetTier3Entries',
-    '#budgetTier3Chars', '#budgetTier3Threshold', '#budgetTier3Scan'];
+  // v1.6.3 修复 #1：置脏的同时把**整面板**当前值快照进 state.xxxForm——因为重绘会销毁
+  // 所有 input（模板无 value 属性），脏值若只留在 DOM 里，下一次 quiet reload / 切 tab 回来
+  // 就会全变空白且无法保存。快照存在 JS state，重绘后由 fill* 回写。
   const markBudgetDirty = event => {
-    if (event.target.closest?.(budgetSelectors.join(','))) {
+    if (event.target.closest?.(BUDGET_FIELDS.join(','))) {
       state.budgetDirty = true;
+      state.budgetForm = snapshotForm(BUDGET_FIELDS);
       syncBudgetDirty();
+    }
+    if (event.target.closest?.(LC_FIELDS.join(','))) {
+      state.lcDirty = true;
+      state.lcForm = snapshotForm(LC_FIELDS);
+      syncAdvDirty('lc');
+    }
+    if (event.target.closest?.(EM_FIELDS.join(','))) {
+      state.emDirty = true;
+      state.emForm = snapshotForm(EM_FIELDS);
+      syncAdvDirty('em');
     }
   };
   $('#overviewContent').addEventListener('input', markBudgetDirty);
   $('#overviewContent').addEventListener('change', markBudgetDirty);
+  // 高级设置（生命周期 / 嵌入后端）保存：与预算共用 /api/config，各自独立脏标记。
+  const advSave = { saveLifecycle: ['lc', collectLifecycle, '生命周期设置已保存并生效'],
+                    saveEmbed: ['em', collectEmbed, '嵌入后端设置已保存，下次检索生效'] };
+  $('#overviewContent').addEventListener('click', async event => {
+    const button = event.target.closest('#saveLifecycle, #saveEmbed');
+    if (!button) return;
+    const [which, collect, okMsg] = advSave[button.id];
+    let body;
+    try {
+      body = collect();
+    } catch (error) {
+      toast(error.message, 'error');
+      return;
+    }
+    // #8：凡是会改变 _embed_signature（→ 向量缓存整体作废、需重嵌+重标定）的改动都要二次确认。
+    // 签名 = provider + (custom 时) base_url + model + dimensions。旧实现只覆盖 na→custom 和改 model，
+    // 漏了 custom→na、改 base_url、改 dimensions——这三者同样作废缓存却零提示。API Key 不在签名里，故不触发。
+    if (button.id === 'saveEmbed') {
+      const prev = state.overview?.embed || {};
+      const normUrl = s => (s || '').trim().replace(/\/+$/, '');   // 与签名口径一致：尾斜杠归一
+      const prevProvider = (prev.provider || 'na').trim().toLowerCase();
+      const newProvider = body.EMBED_PROVIDER;
+      const changed = [];
+      if (prevProvider !== newProvider) changed.push(`后端 ${prevProvider}→${newProvider}`);
+      if (newProvider === 'custom') {
+        if (normUrl(prev.base_url) !== normUrl(body.EMBED_BASE_URL)) changed.push('Base URL');
+        if ((prev.model || '').trim() !== (body.EMBED_MODEL || '').trim()) changed.push('模型名');
+        if (Number(prev.dimensions || 0) !== Number(body.EMBED_DIMENSIONS || 0)) changed.push('维度');
+      }
+      if (changed.length) {
+        const yes = confirm(`以下改动会让向量缓存整体作废（${changed.join('、')}）：\n① 首轮需重新嵌入全部条目（强限流端点会较慢，已内置退避重试）；\n② 2/3 档阈值需重新标定（scripts/calibrate_threshold.py）。\n\n确定保存吗？`);
+        if (!yes) return;
+      }
+    }
+    button.disabled = true;
+    try {
+      await api('config', { method: 'POST', body });
+      if (which === 'lc') { state.lcDirty = false; } else { state.emDirty = false; }
+      syncAdvDirty(which);
+      toast(okMsg, 'success');
+      await loadOverview({ quiet: true });
+    } catch (error) {
+      if (/WEBUI_ACCESS_KEY|写操作已禁用/.test(error.message)) {
+        toast('保存被拒绝：未配置 WEBUI_ACCESS_KEY，写操作已禁用。请在 NA 插件配置里设置访问密钥后刷新本页。', 'error');
+        await loadOverview({ quiet: true });
+      } else {
+        toast(`保存失败：${error.message}`, 'error');
+      }
+    } finally {
+      button.disabled = false;
+    }
+  });
   $('#overviewContent').addEventListener('click', async event => {
     const button = event.target.closest('#saveBudget');
     if (!button) return;
@@ -3084,6 +3368,7 @@ function wireEvents() {
   }));
   $('#renderPreview').addEventListener('click', event => withButton(event.currentTarget, doPreview));
   $('#copyPreview').addEventListener('click', copyPreview);
+  $('#runRecall').addEventListener('click', event => runRecallTest(event.currentTarget));
 }
 
 function boot() {

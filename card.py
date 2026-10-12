@@ -34,6 +34,8 @@ _ACCENT_SOFT = (255, 240, 231)    # #fff0e7
 _TEXT = (41, 70, 81)              # #294651
 _SUBTEXT = (95, 133, 136)         # #5f8588
 _MUTED = (141, 167, 164)          # #8da7a4
+_NEUTRAL = (150, 163, 166)        # 0 分中性色（避免把 0 渲染成"正分"珊瑚色）
+_COOL = (57, 125, 134)            # #397d86 深青（负分）
 _BG_TOP = (223, 244, 244)         # #dff4f4
 _BG_MID = (255, 250, 241)         # #fffaf1
 _BG_BOTTOM = (255, 228, 213)      # #ffe4d5
@@ -50,6 +52,13 @@ _STAGE_STYLES = {
     "偏爱": ((255, 240, 231), (217, 110, 100)),
     "特别亲密": ((217, 110, 100), (255, 255, 255)),
 }
+
+# 前三名名次徽章配色 (底色, 字色) —— 金 / 银 / 铜
+_RANK_METALS = [
+    ((230, 168, 42), (255, 255, 255)),
+    ((186, 197, 205), (255, 255, 255)),
+    ((202, 150, 107), (255, 255, 255)),
+]
 
 _FONT_CANDIDATES = [
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -485,6 +494,31 @@ def _avatar_initial(name: str) -> str:
     return "?"
 
 
+def _fit_font(draw: Any, text: str, font: Any, max_w: float, max_h: float) -> Any:
+    """按可用内接尺寸缩小字号，保证头像首字完整落在圆内。
+
+    旧实现直接用固定字号居中，字形顶到圆边会被圆形裁掉一角（"爱"/"老" 这类
+    方块字尤其明显，看着像残字）。这里按圆形内接矩形逐级缩到刚好放得下。
+    """
+    try:
+        from PIL import ImageFont
+
+        path = getattr(font, "path", None)
+        if not path:
+            return font
+        size = int(getattr(font, "size", 17))
+        best = font
+        while size > 8:
+            bb = draw.textbbox((0, 0), text, font=best)
+            if (bb[2] - bb[0]) <= max_w and (bb[3] - bb[1]) <= max_h:
+                break
+            size = max(8, int(size * 0.88))
+            best = ImageFont.truetype(path, size)
+        return best
+    except Exception:  # noqa: BLE001
+        return font
+
+
 _AVATAR_TTL = 7 * 24 * 3600   # 头像磁盘缓存 7 天
 _AVATAR_TIMEOUT = 4           # 单次抓取超时（秒）
 
@@ -560,16 +594,17 @@ def render_favorability_rank(
 
     try:
         f_brand = ImageFont.truetype(font_path_resolved, 14)
-        f_title = ImageFont.truetype(font_path_resolved, 32)
+        f_title = ImageFont.truetype(font_path_resolved, 30)
         f_hint = ImageFont.truetype(font_path_resolved, 16)
         f_name = ImageFont.truetype(font_path_resolved, 18)
         f_id = ImageFont.truetype(font_path_resolved, 15)
-        f_score = ImageFont.truetype(font_path_resolved, 20)
+        f_score = ImageFont.truetype(font_path_resolved, 19)
         f_stage = ImageFont.truetype(font_path_resolved, 14)
         f_rank = ImageFont.truetype(font_path_resolved, 18)
         f_tag = ImageFont.truetype(font_path_resolved, 11)
         f_sub = ImageFont.truetype(font_path_resolved, 12)   # 副标题/页脚
-        f_avatar = ImageFont.truetype(font_path_resolved, 18)   # 头像首字
+        f_avatar = ImageFont.truetype(font_path_resolved, 17)   # 头像首字
+        f_meta = ImageFont.truetype(font_path_resolved, 13)     # 头部统计
         f_rank_small = ImageFont.truetype(font_path_resolved, 11)  # 名次小徽章
     except Exception:  # noqa: BLE001
         logger.exception("字体加载失败")
@@ -580,13 +615,16 @@ def render_favorability_rank(
     total = len(shown)
 
     MARGIN = 18          # 图片四周留白，让白色卡片"浮"在渐变背景上
-    COL_W = 520          # 单列宽
+    COL_W = 528          # 单列宽
     COL_GAP = 16         # 列间距
     pad = 24             # 卡片内边距
-    header_h = 50        # 标题区（只剩标题）
-    row_h = 68
+    header_h = 72        # 标题 + 头部统计 + 分隔线
+    row_h = 70
     gap = 8
-    bottom_pad = 22      # 底部内边距
+    foot_h = 32          # 页脚（统计 + 水印）
+    bottom_pad = 18      # 底部内边距
+    BADGE = 26           # 名次徽章直径（独立槽位，不叠在头像上）
+    AV_R = 21            # 头像半径
     # 标签约束：控制单条长度与总条数，避免占满整行
     MAX_TAGS = 4        # 标签行最多几个（含 ID）
     MAX_TAG_CHARS = 7   # 关系标签 / 印象记录的字数上限
@@ -597,6 +635,11 @@ def render_favorability_rank(
     #    （如 n=211 → 14 列满 + 末列仅 1 个，视觉上是个空洞列）。
     # 例：15 → [15]；16 → [8,8]；46 → [12,12,11,11]；60 → [15,15,15,15]；
     #     108 → [14,14,14,14,13,13,13,13]；211 → [15,14×14]
+    #
+    # 注：调用方 plugin.py 的 _rank_profiles 已按 RANK_HIDE_EMPTY 过滤掉
+    # 「0 分且无任何记录」的空壳档案（实测 363 → 76，最多 20 人 / 2 列），
+    # 因此这里不再自行截断 —— 加了也永远触发不到，只会平白增加复杂度。
+    n_all = len(shown)
     n = len(shown)
     TARGET_PER_COL = 15
     if n <= 0:
@@ -609,7 +652,10 @@ def render_favorability_rank(
 
     rows_h = max(per_col, 1) * (row_h + gap)
     card_w = pad * 2 + cols * COL_W + (cols - 1) * COL_GAP
-    card_h = pad + header_h + rows_h - gap + bottom_pad
+    # 页脚只在真的截断了人时才出现（见渲染末尾），没截断就不预留这条高度，
+    # 否则列表下方会多出一条空白带。
+    _need_foot = max(0, len(entries) - len(shown)) > 0
+    card_h = pad + header_h + rows_h - gap + (foot_h if _need_foot else 0) + bottom_pad
     img_w = card_w + MARGIN * 2
     img_h = card_h + MARGIN * 2
     S = float(scale) if scale and scale > 0 else _RENDER_SCALE
@@ -617,6 +663,8 @@ def render_favorability_rank(
     img = _vertical_bg(PIL, int(img_w * S), int(img_h * S))
 
     # 卡片柔和投影（独立图层 + 高斯模糊；失败则静默跳过）
+    # ⚠️ 这里必须用 card_w：旧代码误写成未定义的 `width`，一旦本 except
+    #    被触发就是 NameError，然后被 except 吞掉 → 投影静默失效。
     try:
         from PIL import ImageFilter
 
@@ -624,12 +672,12 @@ def render_favorability_rank(
         sd = PIL.ImageDraw.Draw(shadow)
         sd.rounded_rectangle(
             [
-                int(MARGIN * S), int((MARGIN + 5) * S),
-                int((MARGIN + width) * S), int((MARGIN + card_h + 5) * S),
+                int(MARGIN * S), int((MARGIN + 6) * S),
+                int((MARGIN + card_w) * S), int((MARGIN + card_h + 6) * S),
             ],
-            radius=int(24 * S), fill=(58, 72, 82, 70),
+            radius=int(26 * S), fill=(58, 72, 82, 64),
         )
-        shadow = shadow.filter(ImageFilter.GaussianBlur(radius=9 * S))
+        shadow = shadow.filter(ImageFilter.GaussianBlur(radius=10 * S))
         img = PIL.Image.alpha_composite(img.convert("RGBA"), shadow).convert("RGB")
     except Exception:  # noqa: BLE001
         logger.debug("卡片投影绘制失败，已跳过", exc_info=True)
@@ -646,16 +694,52 @@ def render_favorability_rank(
 
     # ---------------- 标题区 ----------------
     hx = MARGIN + pad                  # 标题左边界（跨列统一）
-    draw.rounded_rectangle([hx, hy + 5, hx + 5, hy + 33], radius=3, fill=_ACCENT)
-    draw.text((hx + 16, hy), "好感度排行榜", font=f_title, fill=_TEXT)
+    # 红标与标题**按字形实际墨迹对齐**，而不是按 draw.text 的逻辑位置。
+    # ⚠️ 实测（msyh/LXGW 30px）：textbbox 返回 (0, 3, 180, 31) —— 顶部有 3px
+    #    的 ascender 空隙，逻辑中心与肉眼看到的墨迹中心差 3px。旧实现按
+    #    「逻辑 y + 固定偏移」画红标，肉眼看就是红标偏高一点、没跟标题齐平。
+    #    现在直接取 ink 上下沿，红标高度也贴合 ink 高度，视觉上真正对齐。
+    _ink = draw.textbbox((0, 0), "好感度排行榜", font=f_title)
+    _ink_top, _ink_bot = _ink[1], _ink[3]
+    _ink_h = max(1, _ink_bot - _ink_top)
+    _bar_x = hx
+    _bar_w = 5
+    _bar_top = hy + 2 + _ink_top
+    draw.rounded_rectangle(
+        [_bar_x, _bar_top, _bar_x + _bar_w, _bar_top + _ink_h],
+        radius=2.5, fill=_ACCENT,
+    )
+    draw.text((hx + 15, hy + 2), "好感度排行榜", font=f_title, fill=_TEXT)
 
-    rank_colors = [(230, 168, 42), (186, 197, 205), (202, 150, 107)]   # 金/银/铜
+    # 头部统计：填补原先空荡的标题右侧，同时让卡片一眼有"榜"的感觉
+    if shown:
+        _scores = [int(e.get("score", 0)) for e in shown]
+        _hi, _lo = max(_scores), min(_scores)
+        _stats = [f"共 {n_all} 人", f"最高 {_hi:+d}" if _hi else "最高 0"]
+        if _lo < 0:
+            _stats.append(f"最低 {_lo}")
+        meta_text = " · ".join(_stats)
+    else:
+        meta_text = "暂无数据"
+    _mw = int(draw.textlength(meta_text, font=f_meta))
+    # 统计文字按自身 ink 垂直居中对齐到标题的 ink 中心，而不是拍脑袋给个 y
+    _mk = draw.textbbox((0, 0), meta_text, font=f_meta)
+    _mcy = hy + 2 + (_ink_top + _ink_bot) / 2
+    draw.text(
+        (hx + card_w - pad * 2 - _mw, _mcy - (_mk[1] + _mk[3]) / 2),
+        meta_text, font=f_meta, fill=_MUTED,
+    )
+
+    # 标题区分隔线
+    _line_y = hy + header_h - 16
+    draw.rectangle([hx, _line_y, hx + card_w - pad * 2, _line_y], fill=(240, 243, 245))
+
     _av_fail = [0]   # 头像抓取连续失败计数（断网保护）
     row_base_y = hy + header_h
     TOP_BG = [(255, 250, 235), (246, 249, 251), (253, 245, 237)]        # 前三名淡底
     TOP_BORDER = [(240, 214, 150), (206, 216, 224), (232, 205, 178)]
-    SOFT_BORDER = (237, 240, 242)
-    TRACK = (238, 241, 243)
+    SOFT_BORDER = (235, 239, 241)
+    TRACK = (236, 240, 242)
 
     for i, entry in enumerate(shown):
         rank = i + 1
@@ -672,30 +756,57 @@ def render_favorability_rank(
         y = row_base_y + _row * (row_h + gap)
         is_top = rank <= 3
 
-        # 行卡片微投影：多层偏移模拟柔和阴影（逐行高斯模糊太贵）
-        for k, sc_col in ((3, (240, 243, 246)), (2, (234, 239, 243)), (1, (228, 234, 239))):
-            draw.rounded_rectangle(
-                [cx0, y + k, cx1, y + row_h + k], radius=14, fill=sc_col,
-            )
-
         draw.rounded_rectangle(
             [cx0, y, cx1, y + row_h],
             radius=14,
-            fill=TOP_BG[rank - 1] if is_top else (255, 255, 255),
+            fill=TOP_BG[rank - 1] if is_top else _ROW_BG,
             outline=TOP_BORDER[rank - 1] if is_top else SOFT_BORDER,
             width=1,
         )
 
-        right_edge = cx1 - 12
-        AVATAR_INSET = 10
-        text_x = cx0 + AVATAR_INSET + 40 + 12   # 头像(40)右侧留 12px 间隙
-        pad_in, gap_tag = 8, 5
-        line2_y = y + 38           # 第二行（标签行）顶部
-        pill_h = 20
+        score = int(entry.get("score", 0))
+        # 0 分走中性色：旧实现 score>=0 一律珊瑚色，把 0 画成了"正分"
+        if score > 0:
+            score_color = _ACCENT
+        elif score < 0:
+            score_color = _COOL
+        else:
+            score_color = _NEUTRAL
 
-        # ---------- 左：头像占位（昵称首字）+ 名次小徽章叠左下角 ----------
+        # 左侧竖条：前三名用名次金/银/铜，其余按分数正负着色。
+        # 旧实现用三层偏移的"假阴影"叠出行卡片，边缘发灰且各行不一致。
+        stripe_c = _RANK_METALS[rank - 1][0] if is_top else score_color
+        draw.rounded_rectangle(
+            [cx0 + 5, y + 13, cx0 + 8, y + row_h - 13], radius=2, fill=stripe_c,
+        )
+
+        right_edge = cx1 - 14
+
+        # ---------- 名次徽章：独立槽位 ----------
+        # ⚠️ 旧实现把徽章圆心放在 (ax-12, ay+12)、半径 11，圆的一部分压在头像上、
+        #    且紧贴行卡片左边界 → 名次 4/5/6 的数字左侧被裁掉（只剩右半边）。
+        #    现在徽章独立占一个槽位，任何名次都完整可见。
+        bx = cx0 + 14 + BADGE // 2
+        by = y + row_h // 2
+        if is_top:
+            b_fill, b_fg = _RANK_METALS[rank - 1]
+        else:
+            b_fill, b_fg = (246, 248, 249), (140, 154, 160)
+        draw.ellipse(
+            [bx - BADGE // 2, by - BADGE // 2, bx + BADGE // 2, by + BADGE // 2],
+            fill=b_fill,
+        )
+        _draw_centered(
+            draw,
+            [bx - BADGE // 2, by - BADGE // 2, bx + BADGE // 2, by + BADGE // 2],
+            str(rank), f_rank_small, b_fg,
+        )
+
+        # ---------- 头像：昵称首字，按内接尺寸缩放 ----------
         uid_for_avatar = str(entry.get("user_id") or entry.get("display_name") or "")
-        ax, ay, ar = cx0 + AVATAR_INSET + 20, y + row_h // 2, 20
+        ax = bx + BADGE // 2 + 12 + AV_R
+        ay = by
+        ar = AV_R
         av_img = None
         # 连续失败 3 次就放弃后续抓取，避免断网时整张图卡住
         if avatar_dir and _av_fail[0] < 3:
@@ -716,52 +827,57 @@ def render_favorability_rank(
             av_fill, av_fg = _avatar_color(uid_for_avatar)
             draw.ellipse([ax - ar, ay - ar, ax + ar, ay + ar], fill=av_fill)
             av_ch = _avatar_initial(entry.get("display_name") or entry.get("user_id"))
+            # 内接缩放：方形字顶到圆边会被裁掉一角
+            f_av = _fit_font(draw, av_ch, f_avatar, ar * 2 - 8, ar * 2 - 10)
             _draw_centered(
-                draw, [ax - ar, ay - ar, ax + ar, ay + ar], av_ch, f_avatar, av_fg,
+                draw, [ax - ar, ay - ar, ax + ar, ay + ar], av_ch, f_av, av_fg,
             )
-        # 名次小徽章（白描边使其从头像上"浮"出来）
-        rcx, rcy, rr = ax - 12, ay + 12, 11
-        if rank <= 3:
-            rank_fill, rank_fg = rank_colors[rank - 1], _WHITE
-        else:
-            rank_fill, rank_fg = (255, 255, 255), _ACCENT
-        draw.ellipse(
-            [rcx - rr, rcy - rr, rcx + rr, rcy + rr],
-            fill=rank_fill, outline=(255, 255, 255), width=2,
-        )
-        rt = str(rank)
-        _draw_centered(
-            draw, [rcx - rr, rcy - rr, rcx + rr, rcy + rr], rt, f_rank_small, rank_fg,
-        )
 
-        # ---------- 左上：昵称（只需避开右侧好感度，宽度上限已恢复）----------
-        name_max_w = max(48, right_edge - text_x - 104)
+        text_x = ax + ar + 12
+        pad_in, gap_tag = 8, 5
+        line2_y = y + 45       # 第二行（标签行）顶部
+        pill_h = 19
+
+        # ---------- 左上：昵称 ----------
+        # 分值 + 进度条的固定预留宽度；缩小它可让昵称更长、少留白
+        name_max_w = max(60, right_edge - text_x - 104)
         raw_name = entry.get("display_name") or entry.get("user_id") or "未知"
         name = _truncate(draw, str(raw_name), f_name, name_max_w)
         nb = draw.textbbox((0, 0), name, font=f_name)
-        draw.text((text_x, y + 10 - nb[1]), name, font=f_name, fill=_TEXT)
+        draw.text((text_x, y + 11 - nb[1]), name, font=f_name, fill=_TEXT)
 
         # ---------- 右上：好感度 ----------
-        score = int(entry.get("score", 0))
-        score_text = f"+{score}" if score >= 0 else str(score)
-        score_color = _ACCENT if score >= 0 else (57, 125, 134)
+        score_text = f"{score:+d}" if score != 0 else "0"
         sw = int(draw.textlength(score_text, font=f_score))
-        draw.text((right_edge - sw, y + 7), score_text, font=f_score, fill=score_color)
+        draw.text((right_edge - sw, y + 10), score_text, font=f_score, fill=score_color)
 
-        # 分数进度条（-max … +max 映射为 0…1，0 分正好半格）
-        bar_w, bar_h = 74, 4
+        # ---------- 双向进度条：以 0 为中点 ----------
+        # ⚠️ 旧实现把 -max…+max 线性映射到 0…1，负分自然落在条子左半边，
+        #    看起来像"分数很小但为正"，语义完全错乱。
+        bar_w, bar_h = 96, 5
         bar_x = right_edge - bar_w
-        bar_y = y + 31
+        bar_y = y + 35
+        mid_x = bar_x + bar_w // 2
         draw.rounded_rectangle(
-            [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=2, fill=TRACK,
+            [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=2.5, fill=TRACK,
         )
-        denom = 2 * max_abs_score if max_abs_score else 0
-        ratio = (max(0.0, min(1.0, (score + max_abs_score) / denom)) if denom else 0.0)
-        fill_w = int(bar_w * ratio)
-        if fill_w >= 4:
-            draw.rounded_rectangle(
-                [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=2, fill=score_color,
-            )
+        denom = max_abs_score if max_abs_score else 0
+        if denom:
+            ratio = max(0.0, min(1.0, abs(score) / denom))
+            fw = int((bar_w // 2) * ratio)
+            if fw >= 2:
+                if score >= 0:
+                    draw.rounded_rectangle(
+                        [mid_x, bar_y, mid_x + fw, bar_y + bar_h],
+                        radius=2.5, fill=score_color,
+                    )
+                else:
+                    draw.rounded_rectangle(
+                        [mid_x - fw, bar_y, mid_x, bar_y + bar_h],
+                        radius=2.5, fill=score_color,
+                    )
+        # 中点刻度：让"零"在条上可见
+        draw.rectangle([mid_x, bar_y - 1, mid_x + 1, bar_y + bar_h], fill=(205, 213, 218))
 
         # ---------- 右下：好感等级 ----------
         stage = str(entry.get("stage") or "").strip()
@@ -772,7 +888,7 @@ def render_favorability_rank(
             sx = right_edge - stage_w
             draw.rounded_rectangle(
                 [sx, line2_y, sx + stage_w, line2_y + pill_h],
-                radius=9, fill=stage_bg, outline=stage_bg, width=1,
+                radius=9.5, fill=stage_bg,
             )
             _draw_centered(
                 draw, [sx, line2_y, sx + stage_w, line2_y + pill_h], stage, f_tag, stage_fg,
@@ -838,11 +954,20 @@ def render_favorability_rank(
                 tag_bg, tag_fg = _ACCENT_SOFT, _ACCENT
             draw.rounded_rectangle(
                 [tx, line2_y, tx + pw, line2_y + pill_h],
-                radius=9, fill=tag_bg, outline=tag_bg, width=1,
+                radius=9.5, fill=tag_bg,
             )
             _draw_centered(draw, [tx, line2_y, tx + pw, line2_y + pill_h], tg, f_tag, tag_fg)
             tx += pw + gap_tag
 
+    # ---------------- 页脚 ----------------
+    # 只在**真的截断了人**时才提示「另有 N 人未显示」——
+    # 平时不写平均分/亲近人数那行统计：信息与头部「共 N 人 · 最高 +X」重复，
+    # 且在列表结束处横向铺一行小字显得杂乱。limit 为 0（默认全量）时完全不出现。
+    _omitted = max(0, len(entries) - len(shown))
+    if _omitted:
+        fy = MARGIN + card_h - bottom_pad - foot_h + 9
+        tip = f"另有 {_omitted} 人未显示"
+        draw.text((hx + 1, fy), tip, font=f_sub, fill=_MUTED)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")

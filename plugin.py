@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控",
-    version="1.4.5",
+    version="1.6.4",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -180,6 +180,73 @@ class FavorabilityConfig(ConfigBase):
     TIER3_SCAN_MSGS: int = _fav_field(
         6, "3 档扫描消息条数", "判断「是否提到」时回看多少条最近消息",
         en_title="Tier 3 Scan Depth", en_desc="Recent messages scanned to decide whether a topic came up",
+    )
+
+    # ==================== 记忆生命周期（A2/A3，默认关闭）====================
+    # 开启后：2/3 档条目按「作者 weight × 热度」排序，常被想起的记忆更稳、
+    # 长期冷门的在超预算时优先让位。**只影响排序与截断，绝不删除或改写作者内容**；
+    # 高 weight 条目豁免；关闭时行为与不开此功能完全一致。
+    LIFECYCLE_ENABLED: bool = _fav_field(
+        False, "启用记忆生命周期（热度排序）",
+        "开启后 2/3 档按 weight×热度 排序：常命中的记忆更稳，冷门的在超预算时优先让位。"
+        "只影响排序，不删除/不改写你的内容；关闭时行为不变。",
+        en_title="Enable Memory Lifecycle (heat ranking)",
+        en_desc="Rank tier 2/3 by weight x heat; affects ordering only, never edits your content",
+    )
+    LIFECYCLE_HALF_LIFE_DAYS: int = _fav_field(
+        30, "热度半衰期（天）", "多少天未命中后热度衰减到一半",
+        en_title="Heat Half-life (days)", en_desc="Days until an unused memory's heat halves",
+    )
+    LIFECYCLE_FLOOR: float = _fav_field(
+        0.6, "热度下限", "再冷也不会低于此系数（0~1）；保证冷门记忆永不彻底消失",
+        en_title="Heat Floor", en_desc="Minimum heat factor; cold memories never fully vanish",
+    )
+    LIFECYCLE_PROTECT_WEIGHT: int = _fav_field(
+        4, "豁免降权的 weight 阈值", "weight ≥ 此值的条目完全不受热度降权（保护核心设定）",
+        en_title="Protect Weight", en_desc="Entries with weight >= this are exempt from heat demotion",
+    )
+    LIFECYCLE_REINFORCE_BONUS: int = _fav_field(
+        10, "命中强化步进（×0.01）", "每次命中回补的热度（填 10 = 0.10）；常被想起的记忆回升更快",
+        en_title="Reinforce Bonus (x0.01)", en_desc="Heat restored per hit (10 = 0.10)",
+    )
+
+    # ==================== 独立嵌入后端（v1.6.0，默认用 NA 内置）====================
+    # 设为 custom 可让 persona 检索改用**独立的 OpenAI 兼容嵌入端点**（自建服务、
+    # 本地推理服务、各类商业 API 均可），与 NA 全局嵌入解耦。条目侧与查询侧
+    # 自动同源，保证向量空间一致。
+    # ⚠️ 切换嵌入模型后：向量缓存按签名自动作废重建；且 0.35 阈值必须用
+    #    scripts/calibrate_threshold.py 重新标定（不同模型分数分布不同）。
+    EMBED_PROVIDER: str = _fav_field(
+        "na", "嵌入后端", "na=用 NekroAgent 内置嵌入；custom=用下面自配的 OpenAI 兼容端点",
+        en_title="Embedding Backend",
+        en_desc="na = NekroAgent built-in; custom = your own OpenAI-compatible endpoint",
+    )
+    EMBED_BASE_URL: str = _fav_field(
+        "", "嵌入端点 Base URL",
+        "custom 必填。填你的端点根地址（OpenAI 兼容），插件会在其后拼 /embeddings",
+        en_title="Embedding Base URL",
+        en_desc="Required for custom; the OpenAI-compatible endpoint root URL",
+    )
+    EMBED_API_KEY: str = _fav_field(
+        "", "嵌入 API Key", "custom 的密钥；本地/自建端点通常可留空或随意填一个占位值",
+        en_title="Embedding API Key", en_desc="Key for custom endpoint; local servers may leave blank",
+    )
+    EMBED_MODEL: str = _fav_field(
+        "", "嵌入模型名", "custom 必填。填你所用端点支持的嵌入模型标识，须与实际部署一致；留空或填错会安全回落到 NA 内置嵌入",
+        en_title="Embedding Model",
+        en_desc="Required for custom; must match the model served by your endpoint",
+    )
+    EMBED_DIMENSIONS: int = _fav_field(
+        0, "嵌入维度（0=模型默认）", ">0 时显式传 dimensions，须与模型实际输出一致；留 0 由模型决定",
+        en_title="Embedding Dimensions", en_desc="0 = model default; must match actual output dim",
+    )
+    EMBED_BATCH_SIZE: int = _fav_field(
+        10, "嵌入批量大小",
+        "custom 批量嵌入每次请求的文本条数。部分端点对单次条数 / 总 token 有上限，"
+        "超限会返回 400（本插件会自动对半拆并重试，但直接设小一些更高效），一般 10 是安全值",
+        en_title="Embedding Batch Size",
+        en_desc="Texts per custom batch request; some endpoints cap it and return 400, "
+                "the plugin then splits the batch automatically",
     )
 
     # ==================== 解锁门控与关系 ====================
@@ -391,6 +458,9 @@ from . import memory as persona_memory  # noqa: E402  # 阶梯记忆与好感度
 # 背景记忆数据目录：落到插件数据目录（首次运行自包内 backgrounds/ 复制种子），
 # 避免升级/重装插件时整体替换包目录而覆盖用户改过的记忆。
 persona_memory.configure_bg_dir(plugin.get_plugin_data_dir() / "backgrounds")
+# v1.6.0：注入独立嵌入后端配置提供者（lambda 延迟解析 _embed_cfg，因其定义在后）。
+# memory.py 每次嵌入实时读取，故 WebUI 改 EMBED_* 后无需重启即生效。
+persona_memory.set_embed_config_provider(lambda: _embed_cfg())
 
 
 def _ts_now() -> int:
@@ -649,6 +719,44 @@ def _tier1_cfg() -> dict:
     }
 
 
+def _lifecycle_cfg() -> dict:
+    """从插件配置收集生命周期（热度排序）参数。默认 enabled=False。
+
+    ⚠️ 用「仅 None 才回落默认」而非 `x or default`：否则作者显式设的
+    LIFECYCLE_FLOOR=0 / PROTECT_WEIGHT=0 / REINFORCE_BONUS=0 会被静默吞成默认值，
+    且与概览页显示、memory.lifecycle_settings 运行期口径不一致。
+    """
+    def _n(key: str, default, cast):
+        v = getattr(config, key, None)
+        return cast(default) if v is None else cast(v)
+
+    return {
+        "enabled": bool(getattr(config, "LIFECYCLE_ENABLED", False)),
+        "half_life_days": _n("LIFECYCLE_HALF_LIFE_DAYS", 30, int),
+        "floor": _n("LIFECYCLE_FLOOR", 0.6, float),
+        "protect_weight": _n("LIFECYCLE_PROTECT_WEIGHT", 4, int),
+        # 配置项以整数（×0.01）存，避免浮点输入框的精度/校验麻烦
+        "reinforce_bonus": _n("LIFECYCLE_REINFORCE_BONUS", 10, int) / 100.0,
+    }
+
+
+def _embed_cfg() -> dict:
+    """从插件配置收集独立嵌入后端参数（v1.6.0）。
+
+    每次实时读取 config，故 WebUI 改配置后无需重启即生效（向量缓存会因签名变化自动重建）。
+    provider != custom、或 custom 但 base_url/model 不全时，memory 侧自动回落 NA 内置。
+    """
+    return {
+        "provider": str(getattr(config, "EMBED_PROVIDER", "na") or "na").strip().lower(),
+        "base_url": str(getattr(config, "EMBED_BASE_URL", "") or "").strip(),
+        "api_key": str(getattr(config, "EMBED_API_KEY", "") or "").strip(),
+        "model": str(getattr(config, "EMBED_MODEL", "") or "").strip(),
+        "dimensions": int(getattr(config, "EMBED_DIMENSIONS", 0) or 0),
+        "batch_size": max(1, int(getattr(config, "EMBED_BATCH_SIZE", 10) or 10)),
+        "timeout": 30,
+    }
+
+
 def _tier2_cfg() -> dict:
     """从插件配置收集 2 档运行参数。"""
     return {
@@ -656,6 +764,7 @@ def _tier2_cfg() -> dict:
         "max_chars": int(getattr(config, "TIER2_MAX_CHARS", 500) or 500),
         "threshold": float(getattr(config, "TIER2_SIM_THRESHOLD", 0.35) or 0.35),
         "scan_msgs": int(getattr(config, "TIER2_SCAN_MSGS", 6) or 6),
+        "lifecycle": _lifecycle_cfg(),
     }
 
 
@@ -667,6 +776,7 @@ def _tier3_cfg() -> dict:
         "max_chars": int(getattr(config, "TIER3_MAX_CHARS", 700) or 700),
         "threshold": float(getattr(config, "TIER3_SIM_THRESHOLD", 0.35) or 0.35),
         "scan_msgs": int(getattr(config, "TIER3_SCAN_MSGS", 6) or 6),
+        "lifecycle": _lifecycle_cfg(),
     }
 
 
@@ -2688,7 +2798,7 @@ async def favor_remove_cmd(
 async def on_channel_reset(_ctx: schemas.AgentCtx):
     """「重置上下文」时的处理。
 
-    ⚠️ 历史行为（1.4.3 及以前）：无条件 `store.delete(STATE_KEY)` —— 一次
+    ⚠️ 历史行为（1.6.4 及以前）：无条件 `store.delete(STATE_KEY)` —— 一次
     「重置上下文」会把本频道的**全部关系档案与备忘**一起删掉，且不可逆、无提示。
     重置上下文是高频轻量操作（清对话历史），把不可逆的档案删除绑在它上面，
     误触代价过大；且用户直觉上不会认为「重置上下文」等于「清空关系」。
@@ -2859,6 +2969,11 @@ async def _start_decay_loop() -> None:
 async def clean_up():
     """停掉插件自己的后台任务。"""
     global _decay_task
+    # A4：落盘去抖残留的命中统计，避免丢最后几次强化
+    try:
+        persona_memory.flush_hit_stats()
+    except Exception:  # noqa: BLE001
+        plugin.logger.debug("[persona] 命中统计落盘失败（忽略）")
     pending = _decay_task
     if pending is not None and not pending.done():
         pending.cancel()
