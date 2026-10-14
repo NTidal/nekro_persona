@@ -919,6 +919,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3.5h9.5L19 8v12.5H5z"/><path d="M8.5 12h7M8.5 15.5h4.5"/></svg>
         <span>备忘录</span>
       </button>
+      <button class="nav-item" type="button" data-tab="anchor">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="5" r="2.2"/><path d="M12 7.2V21M5 12a7 7 0 0 0 14 0M8.5 11H5M19 11h-3.5M12 21c-2 0-3.5-1.2-3.5-3M12 21c2 0 3.5-1.2 3.5-3"/></svg>
+        <span>锚点记忆</span>
+      </button>
       <button class="nav-item" type="button" data-tab="rules">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h2M10 12h10M4 18h8M16 18h4"/><circle cx="16" cy="6" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="14" cy="18" r="2"/></svg>
         <span>规则与门控</span>
@@ -1068,6 +1072,28 @@
       </div>
     </section>
 
+    <section class="page" id="page-anchor" data-page="anchor" aria-labelledby="anchorTitle">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title" id="anchorTitle">锚点记忆</h1>
+          <p class="page-desc">角色这一世<strong>自己沉淀</strong>的身份锚点（tier4 生长层）。前 3 档是「他是谁」的种子，锚点是「他怎么长成现在这样」——只增、绝不改种子，且受硬频率闸约束（审慎累积，不每轮都长）。</p>
+        </div>
+        <div class="head-actions">
+          <button class="btn" id="anchorExport" type="button">导出 tier4.json</button>
+          <button class="btn" id="anchorRefresh" type="button">刷新</button>
+        </div>
+      </div>
+      <div id="anchorConfigBar" class="overview-note" style="margin-bottom:12px">加载中…</div>
+      <div class="panel">
+        <div class="table-wrap">
+          <table class="data-table" aria-label="身份锚点">
+            <thead><tr><th>锚点</th><th>核心度</th><th>来源</th><th>更新时间</th><th>操作</th></tr></thead>
+            <tbody id="anchorBody"><tr><td class="empty" colspan="5">正在加载…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <section class="page" id="page-rules" data-page="rules" aria-labelledby="rulesTitle">
       <div class="page-head">
         <div>
@@ -1090,6 +1116,23 @@
             <input id="importPersonaFile" class="field" type="file" accept=".zip">
             <button class="btn primary" id="importPersonaBtn" type="button" style="margin-top:8px">导入并覆盖</button>
             <div class="hint" style="margin-top:8px">导入前自动备份当前文件到 persona_import_backups/；包内 JSON 必须合法，否则整体拒绝。</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel rule-section" data-rule-section="growth">
+        <div class="panel-head">
+          <div><h2 class="panel-title">生长包（tier4 + 关系档案 + 热度）</h2><div class="panel-subtitle">把"这一世活过的痕迹"打包迁移/备份——<strong>私密</strong>，与上面的公开种子包彻底分离。</div></div>
+        </div>
+        <div class="panel-body rule-grid">
+          <div class="config-box">
+            <button class="btn" id="exportGrowthBtn" type="button">导出生长包（zip）</button>
+            <div class="hint" style="margin-top:8px">包含 tier4.json（身份锚点+频道笔记）、各频道关系档案、.hit_stats.json、迁移报告 _migrations.json、频道索引。<strong>不含</strong> tier1/2/3、favor.json、preset。导入种子包不会动这些，反之亦然。</div>
+          </div>
+          <div class="config-box">
+            <input id="importGrowthFile" class="field" type="file" accept=".zip">
+            <button class="btn primary" id="importGrowthBtn" type="button" style="margin-top:8px">导入生长包（覆盖生长数据）</button>
+            <div class="hint" style="margin-top:8px">只写 tier4 + 关系档案 + 热度，<strong>不碰种子</strong>；导入前自动备份当前生长状态到 _growth_import_backups/。档案与 tier4 即时生效，热度需重启重读。</div>
           </div>
         </div>
       </section>
@@ -1401,6 +1444,7 @@ const state = {
   favorPageSize: 25,
   favorChannel: 'all',
   memo: { channel: '', items: [], meta: null, editId: '' },
+  anchor: { items: [], meta: null },
   channels: null,
   channelsPromise: null,
   editContext: null,
@@ -1430,6 +1474,7 @@ const TAB_META = {
   memory: ['背景记忆', '背景记忆'],
   favor: ['好感度档案', '好感度档案'],
   memo: ['备忘录', '备忘录'],
+  anchor: ['锚点记忆', '锚点记忆'],
   rules: ['规则与门控', '规则与门控'],
   preview: ['注入预览', '注入预览']
 };
@@ -1644,6 +1689,7 @@ function activateTab(tab, options = {}) {
   if (tab === 'memory') return loadMemory();
   if (tab === 'favor') return loadFavorIndex();
   if (tab === 'memo') return loadMemos();
+  if (tab === 'anchor') return loadAnchors();
   if (tab === 'rules') return state.rulesLoaded ? Promise.resolve() : loadRules();
   if (tab === 'preview') {
     return loadChannels()
@@ -1670,6 +1716,7 @@ async function refreshCurrent() {
       else if (state.tab === 'memory') await loadMemory({ quiet: true });
       else if (state.tab === 'favor') await loadFavorIndex({ quiet: true });
       else if (state.tab === 'memo') await loadMemos({ quiet: true });
+      else if (state.tab === 'anchor') await loadAnchors({ quiet: true });
       else if (state.tab === 'rules') {
         if (!confirmDiscardRules()) return;
         await loadRules({ quiet: true });
@@ -2202,6 +2249,96 @@ async function deleteMemoById(id) {
     toast('备忘已删除');
     await loadMemos({ quiet: true });
   } catch (error) { toast(`删除失败：${error.message}`, 'error'); }
+}
+
+// ===== 身份锚点（tier4 生长层 · 阶段 A）=====
+async function loadAnchors(options = {}) {
+  if (!options.quiet) $('#anchorBody').innerHTML = '<tr><td class="empty" colspan="5">正在加载…</td></tr>';
+  try {
+    const data = await api('tier4?kind=anchor');
+    state.anchor.items = Array.isArray(data.items) ? data.items : [];
+    state.anchor.meta = data.meta || {};
+    renderAnchors();
+    markConnected();
+  } catch (error) {
+    setConnection('offline', '连接失败');
+    $('#anchorBody').innerHTML = `<tr><td class="empty" colspan="5"><strong>加载失败</strong>${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+function renderAnchors() {
+  const meta = state.anchor.meta || {};
+  $('#anchorConfigBar').innerHTML =
+    `总量上限 <b>${Number(meta.max_total || 0)}</b> 条 · 每日 <b>${Number(meta.max_per_day || 0)}</b> 条 · `
+    + `最小间隔 <b>${Number(meta.min_interval_hours || 0)}</b> 小时 · 单条上限 <b>${Number(meta.max_content || 0)}</b> 字 · `
+    + `每轮注入 <b>${Number(meta.inject_max || 0)}</b> 条（${Number(meta.inject_chars || 0)} 字预算）· `
+    + `核心度上限 <b>${Number(meta.salience_max || 3)}</b>｜现共 <b>${Number(meta.total || 0)}</b> 条，今日已写 <b>${Number(meta.day_count || 0)}</b> 条`
+    + (meta.enabled === false ? ' · <b>功能已停用</b>' : '');
+  const items = state.anchor.items || [];
+  if (!items.length) {
+    $('#anchorBody').innerHTML = '<tr><td class="empty" colspan="5"><strong>暂无身份锚点</strong>这个角色还没有沉淀过「我是谁」的印记。锚点由角色在对话中经 <b>沉淀身份锚点</b> 工具自己生成——稀少而根本，触到频率闸时会被拒绝。</td></tr>';
+    return;
+  }
+  const smax = Math.max(1, Number(meta.salience_max || 3));
+  $('#anchorBody').innerHTML = items.map(a => {
+    const sal = Number(a.salience || 1);
+    const opts = [];
+    for (let i = 1; i <= smax; i++) opts.push(`<option value="${i}"${i === sal ? ' selected' : ''}>${i}</option>`);
+    const src = a.source_chat_key ? escapeHtml(a.source_chat_key)
+      : (a.source_user_id ? escapeHtml(a.source_user_id) : '—');
+    return `<tr data-anchor-id="${escapeHtml(a.id)}">
+      <td data-label="锚点"><div class="entry-preview">${escapeHtml(a.content || '')}</div></td>
+      <td data-label="核心度"><select class="select" style="width:auto;padding:4px 8px" data-anchor-action="salience" aria-label="核心度">${opts.join('')}</select></td>
+      <td data-label="来源" class="muted" title="${src}">${src}</td>
+      <td data-label="更新时间" class="muted">${escapeHtml(formatTime(a.updated_at))}</td>
+      <td data-label="操作" class="actions-cell"><div class="table-actions"><button class="mini-btn danger" type="button" data-anchor-action="delete">删除</button></div></td>
+    </tr>`;
+  }).join('');
+}
+async function setAnchorSalience(id, value) {
+  try {
+    await api('tier4', { method: 'POST', body: { op: 'salience', id, salience: Number(value) } });
+    toast('核心度已更新');
+  } catch (error) { toast(`更新失败：${error.message}`, 'error'); }
+  await loadAnchors({ quiet: true });
+}
+async function deleteAnchorById(id) {
+  if (!id) return;
+  if (!window.confirm('确认删除这条身份锚点？删除不可撤销（可先「导出 tier4.json」留档）。')) return;
+  try {
+    await api('tier4', { method: 'POST', body: { op: 'delete', id } });
+    toast('锚点已删除');
+    await loadAnchors({ quiet: true });
+  } catch (error) { toast(`删除失败：${error.message}`, 'error'); }
+}
+async function exportTier4(event) {
+  // 私有导出：tier4.json 是这一世的生长痕迹，绝不进公开种子包。密钥走请求头，
+  // 故用 fetch + blob 下载，而不是直接跳转 URL。
+  const button = event && event.currentTarget;
+  await withButton(button, async () => {
+    try {
+      const headers = { Accept: 'application/json' };
+      const key = getAccessKey();
+      if (key) headers['X-WebUI-Key'] = key;
+      let response = await fetch('./api/tier4/export', { headers });
+      if (response.status === 401) {
+        const entered = await requestAccessKey();
+        if (entered == null) return;
+        if (entered) headers['X-WebUI-Key'] = entered;
+        response = await fetch('./api/tier4/export', { headers });
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const blob = await response.blob();
+      const cd = response.headers.get('Content-Disposition') || '';
+      const match = cd.match(/filename="?([^"]+)"?/);
+      const fname = match ? match[1] : `tier4_${Date.now()}.json`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = fname;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      toast('tier4.json 已导出');
+    } catch (error) { toast(`导出失败：${error.message}`, 'error'); }
+  });
 }
 
 function currentMemoryEntries() {
@@ -3170,6 +3307,23 @@ function wireEvents() {
     else if (action === 'delete') deleteMemoById(row.dataset.memoId);
   });
 
+  // ===== 身份锚点（tier4）=====
+  $('#anchorRefresh').addEventListener('click', event => withButton(event.currentTarget, () => loadAnchors({ quiet: true })));
+  $('#anchorExport').addEventListener('click', exportTier4);
+  $('#anchorBody').addEventListener('click', event => {
+    const row = event.target.closest('[data-anchor-id]');
+    if (!row) return;
+    const action = event.target.closest('[data-anchor-action]')?.dataset.anchorAction;
+    if (action === 'delete') deleteAnchorById(row.dataset.anchorId);
+  });
+  $('#anchorBody').addEventListener('change', event => {
+    const ctl = event.target.closest('[data-anchor-action="salience"]');
+    if (!ctl) return;
+    const row = event.target.closest('[data-anchor-id]');
+    if (!row) return;
+    setAnchorSalience(row.dataset.anchorId, ctl.value);
+  });
+
   $('#favorSearch').addEventListener('input', debouncedFavorLoad);
   $('#favorClearSearch').addEventListener('click', () => {
     $('#favorSearch').value = '';
@@ -3322,6 +3476,49 @@ function wireEvents() {
         toast('导入成功：' + (data.applied || []).join('、'), 'ok');
         if (typeof loadRules === 'function') { await loadRules(); }
       } catch (error) { toast(`导入失败：${error.message}`, 'error'); }
+    });
+  });
+
+  // ===== 生长包（阶段 C：tier4 + 关系档案 + 热度）=====
+  const growthExportBtn = $('#exportGrowthBtn');
+  if (growthExportBtn) growthExportBtn.addEventListener('click', async () => {
+    await withButton(growthExportBtn, async () => {
+      try {
+        const resp = await fetch('./api/growth/export', { headers: { 'X-WebUI-Key': getAccessKey() || '' } });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const blob = await resp.blob();
+        const m = (resp.headers.get('content-disposition') || '').match(/filename="?([^";]+)"?/);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = m ? m[1] : 'growth_bundle.zip';
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+        toast('已导出生长包（zip）', 'ok');
+      } catch (error) { toast(`导出生长包失败：${error.message}`, 'error'); }
+    });
+  });
+
+  const growthImportFile = $('#importGrowthFile');
+  const growthImportBtn = $('#importGrowthBtn');
+  if (growthImportBtn) growthImportBtn.addEventListener('click', async () => {
+    const file = (growthImportFile.files || [])[0];
+    if (!file) { toast('请先选择生长包 .zip', 'error'); return; }
+    if (!confirm('导入生长包会覆盖当前 tier4、各频道关系档案与热度（会先自动备份到 _growth_import_backups/），但不会改动 tier1/2/3 种子。确定继续？')) return;
+    await withButton(growthImportBtn, async () => {
+      try {
+        const resp = await fetch('./api/growth/import', {
+          method: 'POST',
+          headers: { 'X-WebUI-Key': getAccessKey() || '', 'Content-Type': 'application/zip' },
+          body: file,
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok || !data || data.ok !== true) {
+          throw new Error((data && data.detail) || ('HTTP ' + resp.status));
+        }
+        toast('生长包导入成功：' + (data.applied || []).join('、'), 'ok');
+        if (typeof loadAnchors === 'function') { await loadAnchors({ quiet: true }); }
+        if (typeof loadMemos === 'function') { await loadMemos({ quiet: true }); }
+      } catch (error) { toast(`生长包导入失败：${error.message}`, 'error'); }
     });
   });
 

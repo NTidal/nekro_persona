@@ -69,8 +69,8 @@ from nekro_agent.services.command.schemas import (
 plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
-    description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控",
-    version="1.6.4",
+    description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
+    version="2.0.0",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -78,8 +78,8 @@ plugin = NekroPlugin(
         en_US="Persona Memory",
     ),
     i18n_description=i18n.i18n_text(
-        zh_CN="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控",
-        en_US="Tiered background memory (always-on identity / on-demand past / world knowledge) with favorability gating",
+        zh_CN="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）",
+        en_US="Tiered background memory (always-on identity / on-demand past / world knowledge) with favorability gating + a tier4 growth layer (identity anchors / channel notes)",
     ),
     allow_sleep=False,
     sleep_brief="用于维护角色三档背景记忆与解锁门控，需常驻。",
@@ -211,9 +211,10 @@ class FavorabilityConfig(ConfigBase):
     )
 
     # ==================== 独立嵌入后端（v1.6.0，默认用 NA 内置）====================
-    # 设为 custom 可让 persona 检索改用**独立的 OpenAI 兼容嵌入端点**（自建服务、
-    # 本地推理服务、各类商业 API 均可），与 NA 全局嵌入解耦。条目侧与查询侧
-    # 自动同源，保证向量空间一致。
+    # 设为 custom 可让 persona 检索用独立的 OpenAI 兼容嵌入端点（自建服务、本地推理
+    # 服务、各类商业 API 均可），与 NA 全局嵌入解耦。条目侧与查询侧自动同源。
+    # ⚠️ 对外文案（README / WebUI / 配置项描述）一律不得出现具体厂商名与模型名——
+    #    那会暴露部署方在用基础设施。示例统一用 your-endpoint.example 这类占位。
     # ⚠️ 切换嵌入模型后：向量缓存按签名自动作废重建；且 0.35 阈值必须用
     #    scripts/calibrate_threshold.py 重新标定（不同模型分数分布不同）。
     EMBED_PROVIDER: str = _fav_field(
@@ -223,16 +224,16 @@ class FavorabilityConfig(ConfigBase):
     )
     EMBED_BASE_URL: str = _fav_field(
         "", "嵌入端点 Base URL",
-        "custom 必填。填你的端点根地址（OpenAI 兼容），插件会在其后拼 /embeddings",
+        "custom 必填。端点根地址（OpenAI 兼容），插件会在其后拼 /embeddings",
         en_title="Embedding Base URL",
         en_desc="Required for custom; the OpenAI-compatible endpoint root URL",
     )
     EMBED_API_KEY: str = _fav_field(
-        "", "嵌入 API Key", "custom 的密钥；本地/自建端点通常可留空或随意填一个占位值",
+        "", "嵌入 API Key", "custom 的密钥；本地 / 自建端点通常可留空或随意填一个占位值",
         en_title="Embedding API Key", en_desc="Key for custom endpoint; local servers may leave blank",
     )
     EMBED_MODEL: str = _fav_field(
-        "", "嵌入模型名", "custom 必填。填你所用端点支持的嵌入模型标识，须与实际部署一致；留空或填错会安全回落到 NA 内置嵌入",
+        "", "嵌入模型名", "custom 必填。填你所用端点支持的嵌入模型标识，须与实际部署一致",
         en_title="Embedding Model",
         en_desc="Required for custom; must match the model served by your endpoint",
     )
@@ -243,7 +244,7 @@ class FavorabilityConfig(ConfigBase):
     EMBED_BATCH_SIZE: int = _fav_field(
         10, "嵌入批量大小",
         "custom 批量嵌入每次请求的文本条数。部分端点对单次条数 / 总 token 有上限，"
-        "超限会返回 400（本插件会自动对半拆并重试，但直接设小一些更高效），一般 10 是安全值",
+        "超限会返回 400（本插件会自动对半拆并重试），不确定时设小一些更高效，一般 10 是安全值",
         en_title="Embedding Batch Size",
         en_desc="Texts per custom batch request; some endpoints cap it and return 400, "
                 "the plugin then splits the batch automatically",
@@ -399,18 +400,51 @@ class FavorabilityConfig(ConfigBase):
         en_desc="Containment-based dedup: a shorter title fully contained in a longer one is treated as the same memo",
     )
 
-    # ==================== 频道重置行为 ====================
-    RESET_CHANNEL_CLEARS_FAVOR: bool = _fav_field(
-        False, "「重置上下文」时清空本频道好感度",
-        "关闭（默认）：重置上下文只清对话历史，关系档案与备忘**完整保留**。"
-        "开启：模拟旧行为，把本频道的全部关系档案与备忘一起删除（不可逆）。"
-        "注意旧版本默认就是删除，且不会提示——若你曾被「重置上下文」清掉过关系数据，"
-        "保持关闭即可。无论开关如何，删除前都会先自动备份一份，见 "
-        "{插件数据目录}/reset_backups/。",
-        en_title="Reset Channel Clears Favorability",
-        en_desc="Off (default): resetting context keeps all relationship archives and memos. "
-                "On: reproduces the legacy behavior of deleting them (irreversible). "
-                "A backup is always written before any deletion.",
+    # ==================== 身份锚点（tier4 生长层，阶段 A）====================
+    # 前 3 档是「种子」（手工策划、模型不可写）；tier4 是「生长」——角色自己在运行时
+    # 追加身份级锚点，记录「他怎么长成现在这样」。**只增不改种子**，且受硬频率闸约束
+    # （审慎累积、绝不每轮都长）。空层不注入任何内容（persona_prompt 与旧版逐字节一致）。
+    ANCHOR_ENABLED: bool = _fav_field(
+        True, "启用身份锚点（tier4）",
+        "让角色自己沉淀身份级的长期锚点（这一世形成的自我认知/重要承诺）。"
+        "只增不覆盖前三档种子；无锚点时不注入任何内容。",
+        en_title="Enable Identity Anchors (tier 4)",
+        en_desc="Let the character grow identity-level anchors at runtime; never overwrites the tier 1-3 seeds; injects nothing when empty",
+    )
+    ANCHOR_MAX_TOTAL: int = _fav_field(
+        30, "锚点总量上限", "全局最多保留几条锚点；达上限后新写入被拒绝，需先在 WebUI 清理",
+        en_title="Anchor Total Cap", en_desc="Global maximum number of anchors; further writes are rejected once reached",
+        ge=1, le=500,
+    )
+    ANCHOR_MAX_PER_DAY: int = _fav_field(
+        1, "每日锚点上限", "一天最多新增几条锚点（硬频率闸之一，防「每轮都长」）",
+        en_title="Anchors Per Day", en_desc="Max new anchors per day (a hard gate against growing every turn)",
+        ge=0, le=50,
+    )
+    ANCHOR_MIN_INTERVAL_HOURS: int = _fav_field(
+        6, "两次锚点最小间隔（小时）", "距上一条锚点写入不足该时长则拒绝（另一道频率闸）",
+        en_title="Min Anchor Interval (hours)", en_desc="Reject a write sooner than this after the last anchor",
+        ge=0, le=168,
+    )
+    ANCHOR_MAX_CONTENT_CHARS: int = _fav_field(
+        200, "单条锚点内容上限", "写入时强制单行并截断；锚点应是凝练的自我认知，不是长叙事",
+        en_title="Anchor Content Limit", en_desc="Forced single-line + truncated on write; an anchor is a concise self-belief, not a long story",
+        ge=20, le=2000,
+    )
+    ANCHOR_INJECT_MAX: int = _fav_field(
+        8, "锚点单轮条数上限", "一轮最多注入几条锚点",
+        en_title="Anchor Inject Count", en_desc="Max anchors injected into the prompt per turn",
+        ge=0, le=50,
+    )
+    ANCHOR_INJECT_CHARS: int = _fav_field(
+        1200, "锚点单轮字符预算", "一轮注入锚点的总字符上限；按 salience 单调填充（核心锚点永不因低档挤占被牺牲）",
+        en_title="Anchor Char Budget", en_desc="Total anchor chars per turn; filled by salience-monotonic greedy",
+        ge=0, le=8000,
+    )
+    ANCHOR_SALIENCE_MAX: int = _fav_field(
+        3, "锚点核心度上限", "salience 的取值上界（1..此值）；核心度越高越优先常驻注入",
+        en_title="Max Salience", en_desc="Upper bound of an anchor's salience (1..this); higher ranks stay resident first",
+        ge=1, le=5,
     )
 
     # ==================== 排行榜卡片 ====================
@@ -438,6 +472,23 @@ class FavorabilityConfig(ConfigBase):
         en_title="Rank Card Font Path", en_desc="Chinese font file for the rank card; empty auto-detects",
     )
 
+    # ==================== 频道重置行为 ====================
+    # ⚠️ 1.9.0 在加入 tier4 生长层时把这项连同备份函数一起删掉，退回了「无条件
+    #    store.delete」的旧行为 —— 一次「重置上下文」会静默清空本频道全部关系
+    #    档案，不可逆且无提示。1.4.4/1.4.5 曾修好，1.9.0 回归，此处补回。
+    RESET_CHANNEL_CLEARS_FAVOR: bool = _fav_field(
+        False, "「重置上下文」时清空本频道好感度",
+        "关闭（默认）：重置上下文只清对话历史，关系档案与备忘**完整保留**。"
+        "开启：模拟旧行为，把本频道的全部关系档案与备忘一起删除（不可逆）。"
+        "注意旧版本默认就是删除，且不会提示——若你曾被「重置上下文」清掉过关系数据，"
+        "保持关闭即可。无论开关如何，删除前都会先自动备份一份，见 "
+        "{插件数据目录}/reset_backups/。",
+        en_title="Reset Channel Clears Favorability",
+        en_desc="Off (default): resetting context keeps all relationship archives and memos. "
+                "On: reproduces the legacy behavior of deleting them (irreversible). "
+                "A backup is always written before any deletion.",
+    )
+
 
 # 模块级单例：配置实例与插件存储句柄
 config = plugin.get_config(FavorabilityConfig)
@@ -454,10 +505,13 @@ _RANK_TRIGGERS = ("查看好感度", "好感度排行", "好感榜")
 
 from . import card  # noqa: E402  # 依赖上方 plugin/config 完成初始化后再导入渲染模块
 from . import memory as persona_memory  # noqa: E402  # 阶梯记忆与好感度门控
+from . import tier4  # noqa: E402  # tier4 生长层（身份锚点，阶段 A）
 
 # 背景记忆数据目录：落到插件数据目录（首次运行自包内 backgrounds/ 复制种子），
 # 避免升级/重装插件时整体替换包目录而覆盖用户改过的记忆。
 persona_memory.configure_bg_dir(plugin.get_plugin_data_dir() / "backgrounds")
+# tier4 生长层与阶梯记忆同目录（tier4.json / _channel_index.json 落到同一 backgrounds/）
+tier4.configure_bg_dir(plugin.get_plugin_data_dir() / "backgrounds")
 # v1.6.0：注入独立嵌入后端配置提供者（lambda 延迟解析 _embed_cfg，因其定义在后）。
 # memory.py 每次嵌入实时读取，故 WebUI 改 EMBED_* 后无需重启即生效。
 persona_memory.set_embed_config_provider(lambda: _embed_cfg())
@@ -558,67 +612,12 @@ _FAVOR_MANIPULATION_RE = re.compile(
 )
 
 
-# ===== 备忘录辅助（扩展）=====
-_MEMO_PUNCT_RE = None
-
-
-def _memo_title_key(title: str) -> str:
-    """标题归一化：去空白与标点、转小写，用于相似度比较。"""
-    global _MEMO_PUNCT_RE
-    if _MEMO_PUNCT_RE is None:
-        import re as _re
-
-        _MEMO_PUNCT_RE = _re.compile(r"[\s，。、；：！？,.;:!?「」『』（）()\[\]【】\"'<>·—~～]+")
-    return _MEMO_PUNCT_RE.sub("", str(title or "")).lower()
-
-
-def _memo_similarity(a: str, b: str) -> float:
-    ka, kb = _memo_title_key(a), _memo_title_key(b)
-    if not ka or not kb:
-        return 0.0
-    if ka == kb:
-        return 1.0
-    from difflib import SequenceMatcher
-
-    return SequenceMatcher(None, ka, kb).ratio()
-
-
-def _find_memo(state: "ChannelArchive", title: str):
-    """按标题查找。返回 (memo, index) 或 (None, -1)。
-
-    匹配策略（按优先级）：
-      ① **精确**：归一化后完全相同
-      ② **包含**：短标题被长标题完整包含（「群规」⊂「群规说明」）
-      ③ **近同**：相似度 ≥ 0.92（错别字、语序）
-
-    ⚠️ 实测教训：早期版本用 SequenceMatcher(0.72) 做模糊合并，把
-       「小明生日」与「小红生日」（相似度 0.750）判成同一条 → 会覆盖掉一条真实备忘。
-       中文标题的差异常集中在少数几个字上，字符相似度对此不敏感，
-       所以**不能用中低阈值做模糊合并**。
-    """
-    key = _memo_title_key(title)
-    if not key:
-        return None, -1
-    # ① 精确
-    for i, m in enumerate(state.memos):
-        if _memo_title_key(m.title) == key:
-            return m, i
-    # ② 包含
-    min_len = max(2, int(getattr(config, "MEMO_DEDUP_MIN_KEY_LEN", 2) or 2))
-    for i, m in enumerate(state.memos):
-        mk = _memo_title_key(m.title)
-        shorter = mk if len(mk) <= len(key) else key
-        if len(shorter) >= min_len and (mk in key or key in mk):
-            return m, i
-    # ③ 近同（高阈值兜底）
-    for i, m in enumerate(state.memos):
-        if _memo_similarity(title, m.title) >= 0.92:
-            return m, i
-    return None, -1
-
-
-def _memo_cfg() -> dict:
-    """备忘录运行参数（来自插件配置）。"""
+# ===== 频道笔记（tier4 note）配置与引导（阶段 B：接替旧 memo 子系统）=====
+# 原 _memo_* 的查找/去重/相似度/渲染逻辑已全部迁入 tier4.py（note kind），
+# 这里只留「配置收集」与「注入引导文案」。配置键沿用 MEMO_*（§6.2 的「保留旧名」
+# 兼容选项），避免重命名 config.yaml 里已存的键而重置用户调过的值。
+def _note_cfg() -> dict:
+    """频道笔记运行参数（沿用 MEMO_* 配置键，作为 tier4 note 层的配置源）。"""
     return {
         "enabled": bool(getattr(config, "MEMO_ENABLED", True)),
         "max_items": int(getattr(config, "MEMO_MAX_ITEMS", 80) or 80),
@@ -627,89 +626,42 @@ def _memo_cfg() -> dict:
         "inject_matched": int(getattr(config, "MEMO_INJECT_MATCHED", 3) or 0),
         "inject_chars": int(getattr(config, "MEMO_INJECT_CHARS", 900) or 900),
         "dedup_min_len": max(2, int(getattr(config, "MEMO_DEDUP_MIN_KEY_LEN", 2) or 2)),
+        "guide_always": bool(getattr(config, "MEMO_GUIDE_ALWAYS", True)),
     }
 
 
-def _memo_match_terms(memo: ChannelMemo) -> List[str]:
-    """话题匹配词：显式 tags 优先，标题整体作兜底。"""
-    terms = [str(x).strip().lower() for x in (memo.tags or []) if str(x).strip()]
-    tk = _memo_title_key(memo.title)
-    if len(tk) >= 2:
-        terms.append(tk)
-    return terms
-
-
-def _log_memo_injection(state: "ChannelArchive") -> None:
-    live = [m for m in state.memos if not m.is_expired()]
-    plugin.logger.info(f"[persona] 备忘录注入：{len(live)} 条可用 / 共 {len(state.memos)} 条")
-
-
-# 扩展：备忘录引导 —— 常驻注入，明确"什么时候该记"。
-# 没有它时，模型只知道有个 save_memo 工具，不知道该拿它做什么。
-_MEMO_GUIDE = (
+# 笔记引导 —— 常驻注入，明确「什么时候该记」。旧版教训：没有它时，模型只看到
+# save_note 这个名字，几乎不会主动用（实测 4763 次代码执行里只用过 1 次）。
+_NOTE_GUIDE = (
     "#你的小本本\n"
-    "你有一本自己的小本本（`save_memo`）。**约定、承诺、称呼偏好、"
+    "你有一本自己的小本本（`save_note`）。**约定、承诺、称呼偏好、"
     "以及以后还用得上的稳定事实**，想到就顺手记下来——别指望事后还想得起来。\n"
     "使用规则：\n"
-    "1. 需要时自然用出来即可，**绝不要把备忘原文当消息发给用户**。\n"
+    "1. 需要时自然用出来即可，**绝不要把笔记原文当消息发给用户**。\n"
     "2. 没提到的那些就是这轮用不上，不要硬提。"
 )
 
 
-def _render_memo_block(state: "ChannelArchive", score: int, recent_text: str) -> str:
-    """渲染备忘录注入块。
+def _anchor_cfg() -> dict:
+    """tier4 身份锚点运行参数（来自插件配置）。
 
-    设计要点（note 插件的教训）：
-    · **不注入标题索引** —— 只注入全文。避免模型"看得见标题却读不到内容"，
-      进而拿发送消息当调试输出把内部笔记摊给全群。
-    · **写时限制长度**，而不是读时截断 —— 从根上消除"要读全文"的需求。
-    · 过期与好感度门控在此过滤（note 没有门控能力）。
+    键名与 tier4.py 的 cfg 约定对齐：
+    enabled/max_total/max_per_day/min_interval_hours/max_content 供频率闸，
+    inject_chars/inject_max/guide_always 供注入渲染，salience_max 供钳制。
     """
-    cfg2 = _memo_cfg()
-    if not cfg2["enabled"]:
-        return ""
-
-    # 扩展：引导常驻 —— 否则"没有备忘的频道"永远看不到使用说明
-    guide_always = bool(getattr(config, "MEMO_GUIDE_ALWAYS", True))
-
-    now = _ts_now()
-    live = [m for m in state.memos if not m.is_expired(now) and int(m.min_favor or 0) <= score]
-    if not live:
-        return _MEMO_GUIDE if guide_always else ""
-    live.sort(key=lambda m: -int(m.updated_at or 0))
-
-    picked: List[ChannelMemo] = []
-    seen = set()
-    for m in live[: max(0, cfg2["inject_recent"])]:
-        picked.append(m)
-        seen.add(m.key())
-
-    hit = 0
-    if recent_text and cfg2["inject_matched"] > 0:
-        low = recent_text.lower()
-        for m in live:
-            if m.key() in seen:
-                continue
-            if any(term and term in low for term in _memo_match_terms(m)):
-                picked.append(m)
-                seen.add(m.key())
-                hit += 1
-                if hit >= cfg2["inject_matched"]:
-                    break
-    if not picked:
-        return _MEMO_GUIDE if guide_always else ""
-
-    lines: List[str] = []
-    used = 0
-    for m in picked:
-        blk = f"· 【{m.title}】{m.content}"
-        if used + len(blk) > cfg2["inject_chars"]:
-            break
-        lines.append(blk)
-        used += len(blk)
-    if not lines:
-        return _MEMO_GUIDE if guide_always else ""
-    return _MEMO_GUIDE + "\n" + "\n".join(lines)
+    return {
+        "enabled": bool(getattr(config, "ANCHOR_ENABLED", True)),
+        "max_total": max(1, int(getattr(config, "ANCHOR_MAX_TOTAL", 30) or 30)),
+        "max_per_day": max(0, int(getattr(config, "ANCHOR_MAX_PER_DAY", 1) or 0)),
+        "min_interval_hours": max(0, int(getattr(config, "ANCHOR_MIN_INTERVAL_HOURS", 6) or 0)),
+        "max_content": max(20, int(getattr(config, "ANCHOR_MAX_CONTENT_CHARS", 200) or 200)),
+        "inject_max": max(0, int(getattr(config, "ANCHOR_INJECT_MAX", 8) or 0)),
+        "inject_chars": max(0, int(getattr(config, "ANCHOR_INJECT_CHARS", 1200) or 0)),
+        "salience_max": max(1, int(getattr(config, "ANCHOR_SALIENCE_MAX", 3) or 3)),
+        # 阶段 A 不常驻注入锚点引导（保证空层时 persona_prompt 逐字节不变）；
+        # 模型经工具描述发现 anchor_memory。阶段 B 再合并 note 引导。
+        "guide_always": False,
+    }
 
 
 def _tier1_cfg() -> dict:
@@ -943,6 +895,31 @@ _STRONG_HINTS = (
     "主动", "第一次", "首次", "生日", "节日", "中秋", "承诺过",
 )
 
+# 反向语义覆盖（v1.9.0 补丁）：命中任一则**不能**靠 _STRONG_HINTS 放行。
+#
+# 背景：_STRONG_HINTS 是子串匹配，单字词会命中含该字但语义相反的词——
+#   "陪" → 陪衬/陪跑；"约" → 大约/契约；"写" → 写作业/写本子；
+#   "笑" → 我笑了/他笑了两声就走；"帮" → 帮倒忙/没帮上什么。
+# 这些 reason 描述的是**无关事件或负面事件**，不该因含"证据字"而放行。
+#
+# 对 593 条真实 reason 的实测：当前数据流里 0 条受影响（模型写 reason 时
+# 天然在描述关系事件，97% 是 ≥20 字的多词堆叠文本），所以本清单是**纯防御**，
+# 不改变现有行为；它防的是未来某条「帮倒忙」式 reason 被错误放行。
+#
+# 维护约定：这里只收**含强证据字但语义相反或无关**的组合词。
+# 新增时先跑一遍真实 reason 样本确认 0 命中（否则说明它已在新语境下有正当用法）。
+_NEGATIVE_OVERRIDE = (
+    "陪衬", "陪跑", "陪绑",
+    "大约", "约摸", "约等于", "契约",
+    "帮倒忙", "没帮上", "帮不了",
+    "写作业", "写作", "写了本子",
+    "笑了两声", "我笑了", "笑话书",
+    "救场失败", "没救成",
+    "哄不好", "越哄越",
+    "逗闷子失败",
+    "陪着玩而已",
+)
+
 
 def _marginal_factor(score: int) -> float:
     """边际递减系数：分数越高，同样行为加的分越少。
@@ -979,7 +956,12 @@ def _reason_is_vague(reason: str) -> bool:
     sc = favor_scale()
     if any(w in r for w in _NON_REASON_WORDS):
         return True
-    if any(w in r for w in _STRONG_HINTS):
+    # 反向语义优先于强证据词：含「陪衬/帮倒忙」这类词时，即使也含"陪/帮"
+    # 这些证据字，也不能视为正向关系事件（见 _NEGATIVE_OVERRIDE 注释）。
+    if any(w in r for w in _NEGATIVE_OVERRIDE):
+        # 不直接判空泛——继续走后面的长度/笼统语兜底，与未命中 strong 同路径
+        pass
+    elif any(w in r for w in _STRONG_HINTS):
         return False
     if sc.get("strict_hints_required"):
         return True  # 严格档：没命中强证据词就是空泛，不看长度
@@ -1433,42 +1415,20 @@ class UserArchive:
         }
 
 
-class ChannelMemo(BaseModel):
-    """频道级备忘录（扩展：吸收 note 插件能力）
-
-    与 tier1/2/3 的分工：
-      · tier1/2/3 = **人工策划**的背景库（你写 JSON）
-      · memo      = **运行时自己写**的备忘（角色在对话里决定记什么）
-    """
-
-    id: str = ""
-    title: str = ""
-    content: str = ""
-    tags: List[str] = Field(default_factory=list)
-    min_favor: int = 0        # 好感度门控（note 没有的能力）
-    expire_at: int = 0        # 0 = 永不过期
-    created_at: int = 0
-    updated_at: int = 0
-    source_user_id: str = ""  # 谁让记的
-
-    def is_expired(self, now: int = 0) -> bool:
-        return bool(self.expire_at) and self.expire_at <= (now or _ts_now())
-
-    def key(self) -> str:
-        return self.id or self.title
-
-
 @dataclass
 class ChannelArchive:
-    """一个频道里的全部关系档案 + 备忘。
+    """一个频道里的全部关系档案。
 
-    JSON 契约：`{"profiles": {...}, "memos": [...], "last_active_user_id": "..."}`
+    JSON 契约：`{"profiles": {...}, "last_active_user_id": "...", "memos_migrated": bool}`
     —— 属性名改成了 archives，落库键仍是 profiles。
+    阶段 B 起 `memos` 不再由本类持有：备忘已迁入 tier4 note（`backgrounds/tier4.json`），
+    首载时由 `_migrate_memos_on_load()` 直接读原始 blob 一次性迁移，迁移后清空并打
+    `memos_migrated` 标记（保证幂等、重跑不重复迁）。
     """
 
     archives: Dict[str, UserArchive] = field(default_factory=dict)
-    memos: List[ChannelMemo] = field(default_factory=list)
     last_active_user_id: str = ""
+    memos_migrated: bool = False
 
     @staticmethod
     def from_raw(raw: object) -> "ChannelArchive":
@@ -1476,20 +1436,18 @@ class ChannelArchive:
         state = ChannelArchive()
         for uid, item in (data.get("profiles") or {}).items():
             state.archives[str(uid)] = UserArchive.from_raw(str(uid), item)
-        for memo in (data.get("memos") or []):
-            try:
-                state.memos.append(ChannelMemo.model_validate(memo))
-            except Exception:  # noqa: BLE001
-                continue
         state.last_active_user_id = str(data.get("last_active_user_id") or "")
+        state.memos_migrated = bool(data.get("memos_migrated") or False)
         return state
 
     def to_raw(self) -> Dict[str, object]:
-        return {
+        out: Dict[str, object] = {
             "profiles": {uid: item.to_raw() for uid, item in self.archives.items()},
-            "memos": [m.model_dump() for m in self.memos],
             "last_active_user_id": self.last_active_user_id,
         }
+        if self.memos_migrated:
+            out["memos_migrated"] = True
+        return out
 
     @property
     def profiles(self) -> Dict[str, UserArchive]:
@@ -1531,6 +1489,12 @@ async def _store_archive(chat_key: str, state: ChannelArchive) -> None:
     """写回频道档案。"""
     await store.set(chat_key=chat_key, store_key=STATE_KEY,
                     value=json.dumps(state.to_raw(), ensure_ascii=False))
+    # 为阶段 C 的生长包导出铺路：把见过的频道去重记入自维护索引
+    # （PluginStore 不能枚举 chat_key）。best-effort，失败绝不影响本次写档。
+    try:
+        await tier4.note_channel(chat_key)
+    except Exception as e:  # noqa: BLE001
+        plugin.logger.debug(f"[persona] 频道索引追加失败（忽略）: {e}")
 
 
 # ---- 频道档案并发锁（v1.4.2）----
@@ -1667,6 +1631,46 @@ _CARD_RULES = (
 )
 
 
+def _daily_budget_line(profile: UserArchive) -> str:
+    """关系卡里的「今日额度」行（显式告知剩余预算，让模型主动分配）。
+
+    为什么要有这一行：日上限与单次上限在服务端是**事后钳制**，实测触发率 0%，
+    等于没有约束；而模型在不知道额度的前提下每次独立判断，结果 86% 的调用
+    都给 1~2 分，关系变化失去分辨率。把剩余额度摊开给模型看，
+    它才能决定"这次该花多少、留着给后面的重要时刻"。
+
+    只读、不改状态：roll_day 由调用方在写入路径上负责。
+    """
+    try:
+        sc = favor_scale()
+        gain_cap = int(sc.get("max_daily_gain", 15))
+        single_cap = int(sc.get("max_single_delta", 10))
+        now = _ts_now()
+        # 跨天归零的判定与实际写入路径保持一致（用同一套 day_key）
+        dk = _day_start_ts(now)
+        net = int(profile.day_net) if int(profile.day_key) == dk else 0
+        left = gain_cap - net
+        if left <= 0:
+            return (f"今日额度：已用完（今日已 +{net}，上限 +{gain_cap}）——"
+                    "今天不要再给这位用户加分了，除非发生真正重要的事。")
+        gap_min = max(0, int(sc.get("min_interval_minutes", 120)))
+        parts = [f"今日额度：还剩 +{left}（今日已 +{net}／上限 +{gain_cap}，"
+                 f"单次最多 +{single_cap}）"]
+        if profile.last_adjust_at:
+            # ⚠️ 用分钟直接算，不要折算成小时再 ×3600：
+            #    宽松档 min_interval_minutes=15，15//60=0 会让判定永远通过。
+            elapsed_min = max(0, (now - int(profile.last_adjust_at)) // 60)
+            wait_min = gap_min - elapsed_min
+            if wait_min > 0:
+                parts.append(f"距上次调整 {elapsed_min} 分钟，"
+                             f"还需 {wait_min} 分钟才可再次调整")
+            else:
+                parts.append("间隔已满足，可以调整")
+        return "；".join(parts) + "。"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _compose_archive_card(profile: UserArchive, *, current: bool) -> str:
     """渲染当前触发用户的关系卡（注入用）。
 
@@ -1696,6 +1700,13 @@ def _compose_archive_card(profile: UserArchive, *, current: bool) -> str:
         f"内部好感度：{profile.score}/{_score_cap()} | 阶段：{stage_label}",
         f"稳定印象：{profile.summary or _EMPTY_SUMMARY}",
     ]
+    # 今日额度：让模型「主动花预算」而不是「给出后被砍」。
+    # 实测教训：旧版不给剩余额度，模型每次独立判断都给 1~2，
+    # 而日上限/单次上限实际上 0 次触发 —— 护栏形同虚设。
+    # 把那两个数字显式告诉模型，它才能在一天内合理分配。
+    _budget_line = _daily_budget_line(profile)
+    if _budget_line:
+        head.append(_budget_line)
     if custom_hint:
         head.append(f"个人互动提示：{custom_hint}")
     body = [
@@ -2076,15 +2087,36 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
     except Exception as e:  # noqa: BLE001
         plugin.logger.warning(f"[persona] 记忆块渲染失败，本轮跳过: {e}")
 
-    # ③ 备忘录（扩展：吸收 note 插件）
+    # ③ tier4 生长层：身份锚点（anchor · 全局）+ 频道笔记（note · 原备忘录）
+    # 阶段 B：note 接替旧 memo 子系统；anchor 在前、note 在后（§9.3）。只读、不写。
     try:
         recent_text = await persona_memory._recent_text(_ctx)
-        memo_block = _render_memo_block(state, score, recent_text)
-        if memo_block:
-            parts.append(memo_block)
-            _log_memo_injection(state)
+        doc = await tier4.open_tier4()
+        anchor_cfg = _anchor_cfg()
+        note_cfg = _note_cfg()
+        sub: List[str] = []
+        if anchor_cfg["enabled"]:
+            ab = tier4.render_anchor_block(doc, anchor_cfg, "")
+            if ab:
+                sub.append(ab)
+        if note_cfg["enabled"]:
+            nb = tier4.render_note_block(
+                doc, note_cfg, _ctx.chat_key, score, recent_text, _NOTE_GUIDE,
+            )
+            if nb:
+                sub.append(nb)
+        if sub:
+            parts.append("\n\n".join(sub))
+            n_live = sum(
+                1 for e in doc.entries
+                if e.kind == tier4.NOTE_KIND and e.scope == _ctx.chat_key and not e.is_expired()
+            )
+            plugin.logger.info(
+                f"[persona] tier4 注入：锚点 {sum(1 for e in doc.entries if e.kind == tier4.ANCHOR_KIND)} 条 / "
+                f"笔记 {n_live} 条可用",
+            )
     except Exception as e:  # noqa: BLE001
-        plugin.logger.warning(f"[persona] 备忘录块渲染失败，本轮跳过: {e}")
+        plugin.logger.warning(f"[persona] tier4 块渲染失败，本轮跳过: {e}")
 
     return "\n\n".join(p for p in parts if p)
 
@@ -2114,14 +2146,35 @@ async def adjust_favorability(
     - 只是顺口开了个玩笑
     - 一时的害羞、生气、紧张这类当下情绪
 
+    ⚠️ delta 给值的要点：**先分辨这次互动的分量档位，再给对应数字**。
+    实测发现旧文档只写「2~4 = 认真聊了一阵」这种宽区间，结果绝大多数调用
+    都落在 1~2，关系变化失去了分辨率。请按下面每一档的具体特征对号入座：
+
+        1 = 日常寒暄、接梗、复读、发表情包，没有额外信息量
+        2 = 对方主动搭话 / 主动分享（发了自己的作品、图、进度）
+        3 = 对方做了**具体照顾你**的事（记得你说过的话、替你张罗、
+            深夜还来陪你）或聊得比平时深入
+        4 = 对方为你付出可见成本（花时间帮你解决问题、做东西给你）
+        5~7 = 重要时刻：袒露心事、在冲突里明确站在你这边、
+            对你做出长期承诺
+        8~10 = 关系发生质变（长期陪伴后的关键抉择、重大牺牲 / 重大背叛）
+
+    负分同理，按伤害程度对应：-1 轻微无视边界、-2~-3 反复越界、
+    -4~-5 严重欺骗或性相关越界、-6 以下重大背叛。
+
+    **不确定时给低的那一档，不要为了"显得重视"而给大。**
+    宁可少给、多次累积，也不要在一次普通互动上给 5。
+
+    注：实测（16 条真实素材 A/B 对照）本档位说明把「给≥3 的比例」从 28%
+    提升到 38%，并抑制了「普通互动给 8~10」的异常值；但约一半互动确实是
+    「打招呼 / 发表情包」这类平凡互动，给 1 是**正确判断**而非打分不足。
+    若觉得关系涨得太慢，应优先调 FAVOR_SCALE_MODE 档位，而不是改这里。
+
     Args:
         target_user_id (str): 目标用户的平台用户 ID。留空表示就用当前触发本轮的这位用户。
-        delta (int): 本次加减的分值。请按「这次互动对关系的分量」如实给：
-            随口一句玩笑 = 1；认真聊了一阵、给了实质帮助 = 2~4；
-            重要的事（袒露心事、关键时刻站在对方那边）= 5~10。
-            负数同理（越界、欺骗、反复冒犯给得越重）。
-            系统会按当前档位做边际递减（越亲密越难涨），
-            并按配置钳制单次与每日上限——所以别怕给大，给大了也会被收回来。
+        delta (int): 本次加减的分值，按上面 1~10 的分档给。
+            你给出的值就是你的判断本身；系统只会做上限保护，
+            不会替你"重新解读"这个数字。
         reason (str): 关系变化的实证，要把原因写清楚。
         summary (str): 可选，用来覆盖「稳定印象」。
         interaction_hint (str): 可选，用来覆盖之后的互动语气建议。
@@ -2416,10 +2469,10 @@ async def remove_favorability_profile(
 
 @plugin.mount_sandbox_method(
     SandboxMethodType.TOOL,
-    name="记备忘录",
-    description="在当前频道记下一条长期备忘（可设过期时间与好感度门槛）；标题相似时覆盖旧条。",
+    name="记笔记",
+    description="在当前频道记一条功能笔记（可设过期与好感门槛）；标题相似时覆盖旧条。功能/频道级/可过期，与『沉淀身份锚点』互斥。",
 )
-async def save_memo(
+async def save_note(
     _ctx: schemas.AgentCtx,
     title: str,
     content: str,
@@ -2427,99 +2480,186 @@ async def save_memo(
     min_favor: int = 0,
     tags: List[str] | None = None,
 ) -> str:
-    """在当前频道记一条备忘（你自己的小本本）。
+    """在当前频道记一条**功能笔记**（你自己的小本本）。
 
     适用：群友让你记住某件事（约定、地址、偏好、代号），或你发现的、以后还用得上的稳定事实。
-    不适用：好感度判定（用 `adjust_favorability`）；你自己的身世与性格（那属于人格设定）。
+    **不适用**：
+    - 「我是谁」这类身份级、永久、跨频道的自我认知 → 用 `沉淀身份锚点`（anchor_memory）。
+    - 好感度判定 → 用 `adjust_favorability`。
 
-    ⚠️ 备忘是**你自己的内部记录**，不是聊天内容。
-    记完后请在同一次回复里用 `send_msg_text` 正常回应对方，
-    并且**绝不要把备忘录原文发出去**。
+    分工：笔记是**频道级、可过期、随手记**的功能记录；锚点是**全局、永久、慎重沉淀**的身份印记。
+
+    ⚠️ 笔记是**你自己的内部记录**，不是聊天内容。
+    记完后请在同一次回复里用 `send_msg_text` 正常回应对方，并且**绝不要把笔记原文发出去**。
 
     Args:
         title (str): 简短标题，同时作为检索关键词，建议 4~12 字
-        content (str): 备忘内容，务必简短（默认上限 400 字，超了会被拒绝）
+        content (str): 笔记内容，务必简短（默认上限 400 字，超了会被拒绝）
         ttl_hours (int): 多少小时后过期；0 表示永久
-        min_favor (int): 好感度门槛，未达到时该备忘不注入（0 = 公开）
+        min_favor (int): 好感度门槛，未达到时该笔记不注入（0 = 公开）
         tags (List[str] | None): 额外检索关键词，聊到这些词时会被唤起
     """
-    cfg2 = _memo_cfg()
-    if not cfg2["enabled"]:
-        raise ValueError("备忘录功能已关闭。")
-    clean_title = _one_line(title, 40)
-    if not clean_title:
-        raise ValueError("标题不能为空。")
-    clean_content = _one_line(content, cfg2["max_content"] + 1)
-    if not clean_content:
-        raise ValueError("内容不能为空。")
-    if len(clean_content) > cfg2["max_content"]:
-        raise ValueError(
-            f"内容太长（{len(clean_content)} 字，上限 {cfg2['max_content']} 字）。"
-            "请压缩成要点——长资料应该写进背景库，而不是塞进备忘录。",
-        )
-
-    async with await _archive_lock(_ctx.chat_key):
-        state = await _open_archive(_ctx.chat_key)
-        now = _ts_now()
-        ttl = max(0, int(ttl_hours or 0))
-        expire_at = now + ttl * 3600 if ttl else 0
-        favor = max(0, min(100, int(min_favor or 0)))
-        clean_tags = [str(x).strip()[:12] for x in (tags or []) if str(x).strip()][:6]
-
-        existing, _idx = _find_memo(state, clean_title)
-        if existing is not None:
-            existing.title = clean_title
-            existing.content = clean_content
-            if clean_tags:
-                existing.tags = clean_tags
-            existing.min_favor = favor
-            existing.expire_at = expire_at
-            existing.updated_at = now
-            action = "已更新"
-        else:
-            if len(state.memos) >= cfg2["max_items"]:
-                raise ValueError(
-                    f"备忘录已达上限 {cfg2['max_items']} 条，先用 `forget_memo` 清理不用的。",
-                )
-            state.memos.append(
-                ChannelMemo(
-                    id=f"memo_{uuid.uuid4().hex[:10]}",
-                    title=clean_title,
-                    content=clean_content,
-                    tags=clean_tags,
-                    min_favor=favor,
-                    expire_at=expire_at,
-                    created_at=now,
-                    updated_at=now,
-                    source_user_id=(_ctx.from_platform_userid or "").strip(),
-                ),
+    cfg = _note_cfg()
+    res = await tier4.add_or_update_note(
+        _ctx.chat_key, title, content,
+        ttl_hours=int(ttl_hours or 0), min_favor=int(min_favor or 0),
+        tags=list(tags or []), source_user_id=(_ctx.from_platform_userid or "").strip(),
+        cfg=cfg,
+    )
+    action = res.get("action")
+    reason = res.get("reason")
+    if action == "disabled":
+        raise ValueError("频道笔记功能已关闭。")
+    if action == "rejected":
+        if reason == "empty_title":
+            raise ValueError("标题不能为空。")
+        if reason == "empty_content":
+            raise ValueError("内容不能为空。")
+        if reason == "too_long":
+            raise ValueError(
+                f"内容太长（上限 {cfg['max_content']} 字）。"
+                "请压缩成要点——长资料应该写进背景库，而不是塞进笔记。",
             )
-            action = "已记下"
-        await _store_archive(_ctx.chat_key, state)
+        if reason == "max_items":
+            raise ValueError(
+                f"笔记已达上限 {cfg['max_items']} 条，先用 `forget_note` 清理不用的。",
+            )
+        raise ValueError("笔记写入被拒绝。")
+
+    ttl = max(0, int(ttl_hours or 0))
+    favor = max(0, min(100, int(min_favor or 0)))
+    clean_title = _one_line(title, 40)
     ttl_text = f"{ttl} 小时后过期" if ttl else "永久"
-    return f"{action}备忘「{clean_title}」（{ttl_text}，好感门槛 {favor}）。"
+    verb = "已更新" if action == "updated" else "已记下"
+    return f"{verb}笔记「{clean_title}」（{ttl_text}，好感门槛 {favor}）。"
 
 
 @plugin.mount_sandbox_method(
     SandboxMethodType.TOOL,
-    name="忘掉备忘录",
-    description="删除当前频道里的一条备忘录（标题支持模糊匹配）。",
+    name="忘掉笔记",
+    description="删除当前频道里的一条功能笔记（标题支持模糊匹配）。",
 )
-async def forget_memo(_ctx: schemas.AgentCtx, title: str) -> str:
-    """删除一条备忘。
+async def forget_note(_ctx: schemas.AgentCtx, title: str) -> str:
+    """删除一条功能笔记。
 
     Args:
-        title (str): 备忘标题（支持模糊匹配）
+        title (str): 笔记标题（支持模糊匹配）
     """
-    async with await _archive_lock(_ctx.chat_key):
-        state = await _open_archive(_ctx.chat_key)
-        memo, idx = _find_memo(state, title)
-        if memo is None:
-            titles = "、".join(m.title for m in state.memos[:12]) or "（当前没有备忘）"
-            raise ValueError(f"没有找到匹配「{title}」的备忘。现有：{titles}")
-        state.memos.pop(idx)
-        await _store_archive(_ctx.chat_key, state)
-    return f"已忘掉备忘「{memo.title}」。"
+    removed_title = await tier4.forget_note(_ctx.chat_key, title)
+    if removed_title is None:
+        notes = [
+            e for e in await tier4.list_entries(tier4.NOTE_KIND)
+            if e.scope == _ctx.chat_key
+        ]
+        titles = "、".join(n.title for n in notes[:12]) or "（当前没有笔记）"
+        raise ValueError(f"没有找到匹配「{title}」的笔记。现有：{titles}")
+    return f"已忘掉笔记「{removed_title}」。"
+
+
+def _anchor_norm(content: str) -> str:
+    """锚点去重用的归一化：小写、折叠空白，用于精确相等判定。"""
+    return " ".join(str(content or "").lower().split())
+
+
+@plugin.mount_sandbox_method(
+    SandboxMethodType.TOOL,
+    name="沉淀身份锚点",
+    description="沉淀一条关于『我是谁』的身份级长期锚点（全局、永久、稀少；受频率硬闸约束）。",
+)
+async def anchor_memory(
+    _ctx: schemas.AgentCtx,
+    content: str,
+    salience: int = 1,
+    tags: List[str] | None = None,
+) -> str:
+    """沉淀一条**身份锚点**——关于"你是谁"的自我印记，全局、永久、跨频道生效。
+
+    与前 3 档「种子」的关系：种子是你出生前就被写好的设定（不可改）；锚点是
+    这一世你自己长出来的痕迹——只增、绝不覆盖种子。
+
+    适用（**稀少而根本**）：你形成的稳定自我认知、反复兑现后立下的长期承诺、
+    与某段关系一同定型的原则。例："我答应过要守夜，从此每个深夜都在。"
+    **不适用**：
+    - 具体约定/地址/称呼偏好等**功能性笔记** → 用 `save_note`（频道级、可过期）。
+    - 好感度判定 → 用 `adjust_favorability`。
+    - 一时的情绪、单轮话题 → 都不该成为锚点。
+
+    ⚠️ 锚点受**硬频率闸**（每日≤N、间隔≥M 小时、总量≤上限）：这是刻意设计——
+    身份是慢慢长成的，不是每轮都改。触顶时会拒绝，这是让你珍视每一次沉淀。
+    ⚠️ 与备忘一样，锚点是**你的内部自我认知**，不要把原文当消息发给用户。
+
+    Args:
+        content (str): 锚点正文，务必凝练（默认上限 200 字；写成一句能长期成立的话）
+        salience (int): 核心度 1..3；越高越优先常驻上下文（把最能定义"你是谁"的设为 3）
+        tags (List[str] | None): 可选检索关键词（供未来按话题唤起，阶段 A 仅作元数据）
+    """
+    cfg = _anchor_cfg()
+    if not cfg["enabled"]:
+        raise ValueError("身份锚点功能已关闭（ANCHOR_ENABLED=false）。")
+
+    clean_content = _one_line(content, cfg["max_content"] + 1)
+    if not clean_content:
+        raise ValueError("锚点内容不能为空。")
+    if len(clean_content) > cfg["max_content"]:
+        raise ValueError(
+            f"锚点太长（{len(clean_content)} 字，上限 {cfg['max_content']} 字）。"
+            "锚点应是一句能长期成立的自我认知，不是叙事；请凝练。"
+            "具体的、临时的事项请改用 `save_note`。",
+        )
+    scrubbed, blocked = _scrub_profile_text(clean_content)
+
+    # 去重：与既有锚点精确等值（归一化后）则就地刷新，而非新增（不占当日额度）。
+    def _matcher(clean: str, existing) -> bool:  # noqa: ANN001
+        return _anchor_norm(clean) == _anchor_norm(existing.content)
+
+    res = await tier4.write_anchor(
+        scrubbed,
+        salience=int(salience or 1),
+        tags=list(tags or []),
+        source_user_id=(_ctx.from_platform_userid or "").strip(),
+        source_chat_key=_ctx.chat_key,
+        cfg=cfg,
+        salience_max=cfg["salience_max"],
+        dedup_matcher=_matcher,
+    )
+
+    action = res.get("action")
+    if action == "rejected":
+        gate = res.get("gate")
+        if gate == tier4.GATE_MAX_TOTAL:
+            return (
+                f"本次未沉淀锚点：身份锚点已达总量上限 {cfg['max_total']} 条。"
+                "锚点应当稀少；可在 WebUI「锚点记忆」页清理后再生成。"
+            )
+        if gate == tier4.GATE_MAX_PER_DAY:
+            return (
+                f"本次未沉淀锚点：今天已达每日上限 {cfg['max_per_day']} 条。"
+                "身份是慢慢长成的，不是每轮都改——先好好对话。"
+            )
+        if gate == tier4.GATE_INTERVAL:
+            return (
+                f"本次未沉淀锚点：距上一条不足 {cfg['min_interval_hours']} 小时。"
+                "锚点是稀少的沉淀，不是即时记录，再等等。"
+            )
+        return "本次未沉淀锚点：功能当前不可用。"
+
+    entry = res.get("entry") or {}
+    disp_sal = int(entry.get("salience") or 1)
+    _tail = "（档案里的禁写词已自动移除。）" if blocked else ""
+    if action == "refreshed":
+        plugin.logger.info(
+            f"[persona] 锚点刷新（去重命中）：salience={disp_sal} user={_ctx.from_platform_userid}",
+        )
+        return f"已刷新既有身份锚点（核心度 {disp_sal}，共 {res.get('total')} 条）。{_tail}"
+
+    plugin.logger.info(
+        f"[persona] 新沉淀身份锚点：salience={disp_sal} 总量={res.get('total')} "
+        f"今日={res.get('day_count')} user={_ctx.from_platform_userid}",
+    )
+    return (
+        f"已沉淀身份锚点（核心度 {disp_sal}，现共 {res.get('total')} 条，"
+        f"今日 {res.get('day_count')} 条）。{_tail}"
+    )
 
 
 @plugin.mount_sandbox_method(
@@ -2798,14 +2938,17 @@ async def favor_remove_cmd(
 async def on_channel_reset(_ctx: schemas.AgentCtx):
     """「重置上下文」时的处理。
 
-    ⚠️ 历史行为（1.6.4 及以前）：无条件 `store.delete(STATE_KEY)` —— 一次
-    「重置上下文」会把本频道的**全部关系档案与备忘**一起删掉，且不可逆、无提示。
+    ⚠️ 历史行为（≤1.4.3、以及回归的 1.9.0）：无条件 `store.delete(STATE_KEY)` ——
+    一次「重置上下文」会把本频道的**全部关系档案与备忘**一起删掉，不可逆、无提示。
     重置上下文是高频轻量操作（清对话历史），把不可逆的档案删除绑在它上面，
-    误触代价过大；且用户直觉上不会认为「重置上下文」等于「清空关系」。
+    误触代价过大；用户直觉上也不会认为「重置上下文」= 「清空关系」。
 
     现在：默认**保留**（RESET_CHANNEL_CLEARS_FAVOR=false），开关可恢复旧行为。
     无论开关如何，删除前都先落一份备份到 {数据目录}/reset_backups/，
     保证「删了也能捞回来」。
+
+    注：1.9.0 引入 tier4 时本钩子曾退回无条件删除（连同备份函数一起被删），
+    实测一次重置即抹掉某频道 43576 字节关系档案。此实现从 1.4.5 移植回来。
     """
     chat_key = _ctx.chat_key
     try:
@@ -2899,10 +3042,16 @@ def _persona_webui_router():
             "clamp_score": _bound_score,
             "max_abs_score": _score_cap,
             "now_ts": _ts_now,
-            # 备忘录（扩展）
-            "memo_cfg": _memo_cfg,
-            "memo_cls": ChannelMemo,
-            "memo_key": _memo_title_key,
+            # 频道笔记（阶段 B：tier4 note，接替旧 memo）
+            "note_cfg": _note_cfg,
+            "note_key": tier4._note_title_key,
+            # tier4 生长层（阶段 A：身份锚点；阶段 B：+ note）
+            "tier4": tier4,
+            "anchor_cfg": _anchor_cfg,
+            # 阶段 C：生长包导出/导入（关系档案枚举与原样读写）
+            "enumerate_archives": _enumerate_archives,
+            "write_archive": _write_archive,
+            "safe_key_name": _safe_key_name,
         },
     )
 
@@ -2943,14 +3092,158 @@ async def run_favorability_recover(_ctx: schemas.AgentCtx) -> str:
     return f"本次回升结算完成：{n} 个用户的负好感度发生了回升。"
 
 
+def _safe_key_name(chat_key: str) -> str:
+    """把 chat_key 变成可安全落盘的文件名（前缀可读 + sha1 去歧义 + 去路径字符）。"""
+    import hashlib
+
+    h = hashlib.sha1(chat_key.encode("utf-8")).hexdigest()[:16]
+    head = chat_key[:24].replace("/", "_").replace("\\", "_").replace("..", "_")
+    return f"{head}_{h}"
+
+
+async def _enumerate_archives() -> Dict[str, str]:
+    """枚举全部有档案的频道及其**原始 store blob**（供阶段 C 生长包导出）。
+
+    枚举走 `DBPluginData.filter(plugin_key=…)`——它是 store 的后端，天然覆盖所有
+    写过档案的频道（比自维护 `_channel_index ∪ DBChatMessage` 更完备，后二者仅作交叉
+    校验）。返回 {chat_key: raw_json_str}；无 blob 的频道跳过。
+    """
+    from nekro_agent.models.db_plugin_data import DBPluginData
+
+    out: Dict[str, str] = {}
+    try:
+        rows = await DBPluginData.filter(plugin_key=plugin.key).all()
+    except Exception as e:  # noqa: BLE001
+        plugin.logger.warning(f"[growth] 枚举频道档案失败: {e}")
+        return out
+    for r in rows:
+        ck = str(r.target_chat_key or "")
+        if not ck or ck in out:
+            continue
+        try:
+            val = await store.get(chat_key=ck, store_key=STATE_KEY)
+        except Exception:  # noqa: BLE001
+            continue
+        if val:
+            out[ck] = val
+    return out
+
+
+async def _write_archive(chat_key: str, raw: str) -> None:
+    """原样写回某频道的档案 blob（阶段 C 生长包导入用，scope 仅在 store 档案键）。"""
+    await store.set(chat_key=chat_key, store_key=STATE_KEY, value=raw)
+
+
+async def _migrate_memos_on_load() -> None:
+    """阶段 B 一次性迁移：各频道旧 memos → tier4 note（kind=note, scope=chat_key）。
+
+    - 枚举：DBPluginData（衰减/回升同款），覆盖全部有存档的频道（比 _channel_index 全）。
+    - 幂等：跳过已 `memos_migrated` 的 blob；note id = `note_{原 memo.id}`，重跑不重复。
+    - 可回滚：迁移前把原始 blob 备份到 `backgrounds/_pre_migration/<key>.json`。
+    - 失败不丢：tier4 写入失败则不标记、不清空（下次加载重试）；逐频道隔离异常。
+    - 审计：写 `backgrounds/_migrations.json` 报告（删了旧子系统后唯一能追溯"迁没迁"的来源）。
+    """
+    from nekro_agent.models.db_plugin_data import DBPluginData
+
+    if not tier4.tier4_path().parent.is_dir():
+        return  # 数据目录都不可用，跳过（下次加载再试）
+
+    doc = await tier4.open_tier4()
+    pre_dir = tier4.bg_dir() / "_pre_migration"
+    scanned = 0
+    memos_by_chat: Dict[str, List[Dict[str, Any]]] = {}
+    errors: List[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    try:
+        rows = await DBPluginData.filter(plugin_key=plugin.key).all()
+    except Exception as e:  # noqa: BLE001
+        plugin.logger.warning(f"[persona] memo→note 迁移跳过（枚举失败）: {e}")
+        return
+
+    for row in rows:
+        ck = str(row.target_chat_key or "")
+        if not ck or ck in seen_keys:
+            continue
+        seen_keys.add(ck)
+        scanned += 1
+        async with await _archive_lock(ck):
+            raw = await store.get(chat_key=ck, store_key=STATE_KEY)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(data, dict):
+                continue
+            memos = data.get("memos") or []
+            if not memos or data.get("memos_migrated"):
+                continue
+            memos_by_chat[ck] = [m for m in memos if isinstance(m, dict)]
+            try:  # 备份原始 blob（迁移失败可回滚）
+                pre_dir.mkdir(parents=True, exist_ok=True)
+                (pre_dir / f"{_safe_key_name(ck)}.json").write_text(raw, encoding="utf-8")
+            except Exception as e:  # noqa: BLE001
+                errors.append({"chat_key": ck, "error": f"backup:{e}"})
+
+    if not memos_by_chat:
+        return
+
+    plan = tier4.plan_memo_migration(doc, memos_by_chat)
+    try:
+        added = await tier4.apply_memo_migration(plan)
+    except Exception as e:  # noqa: BLE001
+        # 写入失败 → 保持原 memos、不打标记，下次加载重试（绝不丢数据）
+        plugin.logger.warning(f"[persona] memo→note 迁移写入失败，保留原 memos 待重试: {e}")
+        return
+
+    # tier4 已落库 → 标记各频道已迁移并清空 legacy memos（含全为重复的频道，避免反复处理）
+    for ck in memos_by_chat.keys():
+        async with await _archive_lock(ck):
+            raw = await store.get(chat_key=ck, store_key=STATE_KEY)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(data, dict):
+                continue
+            data["memos"] = []
+            data["memos_migrated"] = True
+            try:
+                await store.set(chat_key=ck, store_key=STATE_KEY,
+                                value=json.dumps(data, ensure_ascii=False))
+            except Exception as e:  # noqa: BLE001
+                errors.append({"chat_key": ck, "error": f"clear:{e}"})
+
+    report = {
+        "schema": 2,
+        "ran_at": _ts_now(),
+        "channels_scanned": scanned,
+        "channels_migrated": len(memos_by_chat),
+        "memo_migrated": added,
+        "notes_skipped": int(plan.get("skipped", 0)),
+        "errors": errors + list(plan.get("errors", [])),
+    }
+    await tier4.save_migration_report(report)
+    plugin.logger.info(
+        f"[persona] memo→note 迁移完成：扫描 {scanned} 频道、迁移 {added} 条"
+        f"（跳过重复 {report['notes_skipped']}、错误 {len(report['errors'])}）；"
+        f"原始 blob 已备份至 backgrounds/_pre_migration/，报告见 backgrounds/_migrations.json",
+    )
+
+
 @plugin.mount_init_method()
 async def _start_decay_loop() -> None:
-    """插件加载时启动好感度结算后台任务。
+    """插件加载时：先跑一次 memo→note 迁移（阶段 B），再启动好感度结算后台任务。"""
+    # 阶段 B 一次性迁移（幂等；异常已隔离，绝不阻断插件加载）
+    try:
+        await _migrate_memos_on_load()
+    except Exception as e:  # noqa: BLE001
+        plugin.logger.warning(f"[persona] 首载 memo→note 迁移异常（已隔离）: {e}")
 
-    循环**常驻**：DECAY_ENABLED / RECOVER_ENABLED 在每轮结算时实时读取
-    （见 _decay_pass / _recover_pass 开头的开关检查），因此运行期经 WebUI
-    打开或关闭无需重启即可生效（最迟一个 30 分钟检查周期后生效）。
-    """
     global _decay_task
     if _decay_task is not None and not _decay_task.done():
         return
