@@ -1194,6 +1194,15 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "MEMO_INJECT_MATCHED": (int, 0, 10),
             "MEMO_INJECT_CHARS": (int, 100, 4000),
             "MEMO_DEDUP_MIN_KEY_LEN": (int, 2, 10),
+            # 扩展：tier4 身份锚点（阶段 A v1.7.0）
+            "ANCHOR_ENABLED": (bool, None, None),
+            "ANCHOR_MAX_TOTAL": (int, 1, 500),
+            "ANCHOR_MAX_PER_DAY": (int, 0, 50),
+            "ANCHOR_MIN_INTERVAL_HOURS": (int, 0, 168),
+            "ANCHOR_MAX_CONTENT_CHARS": (int, 20, 2000),
+            "ANCHOR_INJECT_MAX": (int, 0, 50),
+            "ANCHOR_INJECT_CHARS": (int, 0, 8000),
+            "ANCHOR_SALIENCE_MAX": (int, 1, 5),
         }
         for k, (conv, lo, hi) in limits.items():
             if k not in body:
@@ -1339,130 +1348,352 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         reload_state = await _reload_after_write()
         return {"ok": True, "persisted": True, "id": eid, "tier": tier, **reload_state}
 
-    # ---------------- 备忘录（扩展：吸收 note 插件）----------------
-    @router.get("/api/memos", summary="频道备忘录")
+    # ---------------- 频道笔记（阶段 B：tier4 note，接替旧 memo）----------------
+    # 端点路径 /api/memos、/api/memo 保持不变（前端无需改），底层数据源从
+    # ChannelArchive.memos 换成 tier4.json 里 kind=note、scope=chat_key 的条目。
+    def _note_items(chat_key: str, entries, now: int) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for n in entries:
+            if n.scope != chat_key:
+                continue
+            expire_at = int(n.expire_at or 0)
+            items.append(
+                {
+                    "id": str(n.id),
+                    "title": str(n.title),
+                    "content": str(n.content),
+                    "tags": list(n.tags),
+                    "min_favor": int(n.min_favor or 0),
+                    "expire_at": expire_at,
+                    "expired": bool(expire_at and expire_at <= now),
+                    "created_at": int(n.created_at or 0),
+                    "updated_at": int(n.updated_at or 0),
+                    "source_user_id": str(n.source_user_id or ""),
+                },
+            )
+        items.sort(key=lambda x: -x["updated_at"])
+        return items
+
+    @router.get("/api/memos", summary="频道笔记")
     async def api_memos(request: Request, chat_key: str = "") -> Dict[str, Any]:
         _check_key(request)
         if not chat_key:
             raise HTTPException(status_code=400, detail="缺少 chat_key")
-        state = await helpers["load_state"](chat_key)
+        t4 = helpers["tier4"]
         now = int(helpers["now_ts"]())
-        items: List[Dict[str, Any]] = []
-        for m in getattr(state, "memos", []) or []:
-            expire_at = int(getattr(m, "expire_at", 0) or 0)
-            items.append(
-                {
-                    "id": str(getattr(m, "id", "") or ""),
-                    "title": str(getattr(m, "title", "") or ""),
-                    "content": str(getattr(m, "content", "") or ""),
-                    "tags": list(getattr(m, "tags", None) or []),
-                    "min_favor": int(getattr(m, "min_favor", 0) or 0),
-                    "expire_at": expire_at,
-                    "expired": bool(expire_at and expire_at <= now),
-                    "created_at": int(getattr(m, "created_at", 0) or 0),
-                    "updated_at": int(getattr(m, "updated_at", 0) or 0),
-                    "source_user_id": str(getattr(m, "source_user_id", "") or ""),
-                },
-            )
-        items.sort(key=lambda x: -x["updated_at"])
-        mcfg = helpers["memo_cfg"]()
+        entries = await t4.list_entries(t4.NOTE_KIND)
+        items = _note_items(chat_key, entries, now)
+        ncfg = helpers["note_cfg"]()
         return {
             "chat_key": chat_key,
             "items": items,
             "meta": {
-                **mcfg,
+                **ncfg,
                 "total": len(items),
                 "live": sum(1 for x in items if not x["expired"]),
             },
         }
 
-    @router.post("/api/memo", summary="新建 / 修改 / 删除备忘录")
+    @router.post("/api/memo", summary="新建 / 修改 / 删除频道笔记")
     async def api_memo_update(request: Request) -> Dict[str, Any]:
         _check_key(request)
         body = await request.json()
         chat_key = str(body.get("chat_key") or "")
         if not chat_key:
             raise HTTPException(status_code=400, detail="缺少 chat_key")
-        state = await helpers["load_state"](chat_key)
+        t4 = helpers["tier4"]
+        ncfg = helpers["note_cfg"]()
         now = int(helpers["now_ts"]())
-        mcfg = helpers["memo_cfg"]()
+
+        async def _scope_total() -> int:
+            return sum(
+                1 for n in await t4.list_entries(t4.NOTE_KIND) if n.scope == chat_key
+            )
+
         op = str(body.get("op") or "save")
 
         if op == "delete":
             mid = str(body.get("id") or "")
-            before = len(state.memos)
-            state.memos = [m for m in state.memos if str(getattr(m, "id", "")) != mid]
-            if len(state.memos) == before:
-                raise HTTPException(status_code=404, detail=f"找不到备忘 {mid}")
-            await helpers["save_state"](chat_key, state)
-            return {"ok": True, "deleted": mid, "total": len(state.memos)}
+            if not await t4.delete_entry(mid):
+                raise HTTPException(status_code=404, detail=f"找不到笔记 {mid}")
+            return {"ok": True, "deleted": mid, "total": await _scope_total()}
 
         if op == "clear_expired":
-            before = len(state.memos)
-            state.memos = [m for m in state.memos if not m.is_expired(now)]
-            removed = before - len(state.memos)
-            await helpers["save_state"](chat_key, state)
-            return {"ok": True, "removed": removed, "total": len(state.memos)}
+            removed = await t4.clear_expired_notes(chat_key)
+            return {"ok": True, "removed": removed, "total": await _scope_total()}
 
         title = str(body.get("title") or "").strip()[:40]
         content = str(body.get("content") or "").strip()
-        if not title:
-            raise HTTPException(status_code=400, detail="标题不能为空")
-        if not content:
-            raise HTTPException(status_code=400, detail="备忘内容不能为空")
-        if len(content) > int(mcfg["max_content"]):
-            raise HTTPException(
-                status_code=400, detail=f"内容超过上限 {mcfg['max_content']} 字",
-            )
         tags = [str(x).strip()[:12] for x in (body.get("tags") or []) if str(x).strip()][:6]
         min_favor = max(0, min(100, int(body.get("min_favor") or 0)))
         ttl_hours = max(0, int(body.get("ttl_hours") or 0))
-        expire_at = now + ttl_hours * 3600 if ttl_hours else 0
 
-        mid = str(body.get("id") or "")
-        target = next(
-            (m for m in state.memos if mid and str(getattr(m, "id", "")) == mid), None,
+        res = await t4.add_or_update_note(
+            chat_key, title, content,
+            ttl_hours=ttl_hours, min_favor=min_favor, tags=tags,
+            source_user_id=str(body.get("source_user_id") or ""), cfg=ncfg,
         )
-        if target is None:   # 标题去重（与 save_memo 保持一致）
-            key = helpers["memo_key"](title)
-            target = next(
-                (m for m in state.memos if helpers["memo_key"](m.title) == key), None,
-            )
-        if target is not None:
-            target.title = title
-            target.content = content
-            target.tags = tags
-            target.min_favor = min_favor
-            target.expire_at = expire_at
-            target.updated_at = now
-            action = "updated"
-            result_id = str(getattr(target, "id", "") or "")
-        else:
-            if len(state.memos) >= int(mcfg["max_items"]):
-                raise HTTPException(
-                    status_code=400, detail=f"已达上限 {mcfg['max_items']} 条，请先清理",
-                )
-            import uuid as _uuid
-
-            memo = helpers["memo_cls"](
-                id=f"memo_{_uuid.uuid4().hex[:10]}",
-                title=title,
-                content=content,
-                tags=tags,
-                min_favor=min_favor,
-                expire_at=expire_at,
-                created_at=now,
-                updated_at=now,
-            )
-            state.memos.append(memo)
-            action = "created"
-            result_id = memo.id
-        await helpers["save_state"](chat_key, state)
+        action = res.get("action")
+        reason = res.get("reason")
+        if action == "disabled":
+            raise HTTPException(status_code=400, detail="频道笔记功能已关闭")
+        if action == "rejected":
+            detail = {
+                "empty_title": "标题不能为空",
+                "empty_content": "内容不能为空",
+                "too_long": f"内容超过上限 {ncfg['max_content']} 字",
+                "max_items": f"已达上限 {ncfg['max_items']} 条，请先清理",
+            }.get(reason, "写入被拒绝")
+            raise HTTPException(status_code=400, detail=detail)
+        note = res.get("note") or {}
         return {
             "ok": True,
-            "action": action,
-            "id": result_id,
-            "total": len(state.memos),
+            "action": action,           # created | updated
+            "id": str(note.get("id", "")),
+            "total": await _scope_total(),
+        }
+
+    # ==================== tier4 生长层 · 身份锚点（阶段 A v1.7.0）====================
+    # WebUI 侧只做「审计」：查看 / 删除 / 调 salience。锚点只能由模型经 anchor_memory
+    # 工具新增（触发可见），WebUI 不代为写入。tier4.json 属**私密生长数据**，
+    # 绝不进公开的种子导出包（见 §5.3），仅提供独立私有导出。
+    @router.get("/api/tier4", summary="tier4 条目（默认列 anchor）")
+    async def api_tier4(request: Request, kind: str = "anchor") -> Dict[str, Any]:
+        _check_key(request)
+        t4 = helpers["tier4"]
+        k = (kind or "").strip() or None
+        entries = await t4.list_entries(k)
+        now = int(helpers["now_ts"]())
+        rows: List[Dict[str, Any]] = []
+        for e in entries:
+            rows.append(
+                {
+                    "id": str(e.id),
+                    "kind": str(e.kind),
+                    "scope": str(e.scope),
+                    "content": str(e.content),
+                    "title": str(e.title),
+                    "tags": list(e.tags),
+                    "salience": int(e.salience),
+                    "min_favor": int(e.min_favor),
+                    "expire_at": int(e.expire_at),
+                    "expired": bool(e.expire_at and e.expire_at <= now),
+                    "source_user_id": str(e.source_user_id),
+                    "source_chat_key": str(e.source_chat_key),
+                    "created_at": int(e.created_at),
+                    "updated_at": int(e.updated_at),
+                },
+            )
+        rows.sort(key=lambda x: (-int(x["salience"]), -int(x["updated_at"])))
+        acfg = helpers["anchor_cfg"]()
+        meta = (await t4.open_tier4()).meta.to_raw()
+        return {
+            "kind": k or "all",
+            "items": rows,
+            "meta": {
+                **acfg,
+                "total": len(rows),
+                "day_count": int(meta.get("day_count") or 0),
+                "last_anchor_at": int(meta.get("last_anchor_at") or 0),
+            },
+        }
+
+    @router.post("/api/tier4", summary="tier4 条目操作（delete / salience）")
+    async def api_tier4_update(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        body = await request.json()
+        t4 = helpers["tier4"]
+        acfg = helpers["anchor_cfg"]()
+        op = str(body.get("op") or "")
+        eid = str(body.get("id") or "")
+        if not eid:
+            raise HTTPException(status_code=400, detail="缺少 id")
+
+        if op == "delete":
+            if not await t4.delete_entry(eid):
+                raise HTTPException(status_code=404, detail=f"找不到条目 {eid}")
+            remaining = await t4.list_entries("anchor")
+            plugin.logger.info(f"[persona] WebUI 删除锚点 {eid}")
+            return {"ok": True, "op": "delete", "id": eid, "total": len(remaining)}
+
+        if op == "salience":
+            try:
+                val = int(body.get("salience"))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="salience 需为整数") from None
+            if not await t4.set_salience(eid, val, salience_max=acfg["salience_max"]):
+                raise HTTPException(status_code=404, detail=f"找不到锚点 {eid}")
+            cur = next((e for e in await t4.list_entries("anchor") if e.id == eid), None)
+            plugin.logger.info(f"[persona] WebUI 调整锚点 salience: {eid} → {val}")
+            return {"ok": True, "op": "salience", "id": eid,
+                    "salience": int(cur.salience) if cur else val}
+
+        raise HTTPException(status_code=400, detail=f"未知操作: {op}")
+
+    @router.get("/api/tier4/export", summary="导出生长层 tier4.json（私有，不进种子包）")
+    async def api_tier4_export(request: Request):
+        _check_key(request)
+        from datetime import datetime as _datetime
+
+        from fastapi.responses import Response as _Resp
+
+        t4 = helpers["tier4"]
+        fp = t4.tier4_path()
+        if fp.is_file():
+            raw = fp.read_bytes()
+        else:
+            doc = await t4.open_tier4()
+            raw = json.dumps(doc.to_raw(), ensure_ascii=False, indent=1).encode("utf-8")
+        stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
+        return _Resp(
+            content=raw,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="tier4_{stamp}.json"',
+            },
+        )
+
+    # ==================== 阶段 C：生长包（tier4 + 关系档案 + hit_stats，私密）====================
+    # 与公开「种子包」彻底分离：生长包是"这一世活过的痕迹"，用于实例间迁移/备份。
+    # 只含 tier4.json + 各频道关系档案 + .hit_stats.json + 迁移报告/频道索引；
+    # **不含** tier1/2/3、favor.json、presets。关系档案用 `archives.json`（按 chat_key 建索引），
+    # 因为档案 blob 本身不含 chat_key，按文件名 hash 无法反推——用字典才无损。
+    @router.get("/api/growth/export", summary="导出生长包（tier4 + 关系档案 + hit_stats，私密）")
+    async def api_growth_export(request: Request):
+        _check_key(request)
+        import io as _io
+        import zipfile as _zipfile
+        from datetime import datetime as _datetime
+
+        from fastapi.responses import Response as _Resp
+
+        t4 = helpers["tier4"]
+        buf = _io.BytesIO()
+        stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
+        counts: Dict[str, Any] = {}
+        with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as zf:
+            fp = t4.tier4_path()
+            if fp.is_file():
+                raw = fp.read_bytes()
+                zf.writestr("backgrounds/tier4.json", raw)
+                try:
+                    counts["tier4_entries"] = len(json.loads(raw.decode("utf-8")).get("entries") or [])
+                except Exception:  # noqa: BLE001
+                    counts["tier4_entries"] = -1
+            else:
+                doc = await t4.open_tier4()
+                zf.writestr(
+                    "backgrounds/tier4.json",
+                    json.dumps(doc.to_raw(), ensure_ascii=False, indent=1),
+                )
+                counts["tier4_entries"] = len(doc.entries)
+            for name in ("_migrations.json", "_channel_index.json"):
+                p = t4.bg_dir() / name
+                if p.is_file():
+                    zf.writestr(f"backgrounds/{name}", p.read_bytes())
+            hs = BG_DIR / ".hit_stats.json"
+            if hs.is_file():
+                zf.writestr("backgrounds/.hit_stats.json", hs.read_bytes())
+            archives = await helpers["enumerate_archives"]()
+            arch_objs: Dict[str, Any] = {}
+            for ck, raw in archives.items():
+                try:
+                    obj = json.loads(raw)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(obj, dict):
+                    arch_objs[ck] = obj
+            zf.writestr("archives.json", json.dumps(arch_objs, ensure_ascii=False))
+            counts["archives"] = len(arch_objs)
+            meta = {
+                "bundle_version": 1,
+                "type": "growth",
+                "plugin": str(plugin.key),
+                "exported_at": _datetime.now().isoformat(timespec="seconds"),
+                "counts": counts,
+            }
+            zf.writestr("growth.bundle.json", json.dumps(meta, ensure_ascii=False, indent=1))
+        return _Resp(
+            content=buf.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="growth_bundle_{stamp}.zip"'},
+        )
+
+    @router.post("/api/growth/import", summary="导入生长包（只写 tier4 + 关系档案 + hit_stats，不碰种子）")
+    async def api_growth_import(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        body = await request.body()
+        if not body:
+            raise HTTPException(status_code=400, detail="没有收到文件内容")
+        import io as _io
+        import zipfile as _zipfile
+        from datetime import datetime as _datetime
+
+        try:
+            zf = _zipfile.ZipFile(_io.BytesIO(body))
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"不是有效的 zip 包：{exc}") from exc
+        names = set(zf.namelist())
+        t4 = helpers["tier4"]
+
+        if not any(n.endswith("tier4.json") or n == "archives.json" or n.endswith(".hit_stats.json")
+                   for n in names):
+            raise HTTPException(status_code=400, detail="包里没有可导入的生长数据（tier4.json / archives.json / .hit_stats.json）")
+
+        # 导入前备份当前生长状态（tier4.json + hit_stats）到 _growth_import_backups/<stamp>/
+        stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
+        bdir = BG_DIR.parent / "_growth_import_backups" / stamp
+        bdir.mkdir(parents=True, exist_ok=True)
+        if t4.tier4_path().is_file():
+            shutil.copy2(t4.tier4_path(), bdir / "tier4.json")
+        if (BG_DIR / ".hit_stats.json").is_file():
+            shutil.copy2(BG_DIR / ".hit_stats.json", bdir / ".hit_stats.json")
+
+        applied: List[str] = []
+
+        # 1) tier4.json —— 校验后覆盖
+        t4_src = next((n for n in names if n.endswith("tier4.json")), None)
+        if t4_src:
+            raw = zf.read(t4_src)
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=400, detail=f"tier4.json 不是合法 JSON：{exc}") from exc
+            if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+                raise HTTPException(status_code=400, detail="tier4.json 结构不对（缺 entries）")
+            t4.tier4_path().write_bytes(raw)
+            applied.append(f"tier4.json（{len(data['entries'])} 条）")
+
+        # 2) archives.json —— 原样回填各频道关系档案（仅 store 档案键，不碰种子/文件）
+        arch_src = next((n for n in names if n == "archives.json"), None)
+        if arch_src:
+            try:
+                arch_obj = json.loads(zf.read(arch_src).decode("utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=400, detail=f"archives.json 不是合法 JSON：{exc}") from exc
+            n_arch = 0
+            if isinstance(arch_obj, dict):
+                for ck, blob in arch_obj.items():
+                    if not isinstance(blob, dict):
+                        continue
+                    await helpers["write_archive"](str(ck), json.dumps(blob, ensure_ascii=False))
+                    n_arch += 1
+            applied.append(f"关系档案（{n_arch} 频道）")
+
+        # 3) .hit_stats.json —— 覆盖（内存命中共振需重启才重读，见返回提示）
+        hs_src = next((n for n in names if n.endswith(".hit_stats.json")), None)
+        if hs_src:
+            (BG_DIR / ".hit_stats.json").write_bytes(zf.read(hs_src))
+            applied.append(".hit_stats.json")
+
+        reload_state = await _reload_after_write()
+        plugin.logger.info(f"[growth] WebUI 导入生长包: {applied}（种子数据未改动）")
+        return {
+            "ok": True,
+            "applied": applied,
+            "backup_dir": str(bdir),
+            "note": "关系档案即时生效；tier4 文件即时生效；.hit_stats 命中热度需重启后重读。",
+            **reload_state,
         }
 
     @router.get("/api/backup/export", summary="导出整套人设（zip 包）")
@@ -1573,14 +1804,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     raise HTTPException(status_code=400, detail=f"{arc} 结构不对（缺 entries）")
                 n = len(data["entries"])
             parsed[arc] = (raw, dst, n)
-        # 只有 backgrounds 而没有 preset 也能导入；反过来（只导入预设文本）同样应该允许：
-        # 导出包允许「只要人设文本」这一用法，此处不该拦。
-        has_presets = any(x.startswith('presets/') and x.endswith('.md') for x in names)
-        if not parsed and not has_presets:
+        if not parsed:
             raise HTTPException(
                 status_code=400,
-                detail="包里没有可导入的人设文件（需要 backgrounds/tier1、tier2、tier3、"
-                       "favor.json，或 presets/*.md）",
+                detail="包里没有可导入的人设文件（需要 backgrounds/tier1、tier2、tier3 或 favor.json）",
             )
 
         # 导入前先备份当前文件
@@ -1597,78 +1824,35 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             dst.write_bytes(raw)
             applied.append(f"{arc}（{n} 条）" if n >= 0 else f"{arc}")
         preset_applied = []
-        preset_failed = []
         try:
             from nekro_agent.models.db_preset import DBPreset
 
-            # 从 bundle 元信息里取预设名（导出时写过），找不到就用回退名。
-            # 目的：新建的 preset 记录 name/title 不该是「导入人设 N」这种占位。
-            bundle_presets: Dict[int, str] = {}
-            if "persona.bundle.json" in names:
-                try:
-                    _meta = json.loads(zf.read("persona.bundle.json").decode("utf-8"))
-                    for item in (_meta.get("presets") or []):
-                        try:
-                            bundle_presets[int(item.get("id"))] = str(item.get("name") or "")
-                        except (TypeError, ValueError):
-                            continue
-                except Exception:  # noqa: BLE001
-                    bundle_presets = {}
-
             for n_ in sorted(x for x in names if x.startswith('presets/') and x.endswith('.md')):
-                try:
-                    pid = int(n_.split('/')[-1].split('.')[0])
-                except (ValueError, IndexError):
+                pid = int(n_.split('/')[-1].split('.')[0])
+                ptext = zf.read(n_).decode('utf-8')
+                if not ptext.strip():
                     continue
-                try:
-                    ptext = zf.read(n_).decode('utf-8')
-                    if not ptext.strip():
-                        continue
-                    content_db = ptext.replace('\\n', '\\\\n')
-                    row = await DBPreset.get_or_none(id=pid)
-                    if row:
-                        row.content = content_db
-                        await row.save(update_fields=['content'])
-                    else:
-                        # ⚠️ DBPreset 除 content 外还有多个 NOT NULL 列
-                        #    （name/title/avatar/description/tags/author），
-                        #    只传 id+name+content 会抛「title: Value must not be None」，
-                        #    导致整个导入 500 —— 而 backgrounds 其实已经写入了。
-                        #    这里补齐全部必填字段，缺省用空串/回退名。
-                        pname = (bundle_presets.get(pid) or "").strip() or f'导入人设 {pid}'
-                        await DBPreset.create(
-                            id=pid,
-                            name=pname,
-                            title=pname,
-                            avatar="",
-                            content=content_db,
-                            description="",
-                            tags="",
-                            author="persona-import",
-                            on_shared=False,
-                        )
-                    preset_applied.append(pid)
-                except Exception as exc:  # noqa: BLE001
-                    # 单条预设失败不牵连其它预设，也不让整体 500
-                    plugin.logger.warning(f"[persona] 预设 {n_} 导入失败：{exc}")
-                    preset_failed.append(f"{n_}: {exc}")
+                content_db = ptext.replace('\\n', '\\\\n')
+                row = await DBPreset.get_or_none(id=pid)
+                if row:
+                    row.content = content_db
+                    await row.save(update_fields=['content'])
+                else:
+                    await DBPreset.create(id=pid, name=f'导入人设 {pid}', content=content_db)
+                preset_applied.append(pid)
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001
-            # 预设导入失败**不再**让整个导入返回 500：backgrounds 已经落盘，
-            # 报整体失败会让用户误以为什么都没导入、进而重复导入。
-            # 改为逐条记录失败原因，随响应返回，由前端提示。
-            plugin.logger.warning(f"[persona] 预设文本导入部分失败：{exc}")
-            preset_failed.append(str(exc))
+            raise HTTPException(status_code=500, detail=f"人设文本导入失败：{exc}")
 
         reload_state = await _reload_after_write()
         plugin.logger.info(
-            f"[persona] WebUI 导入整套人设: {list(parsed)} "
-            f"preset={preset_applied} preset_failed={len(preset_failed)}",
+            f"[persona] WebUI 导入整套人设: {list(parsed)} preset={preset_applied}",
         )
         return {
             "ok": True,
             "applied": applied,
             "preset_applied": preset_applied,
-            "preset_failed": preset_failed,
             "backup_dir": str(bdir),
             **reload_state,
         }
