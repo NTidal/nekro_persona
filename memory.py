@@ -19,16 +19,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import shutil
 import time
 from array import array as _float_array
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from nekro_agent.core.logger import get_sub_logger
 
@@ -57,11 +59,232 @@ TIER3_ENABLED = True         # 3 档总开关（配置可覆盖）
 _PKG_BG_DIR = Path(__file__).parent / "backgrounds"
 """包内自带的背景记忆（首次运行时作为种子复制到插件数据目录）。"""
 
-_BG_DIR = _PKG_BG_DIR
-_TIER1_DIR = _BG_DIR / "tier1"
-_TIER2_DIR = _BG_DIR / "tier2"
-_TIER3_DIR = _BG_DIR / "tier3"
-_FAVOR_FILE = _BG_DIR / "favor.json"
+# ---------------- 数据目录：按访问解析（多账号隔离）----------------
+# 目录**不能在导入期固定**：NA 的 plugin.get_plugin_data_dir() 是活视图，
+# 有账号上下文（消息处理 / 账号化挂载的插件 WebUI）时返回该账号的
+# `<数据目录>/accounts/{account}/`，无上下文时返回共享目录。
+# 因此这里只注册一个「根目录提供者」，每次访问都重新解析。
+_bg_dir_provider: Optional[Callable[[], Path]] = None
+"""背景数据根目录提供者；未注册时回退包内 `_PKG_BG_DIR`（与改造前一致）。"""
+
+_prepared_dirs: set = set()
+"""已完成「建目录 + 播种」解析的目录（避免每次访问都 stat）。"""
+
+# ---- 目录解析失败后的降级（v2.0.2 加固，行为变更）----
+# 旧实现把失败目录塞进 `_failed_dirs` 集合后**本进程内再也不重试**：挂载迟到 /
+# 权限瞬时异常 / 磁盘瞬时满，都会让该账号永久回退包内演示数据，且只在第一次打
+# 一条 exception 日志（静默降级）。现在改为：
+#   · 失败只封存 `_BG_DIR_RETRY_TTL` 秒（避免对挂死的挂载点高频重试）；冷却结束
+#     后的下一次访问**重新尝试**解析——绝不把路径永久钉死；
+#   · 降级期间按 `_BG_DIR_WARN_INTERVAL` 去抖打 **warning** 日志，日志里能看出
+#     「某目录不可用、正在使用包内数据」；首次失败带一次 traceback 便于定位；
+#   · 恢复可用时再打一条 warning，便于对着日志确认自愈；
+#   · `bg_dir_status()` 把降级状态暴露给 WebUI 概览（概览页有告警条）。
+# 无论哪条路径都**只返回路径、绝不抛异常**（安全第一：不能打断消息处理）。
+_BG_DIR_RETRY_TTL = 5.0
+"""解析失败后允许重试的冷却秒数（>0：避免对挂死的挂载点高频重试）。"""
+
+_BG_DIR_WARN_INTERVAL = 60.0
+"""同一目录「冷却期内」重复降级的日志去抖间隔（秒）。"""
+
+_failed_dirs: Dict[Path, Dict[str, Any]] = {}
+"""解析失败的目录 → {"last_try": ts, "fails": n, "last_warn": ts, "reason": str}。
+
+条目在**重试成功后立即删除**；冷却结束后的下一次访问会重新尝试解析。
+"""
+
+
+def configure_bg_dir_provider(provider: Optional[Callable[[], Path]]) -> None:
+    """注册「背景数据根目录」提供者。
+
+    提供者在**每次访问**时被调用，因此能跟随调用方的账号上下文解析到不同目录。
+    传入 None 可注销并回退到包内目录。多账号下各目录的状态互相独立，
+    注册/切换提供者**不会**清空其它目录已加载的缓存。
+    """
+    global _bg_dir_provider
+    _bg_dir_provider = provider
+
+
+def _seed_pkg_files(target: Path) -> List[str]:
+    """把包内种子文件复制进 `target`。
+
+    ⚠️ 调用方**必须**只在「`target` 原本不存在」时调用它（见 `_resolve_bg_dir`）。
+    2.0.2 起本函数的语义明确为「**目录不存在才播种**」，与 2.0.1 的
+    `configure_bg_dir` 一致：
+
+    - 目标目录**不存在** → 复制 4 个种子文件（全新安装的起点）
+    - 目标目录**已存在**（哪怕是空的，或只有用户自己的文件）→ 一律不播种，
+      尊重用户「清空 / 删掉某一份」的意图：**绝不把用户故意删掉的
+      favor.json 之类重新变出来**
+
+    为什么这在**两种 NA 镜像上都对**：
+
+    - **原版镜像**：`plugin.get_plugin_data_dir()` 恒返回同一个共享数据目录，
+      它下面的 `backgrounds/` 是唯一的数据目录。用户**删空**它之后目录仍然
+      **存在** → 按本语义不播种 → 演示人设不会复活。
+    - **多账号改造镜像**：框架 `services/plugin/base.py::_seed_account_data_dir()`
+      在账号目录**首次使用时**就把共享目录整份复制成起点（`copytree`，含
+      `backgrounds/`）；因此账号目录下的 `backgrounds/` 通常**已经存在**、内容
+      已由框架给全——共享目录里有种子，账号目录里就已经有了，插件不需要也不该
+      再播一次；共享目录是空的，账号目录「存在但为空」，按本语义**不播**，
+      同样尊重「用户清空」的意图。插件不额外插一手，也就不会和框架打架。
+
+    （唯一的兜底例外：目录恰好就是包内目录本身时直接返回，不做自我复制。）
+    """
+    if not _PKG_BG_DIR.is_dir():
+        return []
+    try:
+        if _PKG_BG_DIR.resolve() == target.resolve():
+            return []   # 兜底：目录恰好就是包内目录时不需要自我复制
+    except OSError:
+        pass
+    copied: List[str] = []
+    for rel in _BG_FILES:
+        src = _PKG_BG_DIR / rel
+        if src.is_file():
+            dst = target / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied.append(rel)
+    return copied
+
+
+def _warn_bg_degraded(target: Path, rec: Dict[str, Any], now: float,
+                      attempt_failed: bool = False,
+                      exc: Optional[BaseException] = None) -> None:
+    """目录不可用的降级告警（warning 级、按目录去抖）。
+
+    要求：**不再静默**——日志里必须能看出「某账号目录不可用、正在用包内数据」。
+    但降级可能持续很久、消息处理又是热路径，故：
+      · `attempt_failed=True`（真的又试了一次并失败）→ 每次都打（频率被
+        `_BG_DIR_RETRY_TTL` 天然限制在 ≤1 次 / 5s）；
+      · `attempt_failed=False`（冷却期内直接回退）→ 按 `_BG_DIR_WARN_INTERVAL` 去抖。
+    失败链条的**第一次**额外带 traceback（`exc_info`），之后只带原因文本，
+    避免常态降级把日志刷满。
+    """
+    if not attempt_failed:
+        last_warn = float(rec.get("last_warn", 0.0) or 0.0)
+        if now - last_warn < _BG_DIR_WARN_INTERVAL:
+            return
+    rec["last_warn"] = now
+    fails = int(rec.get("fails", 0) or 0)
+    reason = str(rec.get("reason", "") or "")
+    detail = f"（原因：{reason}）" if reason else ""
+    wait = "" if attempt_failed else f"，{_BG_DIR_RETRY_TTL:.0f}s 后重试"
+    logger.warning(
+        f"[persona] 背景数据目录不可用，正在使用包内演示数据：{target}{detail}"
+        f"（累计失败 {fails} 次{wait}）",
+        exc_info=bool(exc) and fails <= 1,
+    )
+
+
+def _resolve_bg_dir() -> Path:
+    """按当前上下文解析背景数据根目录，并确保可用、必要时播种。
+
+    绝不抛异常：取路径 / 建目录失败一律**降级**为包内目录（安全第一：
+    不能打断消息处理），但降级是**可重试**的（见 `_BG_DIR_RETRY_TTL`），
+    不是永久钉死。
+
+    v2.0.2 行为变更：只在目标目录**原本不存在**时播种（见 `_seed_pkg_files`）。
+    """
+    provider = _bg_dir_provider
+    if provider is None:
+        return _PKG_BG_DIR
+    try:
+        target = Path(provider())
+    except Exception:  # noqa: BLE001
+        logger.warning("[persona] 背景数据目录提供者解析失败，本次使用包内数据目录",
+                       exc_info=True)
+        return _PKG_BG_DIR
+    if target in _prepared_dirs:
+        return target
+    rec = _failed_dirs.get(target)
+    if rec is not None:
+        now = time.time()
+        if now - float(rec.get("last_try", 0.0) or 0.0) < _BG_DIR_RETRY_TTL:
+            _warn_bg_degraded(target, rec, now)
+            return _PKG_BG_DIR
+    try:
+        existed = target.is_dir()
+        target.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            # v2.0.2：**只在目录原本不存在时**播种（见 _seed_pkg_files 的说明）。
+            # 目录存在但为空 / 只有用户文件时**不播**，尊重用户「删空」的意图。
+            copied = _seed_pkg_files(target)
+            if copied:
+                logger.info(
+                    f"[persona] 全新背景数据目录，已播种包内种子：{target} "
+                    f"← {', '.join(copied)}",
+                )
+    except Exception as exc:  # noqa: BLE001
+        now = time.time()
+        rec = _failed_dirs.get(target) or {"last_try": 0.0, "fails": 0, "last_warn": 0.0}
+        rec["fails"] = int(rec.get("fails", 0) or 0) + 1
+        rec["last_try"] = now
+        rec["reason"] = f"{type(exc).__name__}: {exc}"
+        _failed_dirs[target] = rec
+        _warn_bg_degraded(target, rec, now, attempt_failed=True, exc=exc)
+        return _PKG_BG_DIR
+    if target in _failed_dirs:
+        rec = _failed_dirs.pop(target)
+        logger.warning(
+            f"[persona] 背景数据目录已恢复可用"
+            f"（此前失败 {int(rec.get('fails', 0) or 0)} 次）：{target}",
+        )
+    _prepared_dirs.add(target)
+    return target
+
+
+def bg_dir_status() -> Dict[str, Any]:
+    """背景数据目录的解析状态快照（供 WebUI 概览暴露「正在用包内数据」的降级）。
+
+    它**不写任何数据**；唯一的副作用与其它任何一次访问完全一样：`_resolve_bg_dir()`
+    在目录缺失时会建目录 + 播种（这是解析本身的正常语义），不会修改已有内容。
+    """
+    now = time.time()
+    degraded: List[Dict[str, Any]] = []
+    for path, rec in list(_failed_dirs.items()):
+        last_try = float(rec.get("last_try", 0.0) or 0.0)
+        degraded.append({
+            "dir": str(path),
+            "fails": int(rec.get("fails", 0) or 0),
+            "lastTry": last_try,
+            "reason": str(rec.get("reason", "") or ""),
+            "retryIn": max(0.0, _BG_DIR_RETRY_TTL - (now - last_try)),
+        })
+    degraded.sort(key=lambda d: -int(d["fails"]))
+    cur = _resolve_bg_dir()
+    return {
+        "dir": str(cur),
+        "packageDir": str(_PKG_BG_DIR),
+        "usingPackageDir": str(cur) == str(_PKG_BG_DIR),
+        "providerRegistered": _bg_dir_provider is not None,
+        "degraded": bool(degraded),
+        "degradedDirs": degraded,
+        "preparedDirs": len(_prepared_dirs),
+        "retryTtl": _BG_DIR_RETRY_TTL,
+    }
+
+
+def _bg_dir() -> Path:
+    """当前背景记忆数据目录（每次调用都按上下文重新解析）。"""
+    return _resolve_bg_dir()
+
+
+def _tier1_dir() -> Path:
+    return _resolve_bg_dir() / "tier1"
+
+
+def _tier2_dir() -> Path:
+    return _resolve_bg_dir() / "tier2"
+
+
+def _tier3_dir() -> Path:
+    return _resolve_bg_dir() / "tier3"
+
+
+def _favor_file() -> Path:
+    return _resolve_bg_dir() / "favor.json"
 
 # 数据文件清单：种子复制与判存都以这几项为准（不带 .bak/缓存/临时快照）
 _BG_FILES = ("favor.json", "tier1/core.json", "tier2/lore.json", "tier3/world.json")
@@ -79,70 +302,196 @@ _HIT_STATS_VERSION = 1
 
 
 def bg_dir() -> Path:
-    """当前背景记忆数据目录。"""
-    return _BG_DIR
+    """当前背景记忆数据目录（按访问时的账号上下文解析）。"""
+    return _resolve_bg_dir()
 
 
 def configure_bg_dir(data_dir) -> Path:
-    """把背景记忆数据目录切到插件数据目录；首次运行从包内种子复制。
+    """（向后兼容）把背景记忆数据目录**固定**到给定路径。
 
-    为什么不再放包内：包目录在升级/重装时会被整体替换，用户改过的记忆会被覆盖，
-    WebUI 写入产生的 .bak、手工快照也会被打进发布包。数据改放插件数据目录后，
-    包内那份只作首次运行的种子。
-
-    只复制 _BG_FILES 里的数据文件；目录不可用时回退包内目录，保证仍可运行。
+    内部转成「提供者」注册，新代码请优先用 `configure_bg_dir_provider()`——
+    固定路径只能服务一个目录，多账号下必须按访问解析。
+    目录不可用时回退包内目录，保证仍可运行。返回实际生效的目录。
     """
-    global _BG_DIR, _TIER1_DIR, _TIER2_DIR, _TIER3_DIR, _FAVOR_FILE
     target = Path(data_dir)
-    try:
-        if not target.exists() and _PKG_BG_DIR.is_dir():
-            for rel in _BG_FILES:
-                src = _PKG_BG_DIR / rel
-                if src.is_file():
-                    dst = target / rel
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
-            logger.info(f"背景记忆数据目录首次初始化（自包内种子复制）：{target}")
-        target.mkdir(parents=True, exist_ok=True)
-    except Exception:  # noqa: BLE001
-        logger.exception(f"背景记忆数据目录不可用，回退包内目录：{target}")
-        target = _PKG_BG_DIR
-    _BG_DIR = target
-    _TIER1_DIR = target / "tier1"
-    _TIER2_DIR = target / "tier2"
-    _TIER3_DIR = target / "tier3"
-    _FAVOR_FILE = target / "favor.json"
-    # 目录变了：作废已加载缓存，下次按新目录 mtime 重新读取
-    _state["loaded"] = False
-    _state["mtime_key"] = None
+    configure_bg_dir_provider(lambda _t=target: _t)
+    resolved = _resolve_bg_dir()
+    # 目录变了：只作废**本目录**已加载的缓存（其它账号目录的缓存互不影响）
+    st = _state()
+    st["loaded"] = False
+    st["mtime_key"] = None
     # 查询侧嵌入缓存也一并清空（内存卫生；正确性本已由 key 含签名保证）
     _query_cache_clear()
-    return target
+    return resolved
 
-_state: Dict[str, Any] = {
-    "loaded": False,
-    "mtime_key": None,
-    "tier1": [],
-    "tier2": [],
-    "tier2_vecs": [],
-    "tier3": [],
-    "tier3_vecs": [],
-    "last_hit": "",
-    "last_hit_tier3": "",
-    # A4 访问强化：命中计数（内存态，去抖落盘到 .hit_stats.json）
-    "hit_stats": {},
-    "hit_dirty": False,
-    "hit_last_save": 0.0,
-    # 查询侧嵌入缓存（v1.6.2）：key=签名+文本哈希 → (存入时刻, 向量)。
-    # 只缓存 query 向量，短 TTL + LRU，纯内存不落盘（磁盘缓存只服务条目侧）。
-    "query_cache": {},
-    # 嵌入后端健康（v1.6.3）：custom 端点连续失败时置降级标志，供 /api/overview 暴露、
-    # 概览页告警「检索已降级为纯关键词」。绝不混空间回落 NA（见 _embed_mark_*）。
-    "embed_degraded": False,
-    "embed_degraded_reason": "",
-    "embed_fail_streak": 0,
-    "embed_last_warn": 0.0,
-}
+def _new_state(dir_key: Path) -> Dict[str, Any]:
+    """某个数据目录的运行时状态默认结构。"""
+    return {
+        # 归属目录：命中统计/向量缓存落盘时用它，避免写到「当前上下文」的目录
+        "dir": dir_key,
+        "loaded": False,
+        "mtime_key": None,
+        "tier1": [],
+        "tier2": [],
+        "tier2_vecs": [],
+        "tier3": [],
+        "tier3_vecs": [],
+        "last_hit": "",
+        "last_hit_tier3": "",
+        # A4 访问强化：命中计数（内存态，去抖落盘到 .hit_stats.json）
+        "hit_stats": {},
+        "hit_dirty": False,
+        "hit_last_save": 0.0,
+        # 查询侧嵌入缓存（v1.6.2）：key=签名+文本哈希 → (存入时刻, 向量)。
+        # 只缓存 query 向量，短 TTL + LRU，纯内存不落盘（磁盘缓存只服务条目侧）。
+        "query_cache": {},
+        # 嵌入后端健康（v1.6.3）：custom 端点连续失败时置降级标志，供 /api/overview 暴露、
+        # 概览页告警「检索已降级为纯关键词」。绝不混空间回落 NA（见 _embed_mark_*）。
+        "embed_degraded": False,
+        "embed_degraded_reason": "",
+        "embed_fail_streak": 0,
+        "embed_last_warn": 0.0,
+    }
+
+
+# ---------------- 运行时状态：**按解析出的目录分键** ----------------
+# 多账号下，框架把共享目录内容复制成账号目录起点时会保留文件 mtime，
+# 于是两个账号目录的 (文件名, mtime) 完全一致——只靠 `mtime_key` 判断
+# 「没变化」会直接复用上一个账号已加载的内容，把 A 的人设读给 B。
+# 因此状态必须按目录分键；切换/注册提供者绝不清空其它目录的缓存。
+#
+# v2.0.2 加固（行为变更）：状态改为**有界 LRU**。每个目录常驻约 20MB
+# （2/3 档向量各 300+ 条 × 2048 维），而旧实现只增不减——常驻内存随
+# 「被访问过的账号数」单调上涨且永不回落。现在最多保留 `_state_max_dirs`
+# 个「最近使用」目录的状态，被淘汰的目录下次访问由 `ensure_loaded()`
+# 重新加载（条目向量有磁盘缓存 `.vec_cache.json`，重载不需要重新嵌入）。
+# 淘汰前必须：① 确认该目录状态**没有正在进行的并发使用**（`_pin_state`
+# 计数，见下）；② 把 `hit_dirty` 的命中统计先落盘，避免丢最后几次强化。
+_states: Dict[Path, Dict[str, Any]] = {}
+
+_state_last_used: Dict[Path, float] = {}
+"""目录 → 最近一次被 `_state()` 取用的时刻（LRU 依据）。"""
+
+_state_pinned: Dict[Path, int] = {}
+"""目录 → 正在使用该状态的嵌套计数；>0 时**禁止淘汰**（正确性关键）。"""
+
+_STATE_MAX_DIRS_DEFAULT = 8
+"""默认最多保留的目录状态数（0 = 不限制）。
+
+8 足以覆盖现实里的账号规模（每个约 20MB，最坏常驻约 160MB）；被淘汰的目录
+下次访问会自动重载，故收紧它只影响内存占用、不影响正确性。
+"""
+
+_state_max_dirs: int = _STATE_MAX_DIRS_DEFAULT
+"""当前上限（`configure_state_cache()` 可覆盖）。"""
+
+
+def configure_state_cache(max_dirs: Optional[int] = None) -> int:
+    """设置目录状态缓存上限（0/负数 = 不限制），返回生效值。
+
+    取值优先级：入参 > 环境变量 `NEKRO_PERSONA_STATE_MAX_DIRS` > 默认值。
+    用环境变量是为了**不动插件 config.yaml**（旧配置零迁移即可调）。
+    收紧后立即淘汰最久未用、且**未被并发使用**的目录状态。
+    """
+    global _state_max_dirs
+    raw: Any = max_dirs
+    if raw is None:
+        raw = os.environ.get("NEKRO_PERSONA_STATE_MAX_DIRS")
+    if raw is None or str(raw).strip() == "":
+        raw = _STATE_MAX_DIRS_DEFAULT
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        val = _STATE_MAX_DIRS_DEFAULT
+    _state_max_dirs = max(0, val)
+    _evict_states()
+    return _state_max_dirs
+
+
+def state_cache_stats() -> Dict[str, Any]:
+    """状态缓存的只读快照（供 WebUI 概览 / 排障看常驻目录数）。"""
+    return {
+        "dirs": len(_states),
+        "max_dirs": int(_state_max_dirs),
+        "pinned": {str(k): int(v) for k, v in _state_pinned.items()},
+        "last_used": {str(k): float(v) for k, v in _state_last_used.items()},
+    }
+
+
+def _evict_states() -> List[Path]:
+    """把目录状态缓存裁到上限：淘汰最久未用且**未被并发使用**的目录。
+
+    安全约束（正确性关键）：
+    - `_state_pinned[key] > 0` 的目录**绝不淘汰**：跨 await 的渲染/加载期间
+      把它摘掉，后续 `_state()` 会新建一个**空**状态，2/3 档会静默丢失；
+    - 淘汰前若 `hit_dirty`，先按 `st["dir"]` 落盘命中统计（不丢数据）；
+    - 只影响**内存缓存**：磁盘上的背景文件 / 向量缓存 / 命中统计都不动，
+      下次访问由 `ensure_loaded()` 重新加载。
+    """
+    evicted: List[Path] = []
+    maxn = int(_state_max_dirs)
+    if maxn <= 0 or len(_states) <= maxn:
+        return evicted
+    for key in sorted(_states.keys(), key=lambda k: _state_last_used.get(k, 0.0)):
+        if len(_states) <= maxn:
+            break
+        if _state_pinned.get(key):
+            continue   # 正在被使用：本轮不淘汰它（可换成更新时刻更早的候选之外再来）
+        st = _states.pop(key)
+        _state_last_used.pop(key, None)
+        try:
+            if st.get("hit_dirty"):
+                _save_hit_stats(st)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[persona] 淘汰前落盘命中统计失败（忽略）: {exc}")
+        evicted.append(key)
+        logger.info(f"[persona] 目录状态缓存淘汰（LRU 上限 {maxn}）：{key}")
+    return evicted
+
+
+@contextlib.contextmanager
+def _pin_state():
+    """把**当前上下文解析到的**目录状态钉住，直到退出（禁止 LRU 淘汰它）。
+
+    `ensure_loaded` / `render_memory_block` 会跨多个 await 使用同一份状态，
+    期间绝不能被淘汰（见 `_evict_states` 的说明）。可嵌套使用。
+
+    钉住的 key 取 `st["dir"]`（状态自己的归属目录），不是重新解析一次的结果——
+    这样「钉哪个目录」与「淘汰哪个目录」用的是**同一个 key**，不依赖二次解析一致。
+    """
+    st = _state()
+    key = st.get("dir")
+    if key is None:   # 理论上不会发生（_new_state 一定填 dir）；保守起见仍要能工作
+        yield st
+        return
+    _state_pinned[key] = _state_pinned.get(key, 0) + 1
+    try:
+        yield st
+    finally:
+        left = _state_pinned.get(key, 1) - 1
+        if left > 0:
+            _state_pinned[key] = left
+        else:
+            _state_pinned.pop(key, None)
+
+
+def _state() -> Dict[str, Any]:
+    """当前背景目录对应的运行时状态（不存在则按默认结构创建）。
+
+    v2.0.2：新建状态后按 LRU 上限淘汰最久未用的目录（被钉住的不淘汰）。
+    """
+    key = _resolve_bg_dir()
+    st = _states.get(key)
+    if st is None:
+        st = _new_state(key)
+        _states[key] = st
+        # ⚠️ 必须先登记「最近使用时刻」再淘汰：否则新状态没有 last_used 记录，
+        # 排序时被当成 0.0（最旧），可能刚建出来就被自己淘汰掉。
+        _state_last_used[key] = time.time()
+        _evict_states()
+    _state_last_used[key] = time.time()
+    return st
+
 
 # ---- 查询侧嵌入缓存参数（v1.6.2）----
 # 为什么需要：条目侧向量有磁盘缓存，但每轮对话的 query 向量旧实现现算现扔，
@@ -193,17 +542,23 @@ def tier3_settings(override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
 # ---------------- 加载 ----------------
 def _mtime_key() -> Tuple:
+    """当前解析出的目录的内容指纹：**只对本目录有意义**。
+
+    ⚠️ 两个账号目录的起点是「复制共享目录」而来，文件名与 mtime 完全相同，
+    所以这个指纹**不能**跨目录复用——状态必须按目录分键（见 `_state()`）。
+    """
     keys: List[Tuple[str, float]] = []
-    for d in (_TIER1_DIR, _TIER2_DIR, _TIER3_DIR):
+    for d in (_tier1_dir(), _tier2_dir(), _tier3_dir()):
         if d.is_dir():
             for fp in sorted(d.glob("*.json")):
                 try:
                     keys.append((fp.name, fp.stat().st_mtime))
                 except OSError:
                     continue
-    if _FAVOR_FILE.is_file():
+    favor = _favor_file()
+    if favor.is_file():
         try:
-            keys.append((_FAVOR_FILE.name, _FAVOR_FILE.stat().st_mtime))
+            keys.append((favor.name, favor.stat().st_mtime))
         except OSError:
             pass
     return tuple(keys)
@@ -232,10 +587,11 @@ def _read_dir(d: Path) -> List[Dict[str, Any]]:
 
 
 def load_favor_cfg() -> Dict[str, Any]:
-    if not _FAVOR_FILE.is_file():
+    favor = _favor_file()
+    if not favor.is_file():
         return {}
     try:
-        data = json.loads(_FAVOR_FILE.read_text(encoding="utf-8"))
+        data = json.loads(favor.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001
         logger.error(f"[persona] favor.json 解析失败，已阻止加载: {exc}")
         raise ValueError("favor.json 损坏，已阻止加载") from exc
@@ -292,9 +648,9 @@ def _embed_is_custom(cfg: Optional[Dict[str, Any]] = None) -> bool:
     return bool(str(c.get("base_url", "")).strip() and str(c.get("model", "")).strip())
 
 
-def _vec_cache_path() -> Path:
-    """向量缓存文件（数据目录下）。"""
-    return _BG_DIR / _VEC_CACHE_NAME
+def _vec_cache_path(dir_key: Optional[Path] = None) -> Path:
+    """向量缓存文件（数据目录下，默认取当前上下文解析出的目录）。"""
+    return (dir_key or _resolve_bg_dir()) / _VEC_CACHE_NAME
 
 
 def _embed_signature() -> str:
@@ -350,9 +706,14 @@ def _unpack_vec(raw: Any) -> Optional[List[float]]:
         return None
 
 
-def _load_vec_cache() -> Dict[str, str]:
-    """读缓存；任何异常都当作空缓存（缓存坏了不该挡住加载）。"""
-    fp = _vec_cache_path()
+def _load_vec_cache(dir_key: Path) -> Dict[str, str]:
+    """读 `dir_key` 目录的向量缓存；任何异常都当作空缓存（缓存坏了不该挡住加载）。
+
+    v2.0.2：目录**显式传入**（与 `_save_hit_stats(st)` 同款）——绝不在这条
+    读/写盘路径上依赖「当前上下文」重新解析，否则异步流程里可能落到别的
+    账号目录上（设计一致性 + 消除多账号隐患）。
+    """
+    fp = _vec_cache_path(dir_key)
     if not fp.is_file():
         return {}
     try:
@@ -369,9 +730,9 @@ def _load_vec_cache() -> Dict[str, str]:
         return {}
 
 
-def _save_vec_cache(vecs: Dict[str, str]) -> None:
-    """写缓存；失败只记日志。"""
-    fp = _vec_cache_path()
+def _save_vec_cache(vecs: Dict[str, str], dir_key: Path) -> None:
+    """写 `dir_key` 目录的向量缓存；失败只记日志。目录显式传入（理由见上）。"""
+    fp = _vec_cache_path(dir_key)
     try:
         payload = {
             "version": _VEC_CACHE_VERSION,
@@ -387,17 +748,18 @@ def _save_vec_cache(vecs: Dict[str, str]) -> None:
 
 
 # ---------------- A4 访问强化：命中统计 sidecar ----------------
-def _hit_stats_path() -> Path:
-    return _BG_DIR / _HIT_STATS_NAME
+def _hit_stats_path(dir_key: Optional[Path] = None) -> Path:
+    """命中统计 sidecar 路径（默认取当前上下文解析出的目录）。"""
+    return (dir_key or _resolve_bg_dir()) / _HIT_STATS_NAME
 
 
 def _hit_key(tier: int, entry_id: str) -> str:
     return f"t{int(tier)}:{entry_id}"
 
 
-def _load_hit_stats() -> Dict[str, Dict[str, Any]]:
+def _load_hit_stats(dir_key: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
     """读命中统计；任何异常按空处理（坏了不该挡住加载，与 vec_cache 同款容错）。"""
-    fp = _hit_stats_path()
+    fp = _hit_stats_path(dir_key)
     if not fp.is_file():
         return {}
     try:
@@ -411,19 +773,25 @@ def _load_hit_stats() -> Dict[str, Dict[str, Any]]:
         return {}
 
 
-def _save_hit_stats() -> None:
-    """原子写命中统计；失败只记日志，绝不影响渲染。"""
-    fp = _hit_stats_path()
+def _save_hit_stats(st: Optional[Dict[str, Any]] = None) -> None:
+    """原子写命中统计；失败只记日志，绝不影响渲染。
+
+    st 明确传入某个目录的状态（cleanup 时要逐个目录落盘），缺省用当前上下文。
+    落盘路径取 `st["dir"]`，绝不按「当前上下文」重解析——否则异步落盘会把
+    账号 A 的统计写进账号 B 的目录。
+    """
+    st = _state() if st is None else st
+    fp = _hit_stats_path(st.get("dir"))
     try:
         payload = {
             "version": _HIT_STATS_VERSION,
-            "count": len(_state["hit_stats"]),
-            "stats": _state["hit_stats"],
+            "count": len(st["hit_stats"]),
+            "stats": st["hit_stats"],
         }
         tmp = fp.with_suffix(fp.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         tmp.replace(fp)
-        _state["hit_dirty"] = False
+        st["hit_dirty"] = False
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[persona] 命中统计写入失败（不影响本次运行）: {exc}")
 
@@ -432,7 +800,8 @@ def _bump_hits(entries: List[Dict[str, Any]], tier: int, now: float,
                min_interval: float = 30.0) -> None:
     """命中即强化：内存计数 +1、刷新 last；去抖落盘。fire-and-forget，绝不抛。"""
     try:
-        stats = _state["hit_stats"]
+        st = _state()
+        stats = st["hit_stats"]
         for e in entries:
             eid = str(e.get("id", "")).strip()
             if not eid:
@@ -444,23 +813,28 @@ def _bump_hits(entries: List[Dict[str, Any]], tier: int, now: float,
                 stats[k] = s
             s["hits"] = int(s.get("hits", 0)) + 1
             s["last"] = int(now)
-        _state["hit_dirty"] = True
-        if now - float(_state.get("hit_last_save", 0.0)) >= min_interval:
-            _save_hit_stats()
-            _state["hit_last_save"] = float(now)
+        st["hit_dirty"] = True
+        if now - float(st.get("hit_last_save", 0.0)) >= min_interval:
+            _save_hit_stats(st)
+            st["hit_last_save"] = float(now)
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"[persona] 命中强化失败（忽略）: {exc}")
 
 
-def _prune_hit_stats() -> None:
-    """裁掉已不存在条目的孤儿统计（内容删除后避免 sidecar 无限膨胀）。"""
+def _prune_hit_stats(st: Optional[Dict[str, Any]] = None) -> None:
+    """裁掉已不存在条目的孤儿统计（内容删除后避免 sidecar 无限膨胀）。
+
+    `st` 明确传入某个目录的状态，缺省才用当前上下文——与 `_save_hit_stats(st)`
+    同款，避免多账号异步流程里裁到别的账号。
+    """
+    st = _state() if st is None else st
     valid = set()
-    for tier, items in ((2, _state["tier2"]), (3, _state["tier3"])):
+    for tier, items in ((2, st["tier2"]), (3, st["tier3"])):
         for e in items:
             eid = str(e.get("id", "")).strip()
             if eid:
                 valid.add(_hit_key(tier, eid))
-    stats = _state["hit_stats"]
+    stats = st["hit_stats"]
     for k in list(stats.keys()):
         if k not in valid:
             stats.pop(k, None)
@@ -468,13 +842,18 @@ def _prune_hit_stats() -> None:
 
 def hit_stats_snapshot() -> Dict[str, Dict[str, Any]]:
     """只读快照，供 WebUI 概览/召回测试台展示冷热。"""
-    return {k: dict(v) for k, v in _state["hit_stats"].items()}
+    return {k: dict(v) for k, v in _state()["hit_stats"].items()}
 
 
 def flush_hit_stats() -> None:
-    """把去抖残留的命中统计立即落盘（插件 cleanup 时调用，避免丢最后几次强化）。"""
-    if _state.get("hit_dirty"):
-        _save_hit_stats()
+    """把去抖残留的命中统计立即落盘（插件 cleanup 时调用，避免丢最后几次强化）。
+
+    逐个目录落盘：每个账号目录各有一份 sidecar 与独立状态，
+    只写「当前上下文那一份」会在多账号下丢掉其它账号的最后几次强化。
+    """
+    for st in list(_states.values()):
+        if st.get("hit_dirty"):
+            _save_hit_stats(st)
 
 
 # ---------------- A2/A3 生命周期：热度调制排序 ----------------
@@ -537,7 +916,7 @@ def effective_rank(entry: Dict[str, Any], tier: int, now: float, lc: Dict[str, A
     w = float(entry.get("weight", 1) or 1)
     if not lc.get("enabled") or w >= float(lc["protect_weight"]):
         return w
-    stat = _state["hit_stats"].get(_hit_key(tier, str(entry.get("id", ""))))
+    stat = _state()["hit_stats"].get(_hit_key(tier, str(entry.get("id", ""))))
     return w * heat_factor(stat, now, lc)
 
 
@@ -618,25 +997,25 @@ _EMBED_WARN_INTERVAL = 300.0    # 降级告警去抖：最多每 5 分钟刷一�
 
 def _embed_mark_ok() -> None:
     """custom 嵌入成功：清零失败计数、解除降级标志（从降级恢复时记一条 info）。"""
-    if _state.get("embed_degraded"):
+    if _state().get("embed_degraded"):
         logger.info("[persona] custom 嵌入端点已恢复，2/3 档向量检索重新可用")
-    _state["embed_fail_streak"] = 0
-    _state["embed_degraded"] = False
-    _state["embed_degraded_reason"] = ""
+    _state()["embed_fail_streak"] = 0
+    _state()["embed_degraded"] = False
+    _state()["embed_degraded_reason"] = ""
 
 
 def _embed_mark_fail(reason: str) -> None:
     """custom 嵌入失败：累计连续失败，达阈值置降级标志并去抖告警。"""
-    _state["embed_fail_streak"] = int(_state.get("embed_fail_streak", 0)) + 1
-    if _state["embed_fail_streak"] < _EMBED_FAIL_THRESHOLD:
+    _state()["embed_fail_streak"] = int(_state().get("embed_fail_streak", 0)) + 1
+    if _state()["embed_fail_streak"] < _EMBED_FAIL_THRESHOLD:
         return
-    _state["embed_degraded"] = True
-    _state["embed_degraded_reason"] = reason
+    _state()["embed_degraded"] = True
+    _state()["embed_degraded_reason"] = reason
     now = time.time()
-    if now - float(_state.get("embed_last_warn", 0.0)) >= _EMBED_WARN_INTERVAL:
-        _state["embed_last_warn"] = now
+    if now - float(_state().get("embed_last_warn", 0.0)) >= _EMBED_WARN_INTERVAL:
+        _state()["embed_last_warn"] = now
         logger.warning(
-            f"[persona] custom 嵌入端点连续 {_state['embed_fail_streak']} 次失败（{reason}）："
+            f"[persona] custom 嵌入端点连续 {_state()['embed_fail_streak']} 次失败（{reason}）："
             "2/3 档向量检索已降级为**纯关键词命中**，语义召回暂停。"
             "**不回落 NA 内置嵌入**——条目向量是 custom 空间嵌的，混用会得到无意义相似度。"
             "请检查 EMBED_BASE_URL / EMBED_API_KEY / EMBED_MODEL 与端点可用性。"
@@ -650,9 +1029,9 @@ def embed_health() -> Dict[str, Any]:
     degraded 恒为 False。degraded=True 表示 2/3 档已退化为纯关键词命中。
     """
     return {
-        "degraded": bool(_state.get("embed_degraded")),
-        "reason": str(_state.get("embed_degraded_reason", "") or ""),
-        "fail_streak": int(_state.get("embed_fail_streak", 0) or 0),
+        "degraded": bool(_state().get("embed_degraded")),
+        "reason": str(_state().get("embed_degraded_reason", "") or ""),
+        "fail_streak": int(_state().get("embed_fail_streak", 0) or 0),
     }
 
 
@@ -811,7 +1190,7 @@ def _query_cache_key(text: str, sig: str) -> str:
 
 def _query_cache_get(key: str) -> Optional[List[float]]:
     """取缓存；过期或未命中返回 None。命中则刷新 LRU 顺序（dict 保序，移到末尾）。"""
-    qc: Dict[str, Any] = _state.get("query_cache") or {}
+    qc: Dict[str, Any] = _state().get("query_cache") or {}
     ent = qc.get(key)
     if not ent:
         return None
@@ -826,7 +1205,7 @@ def _query_cache_get(key: str) -> Optional[List[float]]:
 
 def _query_cache_put(key: str, vec: List[float]) -> None:
     """写缓存并执行 LRU 淘汰（超出上限丢最旧）。"""
-    qc: Dict[str, Any] = _state.setdefault("query_cache", {})
+    qc: Dict[str, Any] = _state().setdefault("query_cache", {})
     qc.pop(key, None)
     qc[key] = (time.time(), list(vec))
     while len(qc) > _QUERY_CACHE_MAX:
@@ -836,7 +1215,7 @@ def _query_cache_put(key: str, vec: List[float]) -> None:
 
 def _query_cache_clear() -> None:
     """清空查询缓存（嵌入配置变更 / 测试隔离时调用）。"""
-    _state["query_cache"] = {}
+    _state()["query_cache"] = {}
 
 
 async def _embed_query_uncached(text: str, sig: str) -> Optional[List[float]]:
@@ -885,12 +1264,15 @@ async def _embed_one(text: str) -> Optional[List[float]]:
     return None
 
 
-async def _vectorize(items: List[Dict[str, Any]], label: str,
+async def _vectorize(items: List[Dict[str, Any]], label: str, dir_key: Path,
                      scope: str = "") -> List[Optional[List[float]]]:
     """批量向量化，失败转逐条重试。返回与 items 等长的向量数组。
 
     实测教训：嵌入 API 会突发 429，必须能降级；且降级函数参数（尤其 dimensions）
     必须与查询侧完全一致，否则向量空间不一致 → 阈值失效。
+
+    `dir_key` **必须显式传入**（v2.0.2）：磁盘向量缓存落在该目录下，
+    不再依赖「当前上下文」重新解析（与 `_save_hit_stats(st)` 一致）。
     """
     vecs: List[Optional[List[float]]] = [None] * len(items)
     if not items:
@@ -899,7 +1281,7 @@ async def _vectorize(items: List[Dict[str, Any]], label: str,
 
     # ── 扩展：先查磁盘缓存，只嵌没命中的 ──
     sig = _embed_signature()
-    cache = _load_vec_cache()
+    cache = _load_vec_cache(dir_key)
     keys = [_vec_key(txt, sig, scope) for txt in texts]
     hit = 0
     for i, k in enumerate(keys):
@@ -934,7 +1316,7 @@ async def _vectorize(items: List[Dict[str, Any]], label: str,
             keep = {**cache, **live}
         if len(keep) != len(cache):
             logger.info(f"[persona] {label} 向量缓存：{len(cache)} → {len(keep)} 条（本档 {len(live)}）")
-        _save_vec_cache(keep)
+        _save_vec_cache(keep, dir_key)
 
     failed = [i for i, v in enumerate(vecs) if not v]
     if failed:
@@ -951,34 +1333,52 @@ async def _vectorize(items: List[Dict[str, Any]], label: str,
 
 
 async def ensure_loaded(force: bool = False) -> None:
-    """加载背景数据；文件 mtime 变化时自动重载，条目在此一次性向量化（2/3 档）。"""
+    """加载背景数据；文件 mtime 变化时自动重载，条目在此一次性向量化（2/3 档）。
+
+    ⚠️ 状态按**解析出的目录**分键（见 `_state()`）：账号之间绝不复用缓存。
+    框架把共享目录复制成账号目录起点时会保留 mtime，两个账号目录的
+    (文件名, mtime) 指纹完全相同——只按指纹判断「没变化」会直接把上一个
+    账号已加载的内容给下一个账号（数据串号）。
+
+    v2.0.2：整个加载过程在 `_pin_state()` 里跑——本函数跨 await 使用同一份
+    目录状态，绝不能被 LRU 淘汰（淘汰后 `_state()` 会拿到新建的空状态）。
+    """
+    with _pin_state():
+        await _ensure_loaded_impl(force)
+
+
+async def _ensure_loaded_impl(force: bool = False) -> None:
+    st = _state()
     mk = _mtime_key()
-    if not force and _state["loaded"] and _state["mtime_key"] == mk:
+    if not force and st["loaded"] and st["mtime_key"] == mk:
         return
 
-    t1 = _read_dir(_TIER1_DIR)
+    t1 = _read_dir(_tier1_dir())
     t1.sort(key=lambda x: -int(x.get("weight", 1)))
-    t2 = _read_dir(_TIER2_DIR)
+    t2 = _read_dir(_tier2_dir())
     t2.sort(key=lambda x: -int(x.get("weight", 1)))
-    t3 = _read_dir(_TIER3_DIR)
+    t3 = _read_dir(_tier3_dir())
     t3.sort(key=lambda x: -int(x.get("weight", 1)))
     # 先验证门控配置，避免坏 favor.json 被当成空配置继续运行。
     load_favor_cfg()
 
-    vecs = await _vectorize(t2, "2 档", scope="t2")
-    vecs3 = await _vectorize(t3, "3 档", scope="t3")
+    vecs = await _vectorize(t2, "2 档", dir_key=st["dir"], scope="t2")
+    vecs3 = await _vectorize(t3, "3 档", dir_key=st["dir"], scope="t3")
 
-    _state.update(
+    st.update(
         loaded=True, mtime_key=mk,
         tier1=t1, tier2=t2, tier2_vecs=vecs,
         tier3=t3, tier3_vecs=vecs3,
     )
     # A4：命中统计独立于内容 mtime——首次加载读入，随后裁剪孤儿（内容删除后残留的 key）。
-    if not _state["hit_stats"] and not _state.get("hit_loaded"):
-        _state["hit_stats"] = _load_hit_stats()
-        _state["hit_loaded"] = True
-    _prune_hit_stats()
-    logger.info(f"[persona] 背景已加载: 1 档 {len(t1)} 条, 2 档 {len(t2)} 条, 3 档 {len(t3)} 条")
+    if not st["hit_stats"] and not st.get("hit_loaded"):
+        st["hit_stats"] = _load_hit_stats(st.get("dir"))
+        st["hit_loaded"] = True
+    _prune_hit_stats(st)
+    logger.info(
+        f"[persona] 背景已加载({st.get('dir')}): 1 档 {len(t1)} 条, "
+        f"2 档 {len(t2)} 条, 3 档 {len(t3)} 条",
+    )
 
 
 # ---------------- 门控 ----------------
@@ -1205,10 +1605,14 @@ def _trigger_vocab() -> set:
     刻意排除单字触发词（如「心」「铃」）：系统回执里出现「心」太容易，
     拿它当白名单会把噪声放进来。宁可少纳入，不可误纳入。
     每次现算不缓存（340 条目量级，微秒级），避免 ensure_loaded 重载后变脏。
+
+    注：v2.0.2 起 `_state` 是**函数**（多账号按目录分键），故此处必须 `_state()[lib]`；
+    写成 `_state.get(lib)` 会在 QUERY_INCLUDE_TOOL_FACTS 开启时抛 AttributeError。
     """
+    st = _state()
     vocab = set()
     for lib in ("tier2", "tier3"):
-        for e in _state.get(lib) or []:
+        for e in st.get(lib) or []:
             for k in (e.get("triggers") or []):
                 s = str(k).strip().lower()
                 if len(s) >= 2:
@@ -1324,7 +1728,7 @@ def _keyword_hits(
     """关键词命中。items 缺省为 2 档（3 档复用同一实现）。"""
     hits: List[Dict[str, Any]] = []
     low = text.lower()
-    for e in (items if items is not None else _state["tier2"]):
+    for e in (items if items is not None else _state()["tier2"]):
         for kw in e.get("triggers") or []:
             k = str(kw).strip().lower()
             if k and k in low:
@@ -1351,8 +1755,8 @@ async def _vector_hits(
     threshold: Optional[float] = None,
 ) -> List[Tuple[float, Dict[str, Any]]]:
     """向量命中。缺省走 2 档参数（3 档显式传入自己的库/阈值）。"""
-    items = _state["tier2"] if items is None else items
-    vecs = _state["tier2_vecs"] if vecs is None else vecs
+    items = _state()["tier2"] if items is None else items
+    vecs = _state()["tier2_vecs"] if vecs is None else vecs
     threshold = TIER2_SIM_THRESHOLD if threshold is None else float(threshold)
     if not text or not any(vecs):
         return []
@@ -1386,7 +1790,7 @@ async def _match_tier2_text(
     """
     s = tier2_settings(cfg)
     lc = lifecycle_settings((cfg or {}).get("lifecycle"))
-    if not _state["tier2"] or not text:
+    if not _state()["tier2"] or not text:
         return [], ""
     now = time.time()
     kw = _keyword_hits(text)
@@ -1415,7 +1819,7 @@ async def _match_tier2(
 ) -> Tuple[List[ScoredEntry], str]:
     """2 档检索（ctx 包装）：取最近消息原文后交给 _match_tier2_text。"""
     s = tier2_settings(cfg)
-    if not _state["tier2"]:
+    if not _state()["tier2"]:
         return [], ""
     text = await _recent_text(ctx, limit=int(s["scan_msgs"]))
     return await _match_tier2_text(text, s)
@@ -1427,7 +1831,7 @@ async def _match_tier3_text(
 ) -> Tuple[List[ScoredEntry], str]:
     """3 档检索**纯文本核心**（A7）。独立阈值，不受好感度门控。"""
     cfg = cfg or {}
-    items = _state["tier3"]
+    items = _state()["tier3"]
     if not items or not text:
         return [], ""
     lc = lifecycle_settings(cfg.get("lifecycle"))
@@ -1437,7 +1841,7 @@ async def _match_tier3_text(
     if len(kw) >= int(cfg.get("max_entries", MAX_TIER3_ENTRIES) or MAX_TIER3_ENTRIES):
         return _order_by_heat([(1.0, "keyword", e) for e in kw], 3, now, lc), "keyword"
     vh = await _vector_hits(
-        text, items, _state["tier3_vecs"], cfg.get("threshold", TIER3_SIM_THRESHOLD),
+        text, items, _state()["tier3_vecs"], cfg.get("threshold", TIER3_SIM_THRESHOLD),
     )
     merged: Dict[str, ScoredEntry] = {}
     for e in kw:
@@ -1454,7 +1858,7 @@ async def _match_tier3_text(
 
 async def _match_tier3(ctx: Any, cfg: Dict[str, Any]) -> Tuple[List[ScoredEntry], str]:
     """3 档检索（ctx 包装）：关键词优先，未命中再走向量。"""
-    items = _state["tier3"]
+    items = _state()["tier3"]
     if not items:
         return [], ""
     text = await _recent_text(ctx, limit=int(cfg.get("scan_msgs", TIER3_SCAN_MSGS)))
@@ -1583,7 +1987,25 @@ async def render_memory_block(
     三档预算与阈值全部由配置注入（缺省回落模块默认值），
     模块内不再有硬编码的魔法数字。
     3 档（世界知识）刻意**不参与好感度门控**：常识不该因为不熟就不说。
+
+    v2.0.2：整个渲染过程在 `_pin_state()` 里跑——它跨多次 await 使用同一份
+    目录状态，绝不能被 LRU 淘汰（淘汰后内部 `_state()` 会拿到新建的空状态，
+    2/3 档会静默变成「无内容」）。
     """
+    with _pin_state():
+        return await _render_memory_block_impl(
+            ctx, score, gating, tier3_cfg, tier1_cfg, tier2_cfg,
+        )
+
+
+async def _render_memory_block_impl(
+    ctx: Any,
+    score: int,
+    gating: bool = True,
+    tier3_cfg: Optional[Dict[str, Any]] = None,
+    tier1_cfg: Optional[Dict[str, Any]] = None,
+    tier2_cfg: Optional[Dict[str, Any]] = None,
+) -> str:
     await ensure_loaded()
 
     t1s = tier1_settings(tier1_cfg)
@@ -1594,10 +2016,10 @@ async def render_memory_block(
     blocked: List[Dict[str, Any]] = []
 
     if gating:
-        t1_ok, t1_blk = split_by_favor(_state["tier1"], score)
+        t1_ok, t1_blk = split_by_favor(_state()["tier1"], score)
         blocked.extend(t1_blk)
     else:
-        t1_ok = _state["tier1"]
+        t1_ok = _state()["tier1"]
     t1 = _render_tier1(t1_ok, t1s["max_chars"])
     if t1:
         parts.append(t1)
@@ -1609,8 +2031,8 @@ async def render_memory_block(
     # query 向量再经 _embed_query 的 LRU 缓存天然去重 → 多数轮次嵌入调用从 2 次降到 1 次。
     # 行为等价：_match_tier2_text / _match_tier3_text 自带「空档 or 空文本 → ([], "")」守卫，
     # 与 ctx 包装的早返回一致；不检索的档位文本留空，_text 核心照样返回空。
-    need2 = bool(_state["tier2"])
-    need3 = bool(t3s["enabled"]) and bool(_state["tier3"])
+    need2 = bool(_state()["tier2"])
+    need3 = bool(t3s["enabled"]) and bool(_state()["tier3"])
     scan2 = int(t2s["scan_msgs"])
     scan3 = int(t3s["scan_msgs"])
     text2 = text3 = ""
@@ -1634,7 +2056,7 @@ async def render_memory_block(
             # 不含因超预算被渲染器跳过的——否则长条会虚涨热度、挤掉真能注入的条目，
             # 且「最近命中」会谎报注入过其实没进输出的条目。
             names = ",".join(str(e.get("id", "?")) for e in injected2)
-            _state["last_hit"] = f"{src}:{names}"
+            _state()["last_hit"] = f"{src}:{names}"
             logger.info(f"[persona] 2 档命中({src}): {names}")
             parts.append(t2)
             # A4：仅在生命周期开启时强化命中条目（关闭时零副作用、不写 sidecar）
@@ -1652,7 +2074,7 @@ async def render_memory_block(
             t3 = _render_tier3(hits3, t3s["max_entries"], t3s["max_chars"], injected3)
             if t3:
                 names3 = ",".join(str(e.get("id", "?")) for e in injected3)
-                _state["last_hit_tier3"] = f"{src3}:{names3}"
+                _state()["last_hit_tier3"] = f"{src3}:{names3}"
                 logger.info(f"[persona] 3 档命中({src3}): {names3}")
                 parts.append(t3)
                 if lifecycle_settings(t3s.get("lifecycle"))["enabled"]:
@@ -1682,10 +2104,10 @@ def status(
     tier2_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """状态摘要（供管理工具返回）。"""
-    t1, t2, t3 = _state["tier1"], _state["tier2"], _state["tier3"]
+    t1, t2, t3 = _state()["tier1"], _state()["tier2"], _state()["tier3"]
     t1_chars = sum(len(str(e.get("content", ""))) + len(str(e.get("trigger", ""))) for e in t1)
-    vec_ok = sum(1 for v in _state["tier2_vecs"] if v)
-    vec3_ok = sum(1 for v in _state["tier3_vecs"] if v)
+    vec_ok = sum(1 for v in _state()["tier2_vecs"] if v)
+    vec3_ok = sum(1 for v in _state()["tier3_vecs"] if v)
     g1 = sum(1 for e in t1 if int(e.get("min_favor", 0) or 0) > 0)
     g2 = sum(1 for e in t2 if int(e.get("min_favor", 0) or 0) > 0)
     cfg = load_favor_cfg()

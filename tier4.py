@@ -26,7 +26,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from nekro_agent.core.logger import get_sub_logger
 
@@ -38,47 +38,179 @@ _CHANNEL_INDEX_NAME = "_channel_index.json"
 _CHANNEL_INDEX_VERSION = 1
 
 _PKG_BG_DIR = Path(__file__).parent / "backgrounds"
-_BG_DIR = _PKG_BG_DIR
-_TIER4_FILE = _BG_DIR / _TIER4_NAME
-_CHANNEL_INDEX_FILE = _BG_DIR / _CHANNEL_INDEX_NAME
+
+# ---------------- 数据目录：按访问解析（多账号隔离）----------------
+# 与 memory.py 同款：目录**不能在导入期固定**。NA 的
+# `plugin.get_plugin_data_dir()` 是活视图，账号上下文（消息处理 / 账号化挂载的
+# 插件 WebUI）下返回该账号目录，无上下文时返回共享目录。
+_bg_dir_provider: Optional[Callable[[], Path]] = None
+"""背景数据根目录提供者；未注册时回退包内 `_PKG_BG_DIR`（与改造前一致）。"""
+
+_prepared_dirs: set = set()
+"""已完成「建目录」解析的目录（避免每次访问都 stat）。"""
+
+# ---- 目录解析失败后的降级（v2.0.2 加固，行为变更）----
+# 与 memory.py 同款：旧实现把失败目录塞进 `_failed_dirs` 集合后**本进程内
+# 再也不重试**（挂载迟到 / 权限瞬时异常 → 永久回退包内演示数据、只打一次
+# exception 日志）。现在：失败只封存 `_BG_DIR_RETRY_TTL` 秒，冷却结束后的
+# 下一次访问**重新尝试**；降级期间按 `_BG_DIR_WARN_INTERVAL` 去抖打 warning，
+# 恢复可用时也打一条 warning；`bg_dir_status()` 供 WebUI 概览暴露降级。
+# 仍然**只返回路径、绝不抛异常**（不能打断消息处理）。
+_BG_DIR_RETRY_TTL = 5.0
+"""解析失败后允许重试的冷却秒数（>0：避免对挂死的挂载点高频重试）。"""
+
+_BG_DIR_WARN_INTERVAL = 60.0
+"""同一目录「冷却期内」重复降级的日志去抖间隔（秒）。"""
+
+_failed_dirs: Dict[Path, Dict[str, Any]] = {}
+"""解析失败的目录 → {"last_try": ts, "fails": n, "last_warn": ts, "reason": str}。"""
+
+
+def configure_bg_dir_provider(provider: Optional[Callable[[], Path]]) -> None:
+    """注册「背景数据根目录」提供者（每次访问时解析，跟随账号上下文）。"""
+    global _bg_dir_provider
+    _bg_dir_provider = provider
+
+
+def _warn_dir_degraded(target: Path, rec: Dict[str, Any], now: float,
+                       attempt_failed: bool = False,
+                       exc: Optional[BaseException] = None) -> None:
+    """目录不可用的降级告警（warning 级、按目录去抖）。
+
+    `attempt_failed=True`（真的又试了一次并失败）→ 每次都打（频率被
+    `_BG_DIR_RETRY_TTL` 限制）；冷却期内直接回退 → 按 `_BG_DIR_WARN_INTERVAL` 去抖。
+    失败链条的第一次额外带 traceback（`exc_info`），之后只带原因文本。
+    """
+    if not attempt_failed:
+        last_warn = float(rec.get("last_warn", 0.0) or 0.0)
+        if now - last_warn < _BG_DIR_WARN_INTERVAL:
+            return
+    rec["last_warn"] = now
+    fails = int(rec.get("fails", 0) or 0)
+    reason = str(rec.get("reason", "") or "")
+    detail = f"（原因：{reason}）" if reason else ""
+    wait = "" if attempt_failed else f"，{_BG_DIR_RETRY_TTL:.0f}s 后重试"
+    logger.warning(
+        f"[tier4] 数据目录不可用，生长层正在使用包内数据：{target}{detail}"
+        f"（累计失败 {fails} 次{wait}）",
+        exc_info=bool(exc) and fails <= 1,
+    )
+
+
+def _resolve_bg_dir() -> Path:
+    """按当前上下文解析生长层数据目录，并确保目录存在。
+
+    绝不抛异常：取路径 / 建目录失败一律**降级**为包内目录（安全第一），
+    但降级**可重试**（见 `_BG_DIR_RETRY_TTL`），不是永久钉死。
+    """
+    provider = _bg_dir_provider
+    if provider is None:
+        return _PKG_BG_DIR
+    try:
+        target = Path(provider())
+    except Exception:  # noqa: BLE001
+        logger.warning("[tier4] 数据目录提供者解析失败，本次使用包内数据目录",
+                       exc_info=True)
+        return _PKG_BG_DIR
+    if target in _prepared_dirs:
+        return target
+    rec = _failed_dirs.get(target)
+    if rec is not None:
+        now = time.time()
+        if now - float(rec.get("last_try", 0.0) or 0.0) < _BG_DIR_RETRY_TTL:
+            _warn_dir_degraded(target, rec, now)
+            return _PKG_BG_DIR
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        now = time.time()
+        rec = _failed_dirs.get(target) or {"last_try": 0.0, "fails": 0, "last_warn": 0.0}
+        rec["fails"] = int(rec.get("fails", 0) or 0) + 1
+        rec["last_try"] = now
+        rec["reason"] = f"{type(exc).__name__}: {exc}"
+        _failed_dirs[target] = rec
+        _warn_dir_degraded(target, rec, now, attempt_failed=True, exc=exc)
+        return _PKG_BG_DIR
+    if target in _failed_dirs:
+        rec = _failed_dirs.pop(target)
+        logger.warning(
+            f"[tier4] 数据目录已恢复可用"
+            f"（此前失败 {int(rec.get('fails', 0) or 0)} 次）：{target}",
+        )
+    _prepared_dirs.add(target)
+    return target
+
+
+def bg_dir_status() -> Dict[str, Any]:
+    """生长层数据目录的解析状态快照（供 WebUI 概览暴露「正在用包内数据」）。
+
+    只读；顺带给出按目录缓存的常驻规模（排障用）。
+    """
+    now = time.time()
+    degraded: List[Dict[str, Any]] = []
+    for path, rec in list(_failed_dirs.items()):
+        last_try = float(rec.get("last_try", 0.0) or 0.0)
+        degraded.append({
+            "dir": str(path),
+            "fails": int(rec.get("fails", 0) or 0),
+            "lastTry": last_try,
+            "reason": str(rec.get("reason", "") or ""),
+            "retryIn": max(0.0, _BG_DIR_RETRY_TTL - (now - last_try)),
+        })
+    degraded.sort(key=lambda d: -int(d["fails"]))
+    return {
+        "dir": str(_resolve_bg_dir()),
+        "packageDir": str(_PKG_BG_DIR),
+        "degraded": bool(degraded),
+        "degradedDirs": degraded,
+        "preparedDirs": len(_prepared_dirs),
+        "readCacheDirs": len(_read_caches),
+        "channelIndexDirs": len(_known_channels_by_dir),
+    }
+
+
+def configure_bg_dir(data_dir) -> Path:
+    """（向后兼容）把生长层数据目录**固定**到给定路径。
+
+    内部转成提供者注册；多账号下请优先用 `configure_bg_dir_provider()`。
+    目录不可用时回退包内目录，保证仍可运行。
+    """
+    target = Path(data_dir)
+    configure_bg_dir_provider(lambda _t=target: _t)
+    resolved = _resolve_bg_dir()
+    # 只作废**本目录**的读缓存与频道索引已见集（其它账号目录互不影响）
+    _invalidate_read_cache(resolved)
+    _known_channels_by_dir.pop(resolved, None)
+    _known_loaded_dirs.discard(resolved)
+    return resolved
+
+
+def _bg_dir() -> Path:
+    """当前生长层数据目录（每次调用都按上下文重新解析）。"""
+    return _resolve_bg_dir()
+
+
+def bg_dir() -> Path:
+    """当前生长层数据目录（按访问时的账号上下文解析）。"""
+    return _resolve_bg_dir()
+
+
+def _tier4_file() -> Path:
+    return _resolve_bg_dir() / _TIER4_NAME
+
+
+def _channel_index_file() -> Path:
+    return _resolve_bg_dir() / _CHANNEL_INDEX_NAME
+
+
+def tier4_path() -> Path:
+    """tier4.json 的绝对路径（WebUI 私有导出用；按当前账号上下文解析）。"""
+    return _tier4_file()
+
 
 ANCHOR_KIND = "anchor"
 NOTE_KIND = "note"
 GLOBAL_SCOPE = "global"
-
-
-def configure_bg_dir(data_dir) -> Path:
-    """把生长层数据目录切到插件数据目录（与 memory.configure_bg_dir 同一路径）。
-
-    plugin.py 在初始化时会用同一个 backgrounds 目录调用两者，使 tier4.json 与
-    阶梯记忆、hit_stats sidecar 落在一起。目录不可用时回退包内目录，保证仍可运行。
-    """
-    global _BG_DIR, _TIER4_FILE, _CHANNEL_INDEX_FILE
-    target = Path(data_dir)
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-    except Exception:  # noqa: BLE001
-        logger.exception(f"[tier4] 数据目录不可用，回退包内目录：{target}")
-        target = _PKG_BG_DIR
-    _BG_DIR = target
-    _TIER4_FILE = target / _TIER4_NAME
-    _CHANNEL_INDEX_FILE = target / _CHANNEL_INDEX_NAME
-    # 目录变了：作废读缓存与频道索引的进程内已见集，下次按新目录重取
-    _invalidate_read_cache()
-    _known_channels.clear()
-    global _known_channels_loaded
-    _known_channels_loaded = False
-    return target
-
-
-def bg_dir() -> Path:
-    """当前生长层数据目录。"""
-    return _BG_DIR
-
-
-def tier4_path() -> Path:
-    """tier4.json 的绝对路径（WebUI 私有导出用）。"""
-    return _TIER4_FILE
 
 
 # ---------------- 小工具（本地，避免依赖 plugin.py）----------------
@@ -238,13 +370,52 @@ _tier4_lock = asyncio.Lock()
 
 # 渲染读缓存：按文件 mtime 复用，避免每轮每频道都重新解析。
 # 仅在 mtime 变化时重读；写路径落盘后立即刷新，保证「刚写的锚点下一轮即可见」。
-_read_cache: Dict[str, Any] = {"mtime": None, "size": None, "doc": None}
+# ⚠️ **必须按目录分键**：账号目录是复制共享目录而来（mtime 被保留），
+# 各种 tier4.json 的 (mtime, size) 完全相同；单一全局缓存会让账号 B 的
+# 请求直接拿到账号 A 已解析的文档 → 锚点/笔记串号。
+_read_caches: Dict[Path, Dict[str, Any]] = {}
+
+# v2.0.2：按目录缓存**有界**（只增不减同样是常驻内存隐患）。
+# 这些缓存全是**可从磁盘重建的派生数据**（读缓存由 mtime+size 校验、
+# 频道已见集合由 _channel_index.json 重建），故淘汰永远是安全的：
+# 下一次访问会重新读盘，不影响正确性。
+_DIR_CACHE_MAX = 32
+"""按目录缓存的目录数上限（读缓存 / 频道索引已见集共用）。"""
 
 
-def _invalidate_read_cache() -> None:
-    _read_cache["mtime"] = None
-    _read_cache["size"] = None
-    _read_cache["doc"] = None
+def _prune_dir_caches() -> None:
+    """把按目录缓存裁到 `_DIR_CACHE_MAX`（淘汰最早创建的目录，派生数据可重建）。"""
+    maxn = int(_DIR_CACHE_MAX)
+    if maxn <= 0:
+        return
+    while len(_read_caches) > maxn:
+        old = next(iter(_read_caches))
+        _read_caches.pop(old, None)
+        logger.debug(f"[tier4] 读缓存淘汰最旧目录：{old}")
+    while len(_known_channels_by_dir) > maxn:
+        old = next(iter(_known_channels_by_dir))
+        _known_channels_by_dir.pop(old, None)
+        _known_loaded_dirs.discard(old)
+        logger.debug(f"[tier4] 频道索引已见集淘汰最旧目录：{old}")
+
+
+def _read_cache(dir_key: Optional[Path] = None) -> Dict[str, Any]:
+    """某个数据目录的读缓存槽（缺省取当前上下文解析出的目录）。"""
+    key = dir_key if dir_key is not None else _resolve_bg_dir()
+    slot = _read_caches.get(key)
+    if slot is None:
+        slot = {"mtime": None, "size": None, "doc": None}
+        _read_caches[key] = slot
+        _prune_dir_caches()
+    return slot
+
+
+def _invalidate_read_cache(dir_key: Optional[Path] = None) -> None:
+    """作废某个目录的读缓存（缺省只作废当前上下文那一份，绝不清空别的账号）。"""
+    slot = _read_cache(dir_key)
+    slot["mtime"] = None
+    slot["size"] = None
+    slot["doc"] = None
 
 
 def _fresh_doc() -> Tier4Doc:
@@ -252,8 +423,12 @@ def _fresh_doc() -> Tier4Doc:
 
 
 def _read_tier4_sync() -> Tier4Doc:
-    """从磁盘读 tier4.json；缺失 / 版本不符 / 解析失败 → 空文档（fail-open，绝不影响渲染）。"""
-    fp = _TIER4_FILE
+    """从磁盘读 tier4.json；缺失 / 版本不符 / 解析失败 → 空文档（fail-open，绝不影响渲染）。
+
+    读缓存按**目录**分键（`_read_cache()`），账号之间绝不复用同一份已解析文档。
+    """
+    fp = _tier4_file()
+    cache = _read_cache(fp.parent)
     try:
         st = fp.stat()
     except FileNotFoundError:
@@ -264,11 +439,11 @@ def _read_tier4_sync() -> Tier4Doc:
 
     mtime, size = st.st_mtime, st.st_size
     if (
-        _read_cache["doc"] is not None
-        and _read_cache["mtime"] == mtime
-        and _read_cache["size"] == size
+        cache["doc"] is not None
+        and cache["mtime"] == mtime
+        and cache["size"] == size
     ):
-        return _read_cache["doc"]
+        return cache["doc"]
     try:
         data = json.loads(fp.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001
@@ -279,26 +454,27 @@ def _read_tier4_sync() -> Tier4Doc:
         if doc.version != _TIER4_VERSION:
             logger.warning(f"[tier4] 版本不符（{doc.version}!={_TIER4_VERSION}），本次按空处理")
             doc = _fresh_doc()
-    _read_cache["mtime"] = mtime
-    _read_cache["size"] = size
-    _read_cache["doc"] = doc
+    cache["mtime"] = mtime
+    cache["size"] = size
+    cache["doc"] = doc
     return doc
 
 
 def _write_tier4_sync(doc: Tier4Doc) -> None:
     """原子写盘；成功后刷新读缓存。失败只记日志（调用方已持有写锁）。"""
-    fp = _TIER4_FILE
+    fp = _tier4_file()
+    cache = _read_cache(fp.parent)
     tmp = fp.with_suffix(fp.suffix + ".tmp")
     try:
         tmp.write_text(json.dumps(doc.to_raw(), ensure_ascii=False), encoding="utf-8")
         tmp.replace(fp)
         # 刷新读缓存到新内容
         st = fp.stat()
-        _read_cache["mtime"] = st.st_mtime
-        _read_cache["size"] = st.st_size
-        _read_cache["doc"] = doc
+        cache["mtime"] = st.st_mtime
+        cache["size"] = st.st_size
+        cache["doc"] = doc
     except Exception as exc:  # noqa: BLE001
-        _invalidate_read_cache()
+        _invalidate_read_cache(fp.parent)
         logger.warning(f"[tier4] 写入失败（不影响本次运行）: {exc}")
 
 
@@ -898,7 +1074,7 @@ _MIGRATION_FILE_NAME = "_migrations.json"
 
 
 def _migration_path() -> Path:
-    return _BG_DIR / _MIGRATION_FILE_NAME
+    return _bg_dir() / _MIGRATION_FILE_NAME
 
 
 async def save_migration_report(report: Dict[str, Any]) -> None:
@@ -928,40 +1104,47 @@ def load_migration_report() -> Dict[str, Any]:
 _channel_index_lock = asyncio.Lock()
 # 进程内已见频道集合：_store_archive 每条消息都会调 note_channel，
 # 让「已在索引里的频道」走一次集合查表即返回，避免每轮抢锁 + 读写文件。
-_known_channels: set[str] = set()
-_known_channels_loaded = False
+# ⚠️ **按目录分键**：不同账号各有自己的 _channel_index.json，
+# 单一全局集合会把 A 已见频道当成 B 也见过 → B 的索引漏记。
+_known_channels_by_dir: Dict[Path, set] = {}
+_known_loaded_dirs: set = set()
 
 
 async def note_channel(chat_key: str) -> bool:
-    """把一个 chat_key 去重追加进 _channel_index.json。
+    """把一个 chat_key 去重追加进当前账号目录的 _channel_index.json。
 
     每次 `_store_archive()` 成功后调用（见 plugin.py A2 接线）。返回是否新增了。
     """
-    global _known_channels_loaded
     ck = str(chat_key or "").strip()
     if not ck:
         return False
-    if not _known_channels_loaded:
+    dir_key = _bg_dir()
+    if dir_key not in _known_channels_by_dir:
+        _known_channels_by_dir[dir_key] = set()
+        _prune_dir_caches()
+    known = _known_channels_by_dir[dir_key]
+    if dir_key not in _known_loaded_dirs:
         async with _channel_index_lock:
-            if not _known_channels_loaded:
-                _known_channels.update(_load_channel_index_sync())
-                _known_channels_loaded = True
-    if ck in _known_channels:  # 热路径：集合命中即返回，不抢锁不读盘
+            if dir_key not in _known_loaded_dirs:
+                known.update(_load_channel_index_sync(dir_key))
+                _known_loaded_dirs.add(dir_key)
+    if ck in known:  # 热路径：集合命中即返回，不抢锁不读盘
         return False
     async with _channel_index_lock:
-        if ck in _known_channels:
+        if ck in known:
             return False
-        keys = _load_channel_index_sync()
+        keys = _load_channel_index_sync(dir_key)
         if ck not in keys:
             keys.append(ck)
-            _save_channel_index_sync(keys)
-        _known_channels.add(ck)
+            _save_channel_index_sync(keys, dir_key)
+        known.add(ck)
         return True
 
 
-def _load_channel_index_sync() -> List[str]:
+def _load_channel_index_sync(dir_key: Optional[Path] = None) -> List[str]:
+    fp = _channel_index_file() if dir_key is None else dir_key / _CHANNEL_INDEX_NAME
     try:
-        data = json.loads(_CHANNEL_INDEX_FILE.read_text(encoding="utf-8"))
+        data = json.loads(fp.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
     except Exception as exc:  # noqa: BLE001
@@ -972,16 +1155,17 @@ def _load_channel_index_sync() -> List[str]:
     return [str(x) for x in (data.get("chat_keys") or []) if str(x).strip()]
 
 
-def _save_channel_index_sync(keys: List[str]) -> None:
+def _save_channel_index_sync(keys: List[str], dir_key: Optional[Path] = None) -> None:
+    fp = _channel_index_file() if dir_key is None else dir_key / _CHANNEL_INDEX_NAME
     payload = {"version": _CHANNEL_INDEX_VERSION, "chat_keys": keys}
-    tmp = _CHANNEL_INDEX_FILE.with_suffix(_CHANNEL_INDEX_FILE.suffix + ".tmp")
+    tmp = fp.with_suffix(fp.suffix + ".tmp")
     try:
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(_CHANNEL_INDEX_FILE)
+        tmp.replace(fp)
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[tier4] 频道索引写入失败（不影响本次运行）: {exc}")
 
 
 async def load_channel_index() -> List[str]:
-    """读取已记录的频道键列表（阶段 C 导出用；此处供审计/测试）。"""
+    """读取当前账号目录已记录的频道键列表（阶段 C 导出用；此处供审计/测试）。"""
     return _load_channel_index_sync()

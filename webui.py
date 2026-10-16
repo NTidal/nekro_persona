@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
-BG_DIR = Path(__file__).parent / "backgrounds"   # 兜底；实际在 build_router 里按插件数据目录覆盖
+BG_DIR = Path(__file__).parent / "backgrounds"   # ⚠️ 已废弃：仅为兼容外部引用保留，内部一律走 _bg_dir()
 # 合法档位（扩展：新增 tier3 世界知识）
 _TIERS = ("tier1", "tier2", "tier3")
 _TIER_LABEL = {"tier1": "1 档·身份", "tier2": "2 档·往事", "tier3": "3 档·世界知识"}
@@ -41,13 +41,74 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     且运行进程里模块绝对名不一定是 nekro_persona。"""
     router = APIRouter()
 
-    # 背景记忆数据目录与注入链路共用同一份（由 memory 统一解析：
-    # 插件数据目录，首次运行自包内种子复制），避免 WebUI 与注入读写到不同文件。
-    global BG_DIR
-    try:
-        BG_DIR = Path(memory.bg_dir())
-    except Exception:  # noqa: BLE001
-        pass
+    # 背景记忆数据目录与注入链路共用同一份解析入口（memory 统一解析：
+    # 跟随当前账号上下文 → 插件数据目录；账号目录首次使用由框架播种，
+    # 包内种子由 memory._seed_pkg_files 在目录为空时补齐）。
+    # ⚠️ 必须**按访问解析**：build_router 只在导入期调用一次，在这里取一次
+    # `memory.bg_dir()` 会把路径固定成「导入期的共享目录」，所有账号的
+    # 背景记忆编辑/删除/回收站/导入导出都会误写到共享目录 → 账号互相覆盖。
+    def _bg_dir() -> Path:
+        return Path(memory.bg_dir())
+
+    def _trash_file() -> Path:
+        return _bg_dir() / ".webui_trash.json"
+
+    # ---------------- 作用域（"我在编辑谁的数据"） ----------------
+    def _scope_info() -> Dict[str, Any]:
+        """当前请求的账号作用域，以及**本次请求实际解析到**的背景数据目录。
+
+        为什么必须按请求解析（v1.7.0）：
+        · 账号前缀 `/plugins/{key}@{account}/` 由框架在路由依赖里
+          `set_current_instance_key(account)` 绑定账号上下文，该前缀下的
+          `memory.bg_dir()` → `<插件数据目录>/accounts/{account}/backgrounds`；
+        · 默认前缀 `/plugins/{key}/` 没有账号上下文 → 共享目录
+          `<插件数据目录>/backgrounds`（历史数据 / 新账号的播种模板）。
+        一旦在导入期（build_router 只跑一次）取一次，就会把共享目录固化给所有账号，
+        页面显示的作用域与实际写入的目录会不一致 —— 那正是本次要消除的误导。
+
+        `dataDir` 取**相对插件数据目录**的 POSIX 路径（`backgrounds` 或
+        `accounts/{account}/backgrounds`）：既能区分共享/账号，又不把宿主绝对
+        路径暴露到浏览器。仅在数据目录解析到包内兜底目录等异常情形下才回落
+        为绝对路径（此时它会以 `/` 开头，一眼可辨）。
+        """
+        try:
+            from nekro_agent.services.account.context import get_current_instance_key
+
+            raw_scope = get_current_instance_key()
+            has_account_scoping = True
+        except Exception:  # noqa: BLE001 - 老框架没有账号上下文模块 → 一律按共享处理
+            raw_scope = None
+            # 旧框架只有一个数据集，没有「共享/模板」概念：前端据此隐藏作用域条，
+            # 否则会误报「这里的修改不会影响任何账号」——在旧框架上那份就是线上数据。
+            has_account_scoping = False
+
+        account_key: Optional[str] = None
+        if raw_scope:
+            try:
+                from nekro_agent.services.account import normalize_account_key
+
+                account_key = str(normalize_account_key(str(raw_scope))).strip() or None
+            except Exception:  # noqa: BLE001 - 归一化不可用时退化为裸账号键
+                account_key = str(raw_scope).rpartition("#")[2].strip() or None
+
+        resolved = Path(_bg_dir())
+        # 插件数据目录根：共享时 <root>/backgrounds；账号时 <root>/accounts/<key>/backgrounds
+        root = resolved.parent
+        if root.parent.name == "accounts":
+            root = root.parent.parent
+        try:
+            data_dir = resolved.relative_to(root).as_posix()
+        except ValueError:  # 不在插件数据目录下（包内兜底目录等）
+            data_dir = str(resolved)
+
+        return {
+            "scope": {
+                "kind": "account" if account_key else "shared",
+                "accountKey": account_key,
+                "accountScoping": has_account_scoping,
+            },
+            "dataDir": data_dir,
+        }
 
     # ---------------- 鉴权 ----------------
     def _check_key(request: Request) -> None:
@@ -78,7 +139,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     _WRITE_LOCK = threading.RLock()
 
     def _entry_files(tier: str) -> List[Path]:
-        return sorted(Path(p) for p in glob.glob(str(BG_DIR / tier / "*.json")))
+        return sorted(Path(p) for p in glob.glob(str(_bg_dir() / tier / "*.json")))
 
     def _read_json_strict(fp: Path) -> Optional[Dict[str, Any]]:
         if not fp.exists():
@@ -279,7 +340,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 new_entry.setdefault("triggers", [])
             if tier == "tier3":
                 new_entry.setdefault("familiarity", "")
-            fp = BG_DIR / tier / "custom.json"
+            fp = _bg_dir() / tier / "custom.json"
             data = _read_json_strict(fp)
             if data is None:
                 data = {
@@ -310,7 +371,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         return "other"
 
     def _read_gating() -> Dict[str, Any]:
-        data = _read_json_strict(BG_DIR / "favor.json")
+        data = _read_json_strict(_bg_dir() / "favor.json")
         return data or {}
 
     def _write_gating(patch: Dict[str, Any]) -> None:
@@ -321,12 +382,11 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         ):
             if key in patch:
                 data[key] = patch[key]
-        _dump(BG_DIR / "favor.json", data)
+        _dump(_bg_dir() / "favor.json", data)
 
-    _TRASH_FILE = BG_DIR / ".webui_trash.json"
-
+    # 回收站与背景数据同目录，按当前账号上下文解析（不要在此捕获固定路径）
     def _read_trash() -> List[Dict[str, Any]]:
-        data = _read_json_strict(_TRASH_FILE)
+        data = _read_json_strict(_trash_file())
         if data is None:
             return []
         items = data.get("items", [])
@@ -335,7 +395,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         return [dict(item) for item in items if isinstance(item, dict)]
 
     def _write_trash(items: List[Dict[str, Any]]) -> None:
-        _dump(_TRASH_FILE, {"version": 1, "items": items})
+        _dump(_trash_file(), {"version": 1, "items": items})
 
     def _trash_summary(item: Dict[str, Any]) -> Dict[str, Any]:
         entry = item.get("entry") or {}
@@ -369,7 +429,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             file_name = str(record.get("file") or "custom.json")
             if Path(file_name).name != file_name or not file_name.endswith(".json"):
                 raise ValueError("回收站记录文件路径无效")
-            fp = BG_DIR / tier / file_name
+            fp = _bg_dir() / tier / file_name
             data = _read_json_strict(fp)
             if data is None:
                 source_document = record.get("source_document")
@@ -452,6 +512,9 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     @router.get("/api/overview", summary="概览")
     async def api_overview(request: Request) -> Dict[str, Any]:
         _check_key(request)
+        # 作用域与数据目录：**按本次请求**解析（见 _scope_info 的说明）。
+        # 放在 ensure_loaded 之前也无妨：两者都走 memory.bg_dir() 的同一份上下文。
+        scope_info = _scope_info()
         try:
             await memory.ensure_loaded()
             cfg = memory.load_favor_cfg()
@@ -468,9 +531,37 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             except (TypeError, ValueError):
                 return cast(default)
 
-        t1, t2 = memory._state["tier1"], memory._state["tier2"]
-        t3 = memory._state.get("tier3", [])
-        vecs3 = memory._state.get("tier3_vecs", [])
+        def _dir_status() -> Dict[str, Any]:
+            """数据目录解析状态（memory + tier4 + 状态缓存规模）。
+
+            v2.0.2：目录解析失败时插件会回退**包内演示数据**运行，这是安全优先的
+            降级；旧实现只打一次日志、且本进程内不再重试，属于静默故障。
+            这里把降级暴露到概览页，作者一眼能看出「人设为什么变回了演示内容」。
+            任何异常都不允许拖垮概览页。
+            """
+            out: Dict[str, Any] = {}
+            try:
+                out["memory"] = memory.bg_dir_status()
+            except Exception as exc:  # noqa: BLE001
+                out["memory"] = {"error": str(exc)}
+            try:
+                t4 = helpers.get("tier4")
+                out["tier4"] = t4.bg_dir_status() if t4 is not None else {}
+            except Exception as exc:  # noqa: BLE001
+                out["tier4"] = {"error": str(exc)}
+            try:
+                out["stateCache"] = memory.state_cache_stats()
+            except Exception as exc:  # noqa: BLE001
+                out["stateCache"] = {"error": str(exc)}
+            out["degraded"] = bool(
+                (out.get("memory") or {}).get("degraded")
+                or (out.get("tier4") or {}).get("degraded")
+            )
+            return out
+
+        t1, t2 = memory._state()["tier1"], memory._state()["tier2"]
+        t3 = memory._state().get("tier3", [])
+        vecs3 = memory._state().get("tier3_vecs", [])
         t1s = memory.tier1_settings(_tier1_cfg())
         t2s = memory.tier2_settings(_tier2_cfg())
         t3s = memory.tier3_settings(_t3_cfg())
@@ -479,7 +570,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         )
         t1_rendered_chars = sum(_entry_render_chars(e) for e in t1)
         t1_limit = int(t1s["max_chars"])
-        vecs = memory._state["tier2_vecs"]
+        vecs = memory._state()["tier2_vecs"]
 
         def _dist(entries: List[Dict[str, Any]]) -> Dict[str, int]:
             d: Dict[str, int] = {}
@@ -496,6 +587,11 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "enabled": plugin.is_enabled,
                 "allow_sleep": plugin.allow_sleep,
             },
+            # 作用域可见性（v1.7.0）：账号作用域 = 该账号自己的副本；
+            # 共享作用域 = 历史/模板目录，**在它上面的修改不会影响任何账号**。
+            # 前端顶部的"作用域条"据此渲染，账号名与路径都不写死。
+            "scope": scope_info["scope"],
+            "dataDir": scope_info["dataDir"],
             "tier1": {
                 "count": len(t1),
                 "chars": t1_chars,
@@ -534,7 +630,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "dist_tier1": _dist(t1),
                 "dist_tier2": _dist(t2),
             },
-            "last_hit": memory._state.get("last_hit", ""),
+            "last_hit": memory._state().get("last_hit", ""),
             # 写权限状态（v1.4.2）：未配置 WEBUI_ACCESS_KEY 时后端一律 403 拒绝写操作
             # （v1.4.1 安全约束：插件路由不受 NA 全局鉴权保护，匿名不得改人设）。
             # 前端据此把「保存」按钮置灰并给出可操作提示，而不是等提交后才吃 403。
@@ -596,6 +692,8 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "has_key": bool(str(getattr(config, "EMBED_API_KEY", "") or "").strip()),
                 **memory.embed_health(),
             },
+            # v2.0.2：数据目录降级可见化（见 _dir_status 的说明）。
+            "dirStatus": _dir_status(),
         }
 
     @router.get("/api/entries", summary="背景记忆条目")
@@ -1040,11 +1138,11 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "text": text,
             "debug": {
                 "gating_enabled": gating,
-                "tier1_count": len(memory._state.get("tier1", [])),
-                "tier2_count": len(memory._state.get("tier2", [])),
-                "tier2_hit": str(memory._state.get("last_hit") or ""),
-                "tier3_count": len(memory._state.get("tier3", [])),
-                "tier3_hit": str(memory._state.get("last_hit_tier3") or ""),
+                "tier1_count": len(memory._state().get("tier1", [])),
+                "tier2_count": len(memory._state().get("tier2", [])),
+                "tier2_hit": str(memory._state().get("last_hit") or ""),
+                "tier3_count": len(memory._state().get("tier3", [])),
+                "tier3_hit": str(memory._state().get("last_hit_tier3") or ""),
                 "tier3_enabled": memory.tier3_settings(_t3_cfg())["enabled"],
                 "message_scan_limit": int(memory.tier2_settings(_tier2_cfg())["scan_msgs"]),
             },
@@ -1104,7 +1202,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             used += _blen(e)
         kept_set = set(kept_ids)
 
-        # #9：用公开只读快照替代直接读私有 memory._state["hit_stats"]（改善封装、防误改）。
+        # #9：用公开只读快照替代直接读私有 memory._state()["hit_stats"]（改善封装、防误改）。
         # 循环外取一次，避免每条候选都全量拷贝。
         hit_snap = memory.hit_stats_snapshot()
         rows: List[Dict[str, Any]] = []
@@ -1591,7 +1689,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 p = t4.bg_dir() / name
                 if p.is_file():
                     zf.writestr(f"backgrounds/{name}", p.read_bytes())
-            hs = BG_DIR / ".hit_stats.json"
+            hs = _bg_dir() / ".hit_stats.json"
             if hs.is_file():
                 zf.writestr("backgrounds/.hit_stats.json", hs.read_bytes())
             archives = await helpers["enumerate_archives"]()
@@ -1642,12 +1740,12 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
 
         # 导入前备份当前生长状态（tier4.json + hit_stats）到 _growth_import_backups/<stamp>/
         stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
-        bdir = BG_DIR.parent / "_growth_import_backups" / stamp
+        bdir = _bg_dir().parent / "_growth_import_backups" / stamp
         bdir.mkdir(parents=True, exist_ok=True)
         if t4.tier4_path().is_file():
             shutil.copy2(t4.tier4_path(), bdir / "tier4.json")
-        if (BG_DIR / ".hit_stats.json").is_file():
-            shutil.copy2(BG_DIR / ".hit_stats.json", bdir / ".hit_stats.json")
+        if (_bg_dir() / ".hit_stats.json").is_file():
+            shutil.copy2(_bg_dir() / ".hit_stats.json", bdir / ".hit_stats.json")
 
         applied: List[str] = []
 
@@ -1683,7 +1781,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         # 3) .hit_stats.json —— 覆盖（内存命中共振需重启才重读，见返回提示）
         hs_src = next((n for n in names if n.endswith(".hit_stats.json")), None)
         if hs_src:
-            (BG_DIR / ".hit_stats.json").write_bytes(zf.read(hs_src))
+            (_bg_dir() / ".hit_stats.json").write_bytes(zf.read(hs_src))
             applied.append(".hit_stats.json")
 
         reload_state = await _reload_after_write()
@@ -1710,10 +1808,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         except ValueError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         files = [
-            ("backgrounds/tier1/core.json", BG_DIR / "tier1" / "core.json"),
-            ("backgrounds/tier2/lore.json", BG_DIR / "tier2" / "lore.json"),
-            ("backgrounds/tier3/world.json", BG_DIR / "tier3" / "world.json"),
-            ("backgrounds/favor.json", BG_DIR / "favor.json"),
+            ("backgrounds/tier1/core.json", _bg_dir() / "tier1" / "core.json"),
+            ("backgrounds/tier2/lore.json", _bg_dir() / "tier2" / "lore.json"),
+            ("backgrounds/tier3/world.json", _bg_dir() / "tier3" / "world.json"),
+            ("backgrounds/favor.json", _bg_dir() / "favor.json"),
         ]
         buf = _io.BytesIO()
         stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1780,10 +1878,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             return None
 
         targets = {
-            "tier1/core.json": BG_DIR / "tier1" / "core.json",
-            "tier2/lore.json": BG_DIR / "tier2" / "lore.json",
-            "tier3/world.json": BG_DIR / "tier3" / "world.json",
-            "favor.json": BG_DIR / "favor.json",
+            "tier1/core.json": _bg_dir() / "tier1" / "core.json",
+            "tier2/lore.json": _bg_dir() / "tier2" / "lore.json",
+            "tier3/world.json": _bg_dir() / "tier3" / "world.json",
+            "favor.json": _bg_dir() / "favor.json",
         }
         parsed = {}
         for arc, dst in targets.items():
@@ -1812,7 +1910,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
 
         # 导入前先备份当前文件
         stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
-        bdir = BG_DIR.parent / "persona_import_backups" / stamp
+        bdir = _bg_dir().parent / "persona_import_backups" / stamp
         bdir.mkdir(parents=True, exist_ok=True)
         for arc, dst in targets.items():
             if dst.is_file():

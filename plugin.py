@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.0.1",
+    version="2.0.2",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -545,11 +545,23 @@ from . import card  # noqa: E402  # 依赖上方 plugin/config 完成初始化�
 from . import memory as persona_memory  # noqa: E402  # 阶梯记忆与好感度门控
 from . import tier4  # noqa: E402  # tier4 生长层（身份锚点，阶段 A）
 
-# 背景记忆数据目录：落到插件数据目录（首次运行自包内 backgrounds/ 复制种子），
-# 避免升级/重装插件时整体替换包目录而覆盖用户改过的记忆。
-persona_memory.configure_bg_dir(plugin.get_plugin_data_dir() / "backgrounds")
+# 背景记忆数据目录：**按访问解析**（多账号隔离）。
+# ⚠️ 绝不能在这里写下 `plugin.get_plugin_data_dir() / "backgrounds"` 的求值结果：
+# 模块级求值发生在导入期，那时没有账号上下文，会把路径永久固定到共享目录，
+# 于是所有账号都读写同一份人格数据。这里只注册「提供者」，
+# memory/tier4 每次访问时自行调用，从而跟随当前账号上下文解析。
+persona_memory.configure_bg_dir_provider(lambda: plugin.get_plugin_data_dir() / "backgrounds")
 # tier4 生长层与阶梯记忆同目录（tier4.json / _channel_index.json 落到同一 backgrounds/）
-tier4.configure_bg_dir(plugin.get_plugin_data_dir() / "backgrounds")
+tier4.configure_bg_dir_provider(lambda: plugin.get_plugin_data_dir() / "backgrounds")
+# v2.0.2：目录状态缓存改为**有界 LRU**（每个账号目录约 20MB 常驻向量，旧实现只增不减）。
+# 这里只做一次初始化：取环境变量 NEKRO_PERSONA_STATE_MAX_DIRS，没有就用 memory.py 的
+# 默认值（8）。**刻意不新增插件配置项**——那会让 NA 在加载时回写 config.yaml，
+# 与「旧配置零迁移」相冲突；要调就用容器环境变量。
+try:
+    _state_max_dirs = persona_memory.configure_state_cache()
+    plugin.logger.info(f"[persona] 目录状态缓存上限 = {_state_max_dirs}（0 表示不限制）")
+except Exception as _exc:  # noqa: BLE001
+    plugin.logger.warning(f"[persona] 初始化目录状态缓存上限失败（沿用默认值）: {_exc}")
 # v1.6.0：注入独立嵌入后端配置提供者（lambda 延迟解析 _embed_cfg，因其定义在后）。
 # memory.py 每次嵌入实时读取，故 WebUI 改 EMBED_* 后无需重启即生效。
 persona_memory.set_embed_config_provider(lambda: _embed_cfg())
