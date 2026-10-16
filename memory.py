@@ -23,6 +23,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import shutil
 import time
 from array import array as _float_array
@@ -739,7 +740,13 @@ async def _embed_batch_custom(texts: List[str], cfg: Dict[str, Any]) -> List[Opt
             await asyncio.sleep(throttle)
             await _post_chunk(client, chunk_texts[mid:], offset + mid, depth + 1)
             return
-        logger.warning(f"[persona] custom 嵌入失败 @{offset} (n={len(chunk_texts)}): status={status}")
+        # v2.0.x：原来写死 "custom 嵌入失败"，但 provider=na 时同一条日志也会出现，
+        # 排查时会被误导。改为把当前实际后端/模型打出来，自证口径。
+        _c = _embed_cfg()
+        logger.warning(
+            f"[persona] 批量嵌入失败 @{offset} (n={len(chunk_texts)}): status={status} "
+            f"[provider={_c.get('provider')} model={_c.get('model')}]"
+        )
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -1126,11 +1133,167 @@ def _render_tier1(entries: List[Dict[str, Any]], max_chars: int = MAX_TIER1_CHAR
     )
 
 
+# 平台标记噪声（v2.0.x）：这些片段没有任何语义，却会被送进嵌入，
+# 把整段 query 的向量往噪声方向拉。实测（tier3，标题+5 条）：
+#   干净闲聊     自匹配 0.431（6/8 过 0.35）
+#   真实标记噪声 自匹配 0.328（3/8 过 0.35）  ← 光标记就跌破阈值
+# 只剥**确定的**标记，不做 `\[.*?\]` 这类粗暴全剥——那会把有意义的方括号内容
+# （例如群友自造的 [某某] 称呼）一起删掉，反而损失信号（实测过，见 README）。
+_QUERY_NOISE = (
+    # ⚠️ OneBot @ 提及：**保留昵称，只扔标记**（v2.0.x 修正）。
+    # 昵称是有效信号：实测 2620 个群成员昵称里有 10 个本身就是 tier2/tier3 触发词，
+    # 被 @ 就意味着该角色在场、该被想起。早先整段删除是**错的**，会漏掉这部分召回
+    # （实测抽样 4000 条含 @ 的消息里 42 条受影响，覆盖 6 个条目）。
+    (re.compile(r"\[@id:\d+;nickname:([^\]@]*)@\]"), r" \1 "),
+    # 裸 id 形态：无昵称可留，整段丢弃。实测人类消息里 0 条、bot 消息里 689 条
+    # （bot @ 人时生成的形态），而 bot 回复现在会被纳入查询，所以必须清掉。
+    (re.compile(r"\[@id:\d+@\]"), " "),
+    (re.compile(r"\[Image:\s*[^\]]*\]"), " "),           # 图片占位
+    (re.compile(r"\[图片\]"), " "),
+    (re.compile(r"\[表情[^\]]*\]"), " "),
+    (re.compile(r"\[附件[^\]]*\]"), " "),
+    (re.compile(r"\[合并转发消息\]"), " "),
+    (re.compile(r"\[CQ:[^\]]*\]"), " "),                 # CQ 码
+    (re.compile(r"<attachmentType=\"[^\"]*\"[^>]*>"), " "),   # 附件 XML（单行，有闭合）
+    (re.compile(r"<attachmentType=\"[^\"]*\"[^>]*"), " "),    # 附件 XML（容忍未闭合）
+    (re.compile(r"<attachmentType=\"[^\"]*\"[\s\S]*?(?:/>|>)"), " "),
+    (re.compile(r"https?://\S+"), " "),                  # 链接（含短链）
+    (re.compile(r"\{[^{}]{0,60}\"text\"\s*:[^{}]{0,60}\}"), " "),   # {"text":"..."} 载荷
+    (re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\"[^\"]{16,}\""), " "),     # 长属性值 description="<base64>"
+    (re.compile(r"[A-Za-z0-9+/]{64,}={0,2}"), " "),      # 裸 base64 片段
+)
+
+
+def _clean_query_text(text: str) -> str:
+    """剥掉平台标记噪声，返回可直接送嵌入的文本。纯函数、无副作用。
+
+    注意 @ 提及是特例：**只剥标记、保留昵称**（见 _QUERY_NOISE 首条注释）。
+    """
+    t = str(text or "")
+    for pat, repl in _QUERY_NOISE:
+        t = pat.sub(repl, t)
+    return " ".join(t.split())
+
+
+_QUERY_CFG_PROVIDER = None
+
+
+def set_query_config_provider(fn) -> None:
+    """注册「查询文本构成」配置提供者（plugin 侧注入）。
+
+    与 set_embed_config_provider 同款：每次检索实时读取，WebUI 改配置即时生效。
+    """
+    global _QUERY_CFG_PROVIDER
+    _QUERY_CFG_PROVIDER = fn
+
+
+def _query_cfg() -> Dict[str, Any]:
+    """当前查询构成配置；拿不到时安全回落到「只纳入人类消息」（旧行为）。"""
+    if _QUERY_CFG_PROVIDER is not None:
+        try:
+            cfg = _QUERY_CFG_PROVIDER()
+            if isinstance(cfg, dict):
+                return cfg
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[persona] 读取查询配置失败，用默认: {exc}")
+    return {}
+
+
+def _trigger_vocab() -> set:
+    """tier2+tier3 全部触发词（小写，长度 ≥2）——用于 SYSTEM 行的白名单判定。
+
+    刻意排除单字触发词（如「心」「铃」）：系统回执里出现「心」太容易，
+    拿它当白名单会把噪声放进来。宁可少纳入，不可误纳入。
+    每次现算不缓存（340 条目量级，微秒级），避免 ensure_loaded 重载后变脏。
+    """
+    vocab = set()
+    for lib in ("tier2", "tier3"):
+        for e in _state.get(lib) or []:
+            for k in (e.get("triggers") or []):
+                s = str(k).strip().lower()
+                if len(s) >= 2:
+                    vocab.add(s)
+    return vocab
+
+
+def _pick_query_parts(msgs: Any, include_bot: bool, bot_max: int,
+                      vocab: Optional[set] = None,
+                      include_sender_name: bool = False) -> List[str]:
+    """从「新→旧」的消息序列挑出参与检索的文本，按时间正序返回。
+
+    纯函数（不碰 DB / 全局状态），便于单测与复用。规则：
+      - 人类消息（sender_id != "-1"）：永远纳入；include_sender_name 时前面加发送者昵称
+      - SYSTEM 行：默认丢弃；vocab 非空且该行含触发词时纳入（白名单）
+      - bot 自己的回复：include_bot 且未超 bot_max 时纳入
+      - bot/SYSTEM 行**永不**加发送者名字（见下）
+
+    按「新→旧」遍历再反转，所以 bot_max 截断保留的是**最近**的 bot 回复，
+    而不是最早的 —— 这一点写反会让救回失效（旧回复早就不在当前话题里了）。
+
+    ⚠️ include_sender_name 只作用于人类消息：角色自己的 sender_name 就是人格名
+    （如某角色的名字），如果也给 bot 行加，而人格名恰好是某条记忆的触发词，就会变成
+    **每轮自我触发**，把自己那条记忆永久钉死。
+    """
+    kept: List[str] = []
+    bot_used = 0
+    for m in msgs:
+        raw = getattr(m, "content_text", None)
+        cleaned = _clean_query_text(raw) if raw else ""
+        if not cleaned:
+            continue
+        if str(getattr(m, "sender_id", "")) != "-1":
+            if include_sender_name:
+                who = str(getattr(m, "sender_nickname", "") or "").strip() \
+                    or str(getattr(m, "sender_name", "") or "").strip()
+                if who:
+                    cleaned = f"{who} {cleaned}"
+            kept.append(cleaned)                      # 人类消息：永远纳入
+            continue
+        if str(getattr(m, "sender_name", "") or "") == "SYSTEM":
+            if vocab and any(k in cleaned.lower() for k in vocab):
+                kept.append(cleaned)                  # 白名单：仅含触发词的工具事实
+            continue
+        if include_bot and bot_used < bot_max:        # bot 自己的回复
+            kept.append(cleaned)
+            bot_used += 1
+    kept.reverse()
+    return kept
+
+
 async def _recent_text(ctx: Any, limit: int = TIER2_SCAN_MSGS) -> str:
-    """取最近若干条【非 bot】消息原文，作为匹配依据。
+    """取最近若干条消息原文，作为匹配依据。
 
     ⚠️ 必须用【最近消息原文】做 query，绝不用 LLM 生成
     （LLM query 是文档腔，实测 0.32 vs 原文 0.49）。
+
+    v2.0.x 的四处调整（都有实测依据）：
+
+    1) 剥掉平台标记噪声（_QUERY_NOISE）。实测（tier3，标题+5 条）：干净闲聊
+       0.431 / 真实标记噪声 0.328 —— 光标记就能把正确条目的自匹配分压到 0.35
+       阈值以下，是召回的主要杀手。注意 @ 提及是**只剥标记、保留昵称**：
+       实测 2620 个群成员昵称里有 10 个本身就是触发词，整段删除会漏召回。
+
+    2) QUERY_INCLUDE_BOT：纳入 bot 自己的回复。动机是**工具事实拿不到**——
+       face 插件是 AGENT 型，识别结果经 push_system_message 落库为
+       sender_id='-1' 的 SYSTEM 行，被本函数排除；于是「识别出的角色名明明
+       命中 trigger，却不产生注入」。实测 59 次识别事件中 36 次（61%）的名字
+       就是 tier3 触发词，且**全部零注入**；而这 36 次里有 34 次（94%）bot 的
+       回复里复述了该名字 ← 所以纳入 bot 回复即可救回。
+       用 QUERY_BOT_MAX 封顶，防止自我引用循环占满扫描窗口。
+
+    3) SYSTEM 行默认**永不纳入**（工具回执、「已调整…好感度：+2」、msg_id
+       转储全是噪声）。仅当 QUERY_INCLUDE_TOOL_FACTS 开启、且该行**含已知
+       触发词**时才纳入 —— 这是白名单而非黑名单：不含触发词的 SYSTEM 行
+       结构上就进不来，上游以后新增别的系统消息也不会漏进来。
+
+    4) QUERY_INCLUDE_SENDER_NAME：在**人类**消息前加上发送者群昵称，让「谁在说话」
+       也成为检索依据（多人 RP 群里以角色名活动的成员发言时更容易被想起）。
+       实测影响约 3% 的消息（3242/106449）。**只作用于人类消息**：角色自己的
+       sender_name 就是人格名，而人格名常常正好是某条记忆的触发词，
+       给 bot 行也加会变成每轮自我触发、把自己那条记忆永久钉死。
+
+    注：记忆块在回合开始时构建一次（run_agent.py:81），AGENT 工具回灌后的
+    再提问不会重建它，所以以上救回都**从下一轮生效**，这是结构性的。
     """
     try:
         from nekro_agent.models.db_chat_message import DBChatMessage
@@ -1138,13 +1301,17 @@ async def _recent_text(ctx: Any, limit: int = TIER2_SCAN_MSGS) -> str:
         ck = getattr(ctx, "chat_key", None)
         if not ck:
             return ""
+
+        qc = _query_cfg()
+        include_bot = bool(qc.get("include_bot", False))
+        bot_max = max(0, int(qc.get("bot_max", 0) or 0))
+        include_facts = bool(qc.get("include_tool_facts", False))
+        include_sender_name = bool(qc.get("include_sender_name", False))
+        vocab = _trigger_vocab() if include_facts else None
+
         msgs = await DBChatMessage.filter(chat_key=ck).order_by("-id").limit(max(1, int(limit))).all()
-        parts = [
-            m.content_text.strip()
-            for m in reversed(msgs)
-            if m.sender_id != "-1" and m.content_text and m.content_text.strip()
-        ]
-        return " ".join(parts)
+        return " ".join(_pick_query_parts(msgs, include_bot, bot_max, vocab,
+                                          include_sender_name))
     except Exception as e:  # noqa: BLE001
         logger.debug(f"[persona] 读取最近消息失败: {e}")
         return ""
@@ -1192,7 +1359,12 @@ async def _vector_hits(
     try:
         qv = await _embed_query(text)
     except Exception as e:  # noqa: BLE001
-        logger.debug(f"[persona] query 嵌入失败，跳过向量匹配: {e}")
+        # v2.0.x：以前这里是 debug 级。嵌入端点限流（实测 429 相当常见）时
+        # 向量检索会**静默归零**，日志里完全看不出来，只剩关键词在工作。
+        # 提到 warning，并把影响面说清楚，避免「检索莫名其妙变差」查不到原因。
+        logger.warning(
+            f"[persona] query 嵌入失败，本轮向量匹配跳过（仅剩关键词可用）: {e}"
+        )
         return []
     scored: List[Tuple[float, Dict[str, Any]]] = []
     for e, v in zip(items, vecs):
@@ -1218,10 +1390,23 @@ async def _match_tier2_text(
         return [], ""
     now = time.time()
     kw = _keyword_hits(text)
-    if kw:
+    # 预算感知合并（v2.0.x）：旧实现在关键词命中时**直接 return**，向量检索完全不跑，
+    # 实测会因此丢掉 3 条语义相关条目。但关键词恒为 1.0，向量分（cos）
+    # 永远插不到它前面——所以只有预算还有空位时跑向量才有意义，否则白花一次嵌入。
+    if len(kw) >= int(s["max_entries"]):
         return _order_by_heat([(1.0, "keyword", e) for e in kw], 2, now, lc), "keyword"
     vh = await _vector_hits(text, threshold=s["threshold"])
-    return _order_by_heat([(float(sc), "vector", e) for sc, e in vh], 2, now, lc), "vector"
+    merged: Dict[str, ScoredEntry] = {}
+    for e in kw:
+        merged[str(e.get("id"))] = (1.0, "keyword", e)
+    for sc, e in vh:
+        k = str(e.get("id"))
+        if k not in merged:
+            merged[k] = (float(sc), "vector", e)
+    if not merged:
+        return [], ""
+    src = "mixed" if (kw and vh) else ("keyword" if kw else "vector")
+    return _order_by_heat(list(merged.values()), 2, now, lc), src
 
 
 async def _match_tier2(
@@ -1248,12 +1433,23 @@ async def _match_tier3_text(
     lc = lifecycle_settings(cfg.get("lifecycle"))
     now = time.time()
     kw = _keyword_hits(text, items)
-    if kw:
+    # 与 2 档同款预算感知合并：关键词填满预算就不再跑向量（详见 _match_tier2_text）。
+    if len(kw) >= int(cfg.get("max_entries", MAX_TIER3_ENTRIES) or MAX_TIER3_ENTRIES):
         return _order_by_heat([(1.0, "keyword", e) for e in kw], 3, now, lc), "keyword"
     vh = await _vector_hits(
         text, items, _state["tier3_vecs"], cfg.get("threshold", TIER3_SIM_THRESHOLD),
     )
-    return _order_by_heat([(float(sc), "vector", e) for sc, e in vh], 3, now, lc), "vector"
+    merged: Dict[str, ScoredEntry] = {}
+    for e in kw:
+        merged[str(e.get("id"))] = (1.0, "keyword", e)
+    for sc, e in vh:
+        k = str(e.get("id"))
+        if k not in merged:
+            merged[k] = (float(sc), "vector", e)
+    if not merged:
+        return [], ""
+    src = "mixed" if (kw and vh) else ("keyword" if kw else "vector")
+    return _order_by_heat(list(merged.values()), 3, now, lc), src
 
 
 async def _match_tier3(ctx: Any, cfg: Dict[str, Any]) -> Tuple[List[ScoredEntry], str]:

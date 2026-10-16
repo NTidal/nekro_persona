@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.0.0",
+    version="2.0.1",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -180,6 +180,44 @@ class FavorabilityConfig(ConfigBase):
     TIER3_SCAN_MSGS: int = _fav_field(
         6, "3 档扫描消息条数", "判断「是否提到」时回看多少条最近消息",
         en_title="Tier 3 Scan Depth", en_desc="Recent messages scanned to decide whether a topic came up",
+    )
+
+    # ==================== 查询文本构成（v2.0.x）====================
+    # 默认全部保持旧行为（只纳入人类消息）。开启理由见 memory._recent_text 的注释：
+    # 工具识别结果（如人脸识别出的角色名）落库为 SYSTEM 行，本不参与检索，
+    # 而角色自己的回复里通常会复述该名字 —— 纳入 bot 回复即可救回。
+    QUERY_INCLUDE_BOT: bool = _fav_field(
+        False, "检索文本纳入角色自己的回复",
+        "开启后角色自己的回复也参与关键词匹配。用于救回「工具识别结果」——"
+        "例如人脸识别出的角色名，它落库为系统消息本不参与检索，"
+        "但角色回复里通常会复述该名字，于是下一轮就能命中该角色的记忆。"
+        "默认关闭（保持旧行为）。",
+        en_title="Include Bot Replies in Query",
+        en_desc="Let the character's own replies participate in keyword matching (recovers tool-recognized names)",
+    )
+    QUERY_BOT_MAX: int = _fav_field(
+        2, "纳入角色回复条数上限",
+        "最多纳入最近几条角色回复；用于防止「自我引用循环」占满扫描窗口。"
+        "仅在上面的开关打开时生效。",
+        en_title="Max Bot Replies in Query",
+        en_desc="Cap on how many recent bot replies enter the query text (guards against self-reinforcement)",
+    )
+    QUERY_INCLUDE_TOOL_FACTS: bool = _fav_field(
+        False, "检索文本纳入含触发词的系统消息",
+        "开启后，系统消息（工具结果）**仅在其包含已知触发词时**才参与检索。"
+        "这是白名单：好感度回执、msg_id 转储等噪声不含触发词，结构上不会被纳入。"
+        "默认关闭。",
+        en_title="Include Tool Facts in Query",
+        en_desc="Include SYSTEM rows only when they contain a known trigger (whitelist, keeps receipts out)",
+    )
+    QUERY_INCLUDE_SENDER_NAME: bool = _fav_field(
+        False, "检索文本纳入发送者昵称",
+        "开启后每条**人类**消息前面加上发送者的群昵称，让「谁在说话」也成为检索依据 —— "
+        "多人 RP 群里以角色名活动的成员发言时，本角色会更容易想起对方。"
+        "⚠️ 只对人类消息生效，角色自己的名字不加（否则会自我触发）。"
+        "实测该开关会新增约 3% 消息（3242/106449）的触发。默认关闭。",
+        en_title="Include Sender Names in Query",
+        en_desc="Prefix each human message with its sender nickname; human senders only, never the bot's own name",
     )
 
     # ==================== 记忆生命周期（A2/A3，默认关闭）====================
@@ -515,6 +553,14 @@ tier4.configure_bg_dir(plugin.get_plugin_data_dir() / "backgrounds")
 # v1.6.0：注入独立嵌入后端配置提供者（lambda 延迟解析 _embed_cfg，因其定义在后）。
 # memory.py 每次嵌入实时读取，故 WebUI 改 EMBED_* 后无需重启即生效。
 persona_memory.set_embed_config_provider(lambda: _embed_cfg())
+# v2.0.x：注入「查询文本构成」配置提供者（同样是 lambda 延迟解析，WebUI 改完即时生效）。
+# 决定 _recent_text 是否纳入 bot 回复 / 含触发词的系统消息，见 memory._recent_text。
+persona_memory.set_query_config_provider(lambda: {
+    "include_bot": bool(getattr(config, "QUERY_INCLUDE_BOT", False)),
+    "bot_max": int(getattr(config, "QUERY_BOT_MAX", 2) or 0),
+    "include_tool_facts": bool(getattr(config, "QUERY_INCLUDE_TOOL_FACTS", False)),
+    "include_sender_name": bool(getattr(config, "QUERY_INCLUDE_SENDER_NAME", False)),
+})
 
 
 def _ts_now() -> int:
