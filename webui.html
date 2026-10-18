@@ -464,6 +464,10 @@
   .field-label { display: grid; gap: 6px; color: var(--text-soft); font-size: 11px; }
   .field-label small { color: var(--muted); font-size: 10px; }
   .field-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  /* 等高行：input 与 textarea 同高（回避块的「块标题 / 说明」） */
+  .field-row.equal-h { align-items: start; }
+  .field-row.equal-h > .field-label > .field,
+  .field-row.equal-h > .field-label > .textarea { min-height: 94px; }
   .field-grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
   /* 提示条跨满整行，避免被挤进一列 */
   .field-grid-3 .overview-note { grid-column: 1 / -1; }
@@ -512,6 +516,9 @@
   .data-table .channel-row td { padding-top: 7px; padding-bottom: 7px; color: var(--muted); background: rgba(255,255,255,.012); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9px; }
   .entry-id { display: block; max-width: 160px; overflow: hidden; color: #666d7a; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
   .entry-title { display: block; max-width: 220px; overflow: hidden; color: var(--text); font-size: 12px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
+  .heat-flag { margin-left: 2px; font-size: 11px; line-height: 1; cursor: help; }
+  /* 弹窗里独占一行的开关：左侧说明文字与 field-label 同字号同色 */
+  .dialog-body .switch-row > span:first-child { color: var(--text-soft); font-size: 11px; }
   .entry-preview { display: -webkit-box; max-width: 280px; margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 10px; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
   .table-actions { display: flex; align-items: center; justify-content: flex-end; gap: 5px; }
   /* 扩展：操作列的 td 不能再是 flex —— 那样它就不是 table-cell，
@@ -619,8 +626,11 @@
     display: grid;
     grid-template-columns: minmax(240px, 1fr) minmax(250px, .8fr) auto;
     gap: 16px;
-    align-items: end;
+    /* 顶部对齐：目标频道与好感度从同一行起步（原先 end 会把它压到最底部） */
+    align-items: start;
   }
+  /* 只有按钮行贴底——它作用于整块控制区，跟底部预设按钮齐平更好看 */
+  .preview-control > .row { align-self: end; }
   .score-control { display: grid; gap: 9px; }
   .score-top { display: flex; align-items: center; justify-content: space-between; color: var(--text-soft); font-size: 11px; }
   .score-top-actions { display: flex; align-items: center; gap: 7px; }
@@ -1193,17 +1203,17 @@
 
       <section class="panel rule-section" data-rule-section="growth">
         <div class="panel-head">
-          <div><h2 class="panel-title">生长包（tier4 + 关系档案 + 热度）</h2><div class="panel-subtitle">把"这一世活过的痕迹"打包迁移/备份——<strong>私密</strong>，与上面的公开种子包彻底分离。</div></div>
+          <div><h2 class="panel-title">生长包（tier4 + 关系档案）</h2><div class="panel-subtitle">把"这一世活过的痕迹"打包迁移/备份——<strong>私密</strong>，与上面的公开种子包彻底分离。</div></div>
         </div>
         <div class="panel-body rule-grid">
           <div class="config-box">
             <button class="btn" id="exportGrowthBtn" type="button">导出生长包（zip）</button>
-            <div class="hint" style="margin-top:8px">包含 tier4.json（身份锚点+频道笔记）、各频道关系档案、.hit_stats.json、迁移报告 _migrations.json、频道索引。<strong>不含</strong> tier1/2/3、favor.json、preset。导入种子包不会动这些，反之亦然。</div>
+            <div class="hint" style="margin-top:8px">包含 tier4.json（身份锚点+频道笔记）、各频道关系档案、迁移报告 _migrations.json、频道索引。<strong>不含</strong> tier1/2/3、favor.json、preset；也<strong>不含</strong>热度（命中统计按条目 id 记录，换过 tier2/3 内容就会错位，故不随包迁移）。</div>
           </div>
           <div class="config-box">
             <input id="importGrowthFile" class="field" type="file" accept=".zip">
             <button class="btn primary" id="importGrowthBtn" type="button" style="margin-top:8px">导入生长包（覆盖生长数据）</button>
-            <div class="hint" style="margin-top:8px">只写 tier4 + 关系档案 + 热度，<strong>不碰种子</strong>；导入前自动备份当前生长状态到 _growth_import_backups/。档案与 tier4 即时生效，热度需重启重读。</div>
+            <div class="hint" style="margin-top:8px">只写 tier4 + 关系档案，<strong>不碰种子</strong>；导入前自动备份当前生长状态到 _growth_import_backups/。两者均即时生效，本实例的热度不受影响。</div>
           </div>
         </div>
       </section>
@@ -1287,7 +1297,7 @@
           <button class="btn primary" type="button" data-save-rule="avoid">保存</button>
         </div>
         <div class="panel-body">
-          <div class="field-row">
+          <div class="field-row equal-h">
             <label class="field-label">块标题<input id="avoidHeader" class="field" maxlength="60"><small id="avoidHeaderCount">0 / 60</small></label>
             <label class="field-label">说明<textarea id="avoidNote" class="textarea" maxlength="600"></textarea><small id="avoidNoteCount">0 / 600</small></label>
           </div>
@@ -1375,19 +1385,16 @@
 <dialog id="entryDialog" aria-labelledby="entryDialogTitle">
   <form id="entryForm">
     <div class="dialog-head">
-      <div><h2 id="entryDialogTitle">编辑记忆条目</h2><p id="entryDialogSubtitle">修改后自动写入原 JSON 文件并重载</p></div>
+      <div><h2 id="entryDialogTitle">编辑记忆条目</h2><p id="entryDialogSubtitle">修改后自动写入原 JSON 文件并重载</p><p class="hint mono" id="entryIdentity" style="margin-top:3px"></p></div>
       <button class="btn icon-only ghost" type="button" data-close-dialog="entryDialog" aria-label="关闭">×</button>
     </div>
     <div class="dialog-body">
+      <label class="field-label">标题<input id="entryTitle" class="field" maxlength="80" required><small id="entryTitleCount">0 / 80</small></label>
       <div class="field-row">
-        <label class="field-label">标题<input id="entryTitle" class="field" maxlength="80" required><small id="entryTitleCount">0 / 80</small></label>
-        <label class="field-label">文件 / ID<div id="entryIdentity" class="field mono" style="display:flex;align-items:center;color:var(--muted)"></div></label>
-      </div>
-      <div class="field-grid-3">
         <label class="field-label">披露门槛<input id="entryMinFavor" class="field" type="number" min="0" max="100" required><small>0 = 公开</small></label>
-        <label class="field-label">权重<input id="entryWeight" class="field" type="number" min="1" max="999" required></label>
-        <div class="field-label">状态<div class="switch-row" style="min-height:34px;padding:0"><span class="hint">是否参与注入</span><label class="switch"><input id="entryEnabled" type="checkbox" aria-label="是否参与注入"><span></span></label></div></div>
+        <label class="field-label">权重<input id="entryWeight" class="field" type="number" min="1" max="999" required><small>越大，超预算时越优先保留</small></label>
       </div>
+      <div class="switch-row"><span>是否参与注入</span><label class="switch"><input id="entryEnabled" type="checkbox" aria-label="是否参与注入"><span></span></label></div>
       <label class="field-label" id="entryFamiliarityWrap" hidden>熟悉度<select id="entryFamiliarity" class="select"><option value="">（未标注）</option><option value="熟人">熟人 · 可聊细节</option><option value="听说">听说 · 只知大概</option><option value="仅传闻">仅传闻 · 含糊带过</option></select><small>3 档专用：决定她对这个人/地方的语气分寸（她不该"全知"）</small></label>
       <label class="field-label"><span id="entryTriggerLabel">触发说明</span><input id="entryTrigger" class="field" maxlength="200"><small id="entryTriggerCount">0 / 200</small></label>
       <label class="field-label">记忆内容<textarea id="entryContent" class="textarea" style="min-height:180px" maxlength="2000" required></textarea><small id="entryContentCount">0 / 2000</small><small>建议使用第一人称描述亲身经历或稳定记忆。</small></label>
@@ -1412,11 +1419,11 @@
         <label class="field-label">条目 ID（可选）<input id="newId" class="field" maxlength="48"></label>
       </div>
       <label class="field-label">标题<input id="newTitle" class="field" maxlength="80" required><small id="newTitleCount">0 / 80</small></label>
-      <div class="field-grid-3">
-        <label class="field-label">披露门槛<input id="newMinFavor" class="field" type="number" min="0" max="100" value="0"></label>
-        <label class="field-label">权重<input id="newWeight" class="field" type="number" min="1" max="999" value="1"></label>
-        <div class="field-label">状态<div class="switch-row" style="min-height:34px;padding:0"><span class="hint">创建后立即启用</span><label class="switch"><input id="newEnabled" type="checkbox" checked aria-label="创建后立即启用"><span></span></label></div></div>
+      <div class="field-row">
+        <label class="field-label">披露门槛<input id="newMinFavor" class="field" type="number" min="0" max="100" value="0"><small>0 = 公开</small></label>
+        <label class="field-label">权重<input id="newWeight" class="field" type="number" min="1" max="999" value="1"><small>越大，超预算时越优先保留</small></label>
       </div>
+      <div class="switch-row"><span>创建后立即启用</span><label class="switch"><input id="newEnabled" type="checkbox" checked aria-label="创建后立即启用"><span></span></label></div>
       <label class="field-label" id="newFamiliarityWrap" hidden>熟悉度<select id="newFamiliarity" class="select"><option value="">（未标注）</option><option value="熟人">熟人 · 可聊细节</option><option value="听说">听说 · 只知大概</option><option value="仅传闻">仅传闻 · 含糊带过</option></select><small>3 档专用：决定语气分寸</small></label>
       <label class="field-label"><span id="newTriggerLabel">触发说明</span><input id="newTrigger" class="field" maxlength="200"><small id="newTriggerCount">0 / 200</small></label>
       <label class="field-label">记忆内容<textarea id="newContent" class="textarea" style="min-height:180px" maxlength="2000" required></textarea><small id="newContentCount">0 / 2000</small></label>
@@ -1917,16 +1924,7 @@ function renderOverview(data) {
       <div class="metric warning"><div class="metric-label">向量状态</div><div class="metric-value">${vectors}<small>/ ${Number(tier2.count || 0)}</small></div><div class="metric-note">相似度阈值 ${escapeHtml(tier2.threshold ?? '—')}</div><div class="meter warning"><i style="width:${vectorPct}%"></i></div></div>
       <div class="metric ${tier3.enabled === false ? '' : 'info'}"><div class="metric-label">3 档 · 世界知识</div><div class="metric-value">${Number(tier3.count || 0)}<small>条</small></div><div class="metric-note">${tier3.enabled === false ? '已停用' : '客观见闻 · 不受门控'}</div><div class="meter"><i style="width:${clampPercent(Number(tier3.count || 0) / 50 * 100)}%"></i></div></div>
     </div>
-    <div class="two-col">
-      <section class="panel">
-        <div class="panel-head"><div><h2 class="panel-title">关系衰减</h2><div class="panel-subtitle">后台定时维护长期关系新鲜度</div></div>${decay.enabled ? '<span class="badge success">运行中</span>' : '<span class="badge">已关闭</span>'}</div>
-        <div class="panel-body">
-          <div class="status-line"><span class="status-name">结算间隔</span><span class="status-value">${Number(decay.interval_hours || 0)} 小时</span></div>
-          <div class="status-line"><span class="status-name">单次扣除</span><span class="status-value">${Number(decay.percent || 0)}%</span></div>
-          <div class="status-line"><span class="status-name">保持当前档位</span><span class="status-value">${decay.keep_tier ? '是' : '否'}</span></div>
-          <div class="overview-note" style="margin-top:12px"><div>好感度 ≤ 0 不参与衰减。修改参数请前往 <button class="inline-link" type="button" data-jump="rules">规则与门控</button>。</div></div>
-        </div>
-      </section>
+    <div class="two-col" style="grid-template-columns:1fr">
       <section class="panel">
         <div class="panel-head"><div><h2 class="panel-title">三档预算与阈值</h2><div class="panel-subtitle">${writable ? '直接写回插件配置，保存后立即生效' : '当前只读 —— 未配置访问密钥，后端拒绝写操作'}</div></div><div class="panel-actions"><span id="budgetDirtyBadge" class="badge warning" hidden>有未保存修改</span><button class="btn primary" id="saveBudget" type="button"${writable ? '' : ' disabled'}>保存预算</button></div></div>
         <div class="panel-body">
@@ -1960,7 +1958,7 @@ function renderOverview(data) {
     </div>
     <div class="two-col">
       <section class="panel">
-        <div class="panel-head"><div><h2 class="panel-title">记忆生命周期 · 热度排序</h2><div class="panel-subtitle">常想起的记忆更稳，冷门的在超预算时优先让位</div></div><div class="panel-actions"><span id="lcDirtyBadge" class="badge warning" hidden>有未保存修改</span><button class="btn primary" id="saveLifecycle" type="button"${writable ? '' : ' disabled'}>保存</button></div></div>
+        <div class="panel-head"><div><h2 class="panel-title">记忆生命周期 · 热度排序</h2><div class="panel-subtitle">常想起的记忆更稳，冷门的在超预算时优先让位</div></div><div class="panel-actions"><span id="lcDirtyBadge" class="badge warning" hidden>有未保存修改</span><button class="btn" id="resetHeat" type="button"${writable ? '' : ' disabled'} title="清空命中统计，把全部条目的热度归零">重置热度</button><button class="btn primary" id="saveLifecycle" type="button"${writable ? '' : ' disabled'}>保存</button></div></div>
         <div class="panel-body">
           <div class="switch-row">
             <div class="switch-copy"><strong>启用热度排序</strong><small>只影响 2/3 档的排序与截断，绝不删除或改写你的内容；关闭时行为完全不变</small></div>
@@ -1995,6 +1993,14 @@ function renderOverview(data) {
       <div class="panel-head"><div><h2 class="panel-title">好感度门控</h2><div class="panel-subtitle">分数区间与对应的互动指引</div></div><button class="btn" type="button" data-jump="rules">编辑规则</button></div>
       <div class="table-wrap"><table class="data-table"><thead><tr><th>档位</th><th>分数区间</th><th>互动指引</th></tr></thead><tbody>${stageRows}</tbody></table></div>
       <div class="panel-body" style="border-top:1px solid var(--line)">
+        <div class="hint" style="margin-bottom:7px">关系衰减 <span class="badge ${decay.enabled ? 'success' : ''}">${decay.enabled ? '运行中' : '已关闭'}</span></div>
+        <div class="badge-row">
+          <span class="badge">结算间隔 ${Number(decay.interval_hours || 0)} 小时</span>
+          <span class="badge">单次扣除 ${Number(decay.percent || 0)}%</span>
+          <span class="badge">保持当前档位 ${decay.keep_tier ? '是' : '否'}</span>
+        </div>
+        <div class="hint" style="margin-top:6px">好感度 ≤ 0 不参与衰减。参数在 <button class="inline-link" type="button" data-jump="rules">规则与门控</button> 里修改。</div>
+        <div style="margin:14px 0;border-top:1px solid var(--line)"></div>
         <div class="hint" style="margin-bottom:7px">1 档门槛分布</div><div class="badge-row">${dist1}</div>
         <div class="hint" style="margin:12px 0 7px">2 档门槛分布</div><div class="badge-row">${dist2}</div>
         <div class="hint" style="margin:12px 0 7px">3 档 · 世界知识</div><div class="badge-row"><span class="badge">${Number(tier3.count || 0)} 条 · <b>不受好感度门控</b>（常识不该因为不熟就不说）</span></div>
@@ -2502,7 +2508,7 @@ function renderMemory() {
       ? (entry.trigger ? `<span class="truncate" style="display:block;max-width:210px;color:var(--muted)" title="${escapeHtml(entry.trigger)}">${escapeHtml(entry.trigger)}</span>` : '<span class="muted">—</span>')
       : ((entry.triggers || []).length ? (entry.triggers || []).slice(0, 3).map(item => `<span class="badge">${escapeHtml(item)}</span>`).join(' ') + ((entry.triggers || []).length > 3 ? ` <span class="muted">+${entry.triggers.length - 3}</span>` : '') : '<span class="muted">—</span>');
     return `<tr data-memory-tier="${escapeHtml(entry.tier)}" data-memory-id="${escapeHtml(entry.id)}">
-      <td data-label="条目"><span class="entry-title" title="${escapeHtml(entry.title || entry.id)}">${escapeHtml(entry.title || '未命名条目')}</span><span class="entry-id" title="${escapeHtml(entry.id)}">${escapeHtml(entry.id)}</span><div class="entry-preview">${escapeHtml(entry.content || '暂无内容')}</div><div class="hint" style="margin-top:3px">${Number(entry.rendered_chars || 0)} 字</div></td>
+      <td data-label="条目"><span class="entry-title" title="${escapeHtml(entry.title || entry.id)}${entry.heat_on ? ' · 受热度影响（热度 ' + Number(entry.heat).toFixed(2) + ' · 命中 ' + Number(entry.hits || 0) + ' 次）' : ''}">${escapeHtml(entry.title || '未命名条目')}${entry.heat_on ? '<span class="heat-flag" title="被热度影响">🔥</span>' : ''}</span><span class="entry-id" title="${escapeHtml(entry.id)}">${escapeHtml(entry.id)}</span><div class="entry-preview">${escapeHtml(entry.content || '暂无内容')}</div><div class="hint" style="margin-top:3px">${Number(entry.rendered_chars || 0)} 字</div></td>
       <td data-label="披露门槛"><div class="badge-row">${entry.tier === 'tier3'
         ? (entry.familiarity ? `<span class="badge accent">${escapeHtml(entry.familiarity)}</span>` : '<span class="badge">未标注</span>') + '<span class="badge">不受门控</span>'
         : (Number(entry.min_favor || 0) > 0 ? `<span class="badge accent">+${Number(entry.min_favor || 0)}</span>${stageBadge(entry.stage)}` : '<span class="badge success">公开</span>')}</div></td>
@@ -3277,6 +3283,23 @@ function wireEvents() {
       }
     } finally {
       button.disabled = false;
+    }
+  });
+  $('#overviewContent').addEventListener('click', async event => {
+    const button = event.target.closest('#resetHeat');
+    if (!button) return;
+    if (!window.confirm('确定重置热度吗？\n\n会清空本实例当前作用域的全部命中统计，2/3 档排序立刻回到「无热度」状态。\n命中次数无法恢复，此操作不可撤销。')) return;
+    button.disabled = true;
+    try {
+      const res = await api('heat/reset', { method: 'POST', body: {} });
+      toast(`已重置热度：清空 ${Number(res.cleared || 0)} 条命中统计`, 'success');
+      await loadOverview({ quiet: true });
+    } catch (error) {
+      if (/WEBUI_ACCESS_KEY|写操作已禁用/.test(error.message)) {
+        toast('重置被拒绝：未配置 WEBUI_ACCESS_KEY，写操作已禁用。', 'error');
+      } else {
+        toast(`重置失败：${error.message}`, 'error');
+      }
     }
   });
   $('#overviewContent').addEventListener('click', async event => {

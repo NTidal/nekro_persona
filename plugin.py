@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.0.2",
+    version="2.0.3",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -1862,7 +1862,7 @@ def _mystery_reason(profile: UserArchive, verb: str) -> str:
 def _parse_chat_target(chat_key: str) -> tuple[str, str]:
     """从 chat_key 解析 (chat_type, chat_id)，供 OneBot 直发使用。
 
-    例: onebot_v11-group_123456 -> ("group", "123456")
+    例: onebot_v11-group_xxx -> ("group", "xxx")
     """
     if "-" in chat_key:
         _, target = chat_key.split("-", 1)

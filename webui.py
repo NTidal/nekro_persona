@@ -21,6 +21,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -715,6 +716,50 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     continue
             return ""
 
+        # 热度标识（v2.0.3）：供列表在标题后标 🔥。
+        # 判定：生命周期开启 **且** 该条目真的被命中过（hits > 0）。
+        # 为什么加 hits > 0 这一条：热度开启后，从未命中的条目一律落在 floor（0.6），
+        # 若按「heat != 1.0」标记，286 条会全部挂 🔥，标识就没有信息量了。
+        _heat_snap = memory.hit_stats_snapshot()
+        _heat_now = time.time()
+        try:
+            _lc_t2 = memory.lifecycle_settings(_tier2_cfg().get("lifecycle"))
+        except Exception:  # noqa: BLE001
+            _lc_t2 = {"enabled": False, "half_life_days": 30, "floor": 0.6,
+                      "protect_weight": 4, "reinforce_bonus": 10}
+        try:
+            _lc_t3 = memory.lifecycle_settings(_t3_cfg().get("lifecycle"))
+        except Exception:  # noqa: BLE001
+            _lc_t3 = {"enabled": False, "half_life_days": 30, "floor": 0.6,
+                      "protect_weight": 4, "reinforce_bonus": 10}
+
+        def _heat_of(e: Dict[str, Any], tier: str) -> Dict[str, Any]:
+            """该条目的热度信息。tier1 不参与热度排序，恒为关闭。"""
+            if tier == "tier2":
+                lc, num = _lc_t2, 2
+            elif tier == "tier3":
+                lc, num = _lc_t3, 3
+            else:
+                return {"hits": 0, "heat": 1.0, "heat_enabled": False,
+                        "heat_on": False}
+            eid = str(e.get("id", "") or "").strip()
+            stat = _heat_snap.get(memory._hit_key(num, eid)) or {}
+            try:
+                hits = int(stat.get("hits", 0) or 0)
+            except (TypeError, ValueError):
+                hits = 0
+            try:
+                heat = round(float(memory.heat_factor(stat, _heat_now, lc)), 3)
+            except Exception:  # noqa: BLE001
+                heat = 1.0
+            enabled = bool(lc.get("enabled"))
+            return {
+                "hits": hits,
+                "heat": heat,
+                "heat_enabled": enabled,
+                "heat_on": bool(enabled and hits > 0),
+            }
+
         def _deco(items: List[Dict[str, Any]], tier: str) -> List[Dict[str, Any]]:
             out = []
             for e in items:
@@ -736,6 +781,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                         "trigger_chars": _text_length(e.get("trigger")) + sum(_text_length(x) for x in (e.get("triggers") or [])),
                         "rendered_chars": _entry_render_chars(e) if tier == "tier1" else _text_length(e.get("content")),
                         "file": e.get("_file", ""),
+                        **_heat_of(e, tier),
                     },
                 )
             return out
@@ -1651,12 +1697,18 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             },
         )
 
-    # ==================== 阶段 C：生长包（tier4 + 关系档案 + hit_stats，私密）====================
+    # ==================== 阶段 C：生长包（tier4 + 关系档案，私密）====================
     # 与公开「种子包」彻底分离：生长包是"这一世活过的痕迹"，用于实例间迁移/备份。
-    # 只含 tier4.json + 各频道关系档案 + .hit_stats.json + 迁移报告/频道索引；
+    # 只含 tier4.json + 各频道关系档案 + 迁移报告/频道索引；
     # **不含** tier1/2/3、favor.json、presets。关系档案用 `archives.json`（按 chat_key 建索引），
     # 因为档案 blob 本身不含 chat_key，按文件名 hash 无法反推——用字典才无损。
-    @router.get("/api/growth/export", summary="导出生长包（tier4 + 关系档案 + hit_stats，私密）")
+    #
+    # ⚠️ 热度（.hit_stats.json）**刻意不导出/不导入**（v2.0.3 起）：
+    #    命中统计是按 entry id 记的，一旦目标实例的 tier2/tier3 内容与来源不同
+    #    （改了条目、换了人设、id 复用给了别的条目），旧的热度就会张冠李戴，
+    #    表现为"某条完全没被聊过的记忆莫名很热"。热度是**本实例的使用痕迹**，
+    #    应当由本实例自行累积；迁移人设时它毫无意义，因此从包里剔除。
+    @router.get("/api/growth/export", summary="导出生长包（tier4 + 关系档案，私密）")
     async def api_growth_export(request: Request):
         _check_key(request)
         import io as _io
@@ -1689,9 +1741,6 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 p = t4.bg_dir() / name
                 if p.is_file():
                     zf.writestr(f"backgrounds/{name}", p.read_bytes())
-            hs = _bg_dir() / ".hit_stats.json"
-            if hs.is_file():
-                zf.writestr("backgrounds/.hit_stats.json", hs.read_bytes())
             archives = await helpers["enumerate_archives"]()
             arch_objs: Dict[str, Any] = {}
             for ck, raw in archives.items():
@@ -1717,7 +1766,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             headers={"Content-Disposition": f'attachment; filename="growth_bundle_{stamp}.zip"'},
         )
 
-    @router.post("/api/growth/import", summary="导入生长包（只写 tier4 + 关系档案 + hit_stats，不碰种子）")
+    @router.post("/api/growth/import", summary="导入生长包（只写 tier4 + 关系档案，不碰种子）")
     async def api_growth_import(request: Request) -> Dict[str, Any]:
         _check_key(request)
         body = await request.body()
@@ -1734,9 +1783,8 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         names = set(zf.namelist())
         t4 = helpers["tier4"]
 
-        if not any(n.endswith("tier4.json") or n == "archives.json" or n.endswith(".hit_stats.json")
-                   for n in names):
-            raise HTTPException(status_code=400, detail="包里没有可导入的生长数据（tier4.json / archives.json / .hit_stats.json）")
+        if not any(n.endswith("tier4.json") or n == "archives.json" for n in names):
+            raise HTTPException(status_code=400, detail="包里没有可导入的生长数据（tier4.json / archives.json）")
 
         # 导入前备份当前生长状态（tier4.json + hit_stats）到 _growth_import_backups/<stamp>/
         stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1744,8 +1792,6 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         bdir.mkdir(parents=True, exist_ok=True)
         if t4.tier4_path().is_file():
             shutil.copy2(t4.tier4_path(), bdir / "tier4.json")
-        if (_bg_dir() / ".hit_stats.json").is_file():
-            shutil.copy2(_bg_dir() / ".hit_stats.json", bdir / ".hit_stats.json")
 
         applied: List[str] = []
 
@@ -1778,11 +1824,8 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     n_arch += 1
             applied.append(f"关系档案（{n_arch} 频道）")
 
-        # 3) .hit_stats.json —— 覆盖（内存命中共振需重启才重读，见返回提示）
-        hs_src = next((n for n in names if n.endswith(".hit_stats.json")), None)
-        if hs_src:
-            (_bg_dir() / ".hit_stats.json").write_bytes(zf.read(hs_src))
-            applied.append(".hit_stats.json")
+        # 3) 热度（.hit_stats.json）**不迁移** —— 见 api_growth_export 的说明。
+        #    旧包里若带了这个文件，直接忽略（向后兼容）。
 
         reload_state = await _reload_after_write()
         plugin.logger.info(f"[growth] WebUI 导入生长包: {applied}（种子数据未改动）")
@@ -1790,7 +1833,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "ok": True,
             "applied": applied,
             "backup_dir": str(bdir),
-            "note": "关系档案即时生效；tier4 文件即时生效；.hit_stats 命中热度需重启后重读。",
+            "note": "关系档案与 tier4 即时生效；热度（命中统计）不随生长包迁移，由本实例自行累积。",
             **reload_state,
         }
 
@@ -1954,6 +1997,26 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "backup_dir": str(bdir),
             **reload_state,
         }
+
+    @router.post("/api/heat/reset", summary="重置热度（清空命中统计）")
+    async def api_heat_reset(request: Request) -> Dict[str, Any]:
+        """清空命中统计（.hit_stats.json），2/3 档排序立刻回到「无热度」状态。
+
+        只影响**当前作用域**（共享目录，或某个账号目录）—— 与热度本身的分目录语义一致。
+        重置后所有条目 heat 回到 1.0，等下一次命中重新累积。
+        """
+        _check_key(request)
+        st = memory._state()
+        before = len(st.get("hit_stats") or {})
+        st["hit_stats"] = {}
+        st["hit_dirty"] = False
+        st["query_cache"] = {}
+        try:
+            memory._save_hit_stats(st)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"写入命中统计失败：{exc}") from exc
+        plugin.logger.info(f"[persona] WebUI 重置热度：清空 {before} 条命中统计（{st.get('dir')}）")
+        return {"ok": True, "cleared": before, "dir": str(st.get("dir") or "")}
 
     @router.post("/api/reload", summary="重载背景记忆")
     async def api_reload(request: Request) -> Dict[str, Any]:
