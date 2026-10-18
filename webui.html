@@ -285,9 +285,13 @@
   .page-title { margin: 0; font-size: clamp(22px, 3vw, 28px); font-weight: 640; letter-spacing: -.025em; }
   .page-desc { max-width: 650px; margin: 5px 0 0; color: var(--muted); font-size: 12px; }
   .head-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+  /* 页头按钮不收缩（否则文字会被挤成两行），由下拉框让位 */
+  .head-actions > .btn { flex: 0 0 auto; }
+  .head-actions > .select { flex: 0 1 auto; min-width: 0; max-width: 380px; }
 
   .btn {
     display: inline-flex;
+    white-space: nowrap;
     align-items: center;
     justify-content: center;
     gap: 7px;
@@ -1144,6 +1148,12 @@
       </div>
       <div id="memoConfigBar" class="overview-note" style="margin-bottom:12px">加载中…</div>
       <div class="panel">
+        <div class="panel-body" style="border-bottom:1px solid var(--line)">
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <input id="memoSearch" class="field" type="search" placeholder="搜索标题 / 内容 / 检索词" aria-label="搜索备忘" autocomplete="off" style="max-width:320px">
+            <span id="memoSearchInfo" class="hint"></span>
+          </div>
+        </div>
         <div class="table-wrap">
           <table class="data-table" aria-label="备忘录">
             <thead><tr><th>备忘</th><th>门槛</th><th>有效期</th><th>更新时间</th><th>操作</th></tr></thead>
@@ -1521,7 +1531,7 @@ const state = {
   favorPage: 1,
   favorPageSize: 25,
   favorChannel: 'all',
-  memo: { channel: '', items: [], meta: null, editId: '' },
+  memo: { channel: '', items: [], meta: null, editId: '', query: '' },
   anchor: { items: [], meta: null },
   channels: null,
   channelsPromise: null,
@@ -2298,9 +2308,23 @@ async function loadMemos(options = {}) {
 function renderMemos() {
   const meta = state.memo.meta || {};
   $('#memoConfigBar').innerHTML = `单频道上限 <b>${Number(meta.max_items || 0)}</b> 条 · 单条上限 <b>${Number(meta.max_content || 0)}</b> 字 · 每轮注入最近 <b>${Number(meta.inject_recent || 0)}</b> 条 + 命中 <b>${Number(meta.inject_matched || 0)}</b> 条（共 ${Number(meta.inject_chars || 0)} 字预算）· 包含式去重最短标题 <b>${Number(meta.dedup_min_len || 2)}</b> 字${meta.enabled === false ? ' · <b>功能已停用</b>' : ''}`;
-  const items = state.memo.items || [];
-  if (!items.length) {
+  const all = state.memo.items || [];
+  if (!all.length) {
+    $('#memoSearchInfo').textContent = '';
     $('#memoBody').innerHTML = '<tr><td class="empty" colspan="5"><strong>该频道暂无备忘</strong>角色在对话里需要时会自己记；也可以点右上角新建。</td></tr>';
+    return;
+  }
+  // 搜索：标题 / 内容 / 检索词 三处做包含式匹配（不区分大小写）
+  const q = String(state.memo.query || '').trim().toLowerCase();
+  const items = q
+    ? all.filter(m => [m.title || '', m.content || '', (m.tags || []).join(' ')]
+        .join(' ').toLowerCase().includes(q))
+    : all;
+  $('#memoSearchInfo').textContent = q
+    ? `匹配 ${items.length} / ${all.length} 条`
+    : `共 ${all.length} 条`;
+  if (!items.length) {
+    $('#memoBody').innerHTML = '<tr><td class="empty" colspan="5"><strong>没有匹配的备忘</strong>换个短一点的关键词，或清空搜索框。命中范围：标题、内容、检索词。</td></tr>';
     return;
   }
   $('#memoBody').innerHTML = items.map(m => {
@@ -3430,6 +3454,10 @@ function wireEvents() {
   $('#memoChannel').addEventListener('change', () => {
     state.memo.channel = $('#memoChannel').value;
     loadMemos({ quiet: true });
+  });
+  $('#memoSearch').addEventListener('input', event => {
+    state.memo.query = event.currentTarget.value;
+    renderMemos();
   });
   $('#memoRefresh').addEventListener('click', event => withButton(event.currentTarget, () => loadMemos({ quiet: true })));
   $('#newMemoButton').addEventListener('click', openNewMemo);
