@@ -43,7 +43,7 @@ MAX_TIER1_CHARS = 2000       # 1 档硬上限，超限按 weight 降序截断
 MAX_TIER2_ENTRIES = 2        # 2 档单轮最多注入条数
 MAX_TIER2_CHARS = 500        # 2 档单轮字符预算
 TIER2_SIM_THRESHOLD = 0.35   # 2 档向量阈值（30 条实测标定：噪声上限 0.311 / 相关下限 0.351）
-TIER2_SCAN_MSGS = 6          # 判断"是否提到"时扫描的最近消息条数
+TIER2_SCAN_MSGS = 32         # 判断"是否提到"时扫描的最近消息条数
 
 # ---- 3 档：世界知识（扩展）----
 # 与 2 档的关键差异：
@@ -53,7 +53,7 @@ TIER2_SCAN_MSGS = 6          # 判断"是否提到"时扫描的最近消息条�
 MAX_TIER3_ENTRIES = 3        # 3 档单轮最多注入条数
 MAX_TIER3_CHARS = 700        # 3 档单轮字符预算
 TIER3_SIM_THRESHOLD = 0.35   # 3 档向量阈值（待用真实世界知识库标定）
-TIER3_SCAN_MSGS = 6          # 3 档扫描的最近消息条数
+TIER3_SCAN_MSGS = 32         # 3 档扫描的最近消息条数
 TIER3_ENABLED = True         # 3 档总开关（配置可覆盖）
 
 _PKG_BG_DIR = Path(__file__).parent / "backgrounds"

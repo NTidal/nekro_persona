@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.0.4",
+    version="2.0.5",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -154,7 +154,7 @@ class FavorabilityConfig(ConfigBase):
         en_desc="Retrieval threshold for tier 2; recalibrate as the library grows",
     )
     TIER2_SCAN_MSGS: int = _fav_field(
-        6, "2 档扫描消息条数", "判断「是否提到」时回看多少条最近消息",
+        32, "2 档扫描消息条数", "判断「是否提到」时回看多少条最近消息",
         en_title="Tier 2 Scan Depth", en_desc="Recent messages scanned to decide whether a topic came up",
     )
     TIER3_ENABLED: bool = _fav_field(
@@ -178,7 +178,7 @@ class FavorabilityConfig(ConfigBase):
         en_desc="Retrieval threshold for world knowledge; recalibrate as the library grows",
     )
     TIER3_SCAN_MSGS: int = _fav_field(
-        6, "3 档扫描消息条数", "判断「是否提到」时回看多少条最近消息",
+        32, "3 档扫描消息条数", "判断「是否提到」时回看多少条最近消息",
         en_title="Tier 3 Scan Depth", en_desc="Recent messages scanned to decide whether a topic came up",
     )
 
@@ -773,7 +773,7 @@ def _tier2_cfg() -> dict:
         "max_entries": int(getattr(config, "TIER2_MAX_ENTRIES", 2) or 2),
         "max_chars": int(getattr(config, "TIER2_MAX_CHARS", 500) or 500),
         "threshold": float(getattr(config, "TIER2_SIM_THRESHOLD", 0.35) or 0.35),
-        "scan_msgs": int(getattr(config, "TIER2_SCAN_MSGS", 6) or 6),
+        "scan_msgs": int(getattr(config, "TIER2_SCAN_MSGS", 32) or 32),
         "lifecycle": _lifecycle_cfg(),
     }
 
@@ -785,7 +785,7 @@ def _tier3_cfg() -> dict:
         "max_entries": int(getattr(config, "TIER3_MAX_ENTRIES", 3) or 3),
         "max_chars": int(getattr(config, "TIER3_MAX_CHARS", 700) or 700),
         "threshold": float(getattr(config, "TIER3_SIM_THRESHOLD", 0.35) or 0.35),
-        "scan_msgs": int(getattr(config, "TIER3_SCAN_MSGS", 6) or 6),
+        "scan_msgs": int(getattr(config, "TIER3_SCAN_MSGS", 32) or 32),
         "lifecycle": _lifecycle_cfg(),
     }
 
