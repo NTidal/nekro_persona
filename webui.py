@@ -1173,6 +1173,43 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             ctx, effective_score, gating=gating,
             tier1_cfg=_tier1_cfg(), tier2_cfg=_tier2_cfg(), tier3_cfg=_t3_cfg(),
         )
+
+        # 关系记忆（memory_log · 系统自动沉淀的事件史）—— 与 persona_prompt 同口径
+        memlog_text = ""
+        memlog_picked: List[Any] = []
+        memlog_total = 0
+        try:
+            if (bool(getattr(config, "MEMLOG_ENABLED", True))
+                    and bool(getattr(config, "MEMLOG_INJECT_ENABLED", True))):
+                memlog = helpers["memory_log"]
+                items = await memlog.list_entries(chat_key)
+                memlog_total = len(items)
+                if items:
+                    _now = time.time()
+                    items.sort(
+                        key=lambda e: (memlog.heat_factor(e, _now),
+                                       e.event_at or e.created_at),
+                        reverse=True,
+                    )
+                    max_n = max(1, int(getattr(config, "MEMLOG_INJECT_MAX", 3) or 3))
+                    budget = max(100, int(getattr(config, "MEMLOG_INJECT_CHARS", 700) or 700))
+                    head = "【关系记忆 · 你记得发生过的事】"
+                    used = len(head)
+                    for e in items:
+                        line = f"- {e.title}：{e.content}"
+                        if memlog_picked and used + len(line) + 1 > budget:
+                            break
+                        memlog_picked.append(e)
+                        used += len(line) + 1
+                        if len(memlog_picked) >= max_n:
+                            break
+                    if memlog_picked:
+                        memlog_text = head + "\n" + "\n".join(
+                            f"- {e.title}：{e.content}" for e in memlog_picked)
+                        text = (text + "\n\n" + memlog_text).strip()
+        except Exception:  # noqa: BLE001
+            memlog_text = ""
+
         return {
             "chat_key": chat_key,
             "score": effective_score,
@@ -1191,8 +1228,57 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "tier3_hit": str(memory._state().get("last_hit_tier3") or ""),
                 "tier3_enabled": memory.tier3_settings(_t3_cfg())["enabled"],
                 "message_scan_limit": int(memory.tier2_settings(_tier2_cfg())["scan_msgs"]),
+                "memory_log_total": memlog_total,
+                "memory_log_injected": len(memlog_picked),
             },
+            "memory_log_text": memlog_text,
         }
+
+    @router.get("/api/memory_log", summary="关系记忆（自动沉淀的事件史）")
+    async def api_memory_log(request: Request, chat_key: str = "",
+                             limit: int = 100) -> Dict[str, Any]:
+        """列出关系记忆。chat_key 为空时返回全部频道（按频道分组统计）。"""
+        _check_key(request)
+        memlog = helpers["memory_log"]
+        entries = await memlog.list_entries(chat_key or None)
+        total = len(entries)
+        entries.sort(key=lambda e: e.event_at or e.created_at, reverse=True)
+        n = max(1, min(500, int(limit or 100)))
+        now = time.time()
+        return {
+            "chat_key": chat_key,
+            "total": total,
+            "stats": await memlog.stats(chat_key or None),
+            "items": [
+                {
+                    "id": e.id,
+                    "scope": e.scope,
+                    "title": e.title,
+                    "content": e.content,
+                    "tags": e.tags,
+                    "event_at": e.event_at,
+                    "created_at": e.created_at,
+                    "hits": e.hits,
+                    "last_hit": e.last_hit,
+                    "heat": round(memlog.heat_factor(e, now), 4),
+                }
+                for e in entries[:n]
+            ],
+        }
+
+    @router.post("/api/memory_log", summary="关系记忆操作（delete）")
+    async def api_memory_log_op(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        body = await request.json()
+        op = str(body.get("op") or "").strip()
+        memlog = helpers["memory_log"]
+        if op == "delete":
+            eid = str(body.get("id") or "").strip()
+            if not eid:
+                raise HTTPException(status_code=400, detail="缺少 id")
+            ok = await memlog.delete_entry(eid)
+            return {"ok": ok, "id": eid}
+        raise HTTPException(status_code=400, detail=f"未知操作: {op}")
 
     @router.post("/api/recall_test", summary="检索实验（A5：为什么命中/为什么落选）")
     async def api_recall_test(request: Request) -> Dict[str, Any]:

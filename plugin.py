@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.0.5",
+    version="2.0.6",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -438,6 +438,53 @@ class FavorabilityConfig(ConfigBase):
         en_desc="Containment-based dedup: a shorter title fully contained in a longer one is treated as the same memo",
     )
 
+    # ==================== 关系记忆（memory_log · 自动沉淀的事件史）====================
+    # 与 tier4 note 的分工：note 是角色自己记的功能小抄（模型主动写），
+    # memory_log 是系统自动沉淀的「事件史」——谁做了什么、发生了什么。
+    # 素材来自 exec_code 里 adjust_favorability 的 reason 与 send_voice_clone 的文本，
+    # **不看 delta、不看是否被规则拒绝**：严格模式下被拒的调用同样贡献素材，
+    # 因为「事件发生了」与「分数涨没涨」是正交的两件事。
+    MEMLOG_ENABLED: bool = _fav_field(
+        True, "启用关系记忆（自动沉淀事件史）",
+        "后台定期把互动归纳成事件记忆并注入对话。关闭后不沉淀也不注入，已有数据保留。",
+        en_title="Enable Relationship Memory Log",
+        en_desc="Periodically consolidate interactions into event memories and inject them",
+    )
+    MEMLOG_MODEL_GROUP: str = _fav_field(
+        "", "归纳用的模型组",
+        "留空则用 USE_MODEL_GROUP。该模型需要支持 JSON 输出；建议用便宜的对话模型。",
+        en_title="Consolidation Model Group",
+        en_desc="Model group for consolidation; empty means USE_MODEL_GROUP",
+    )
+    MEMLOG_BATCH_MIN_ITEMS: int = _fav_field(
+        20, "攒批条数",
+        "积累到多少条素材才触发一次归纳（太小会频繁调模型，太大会延迟）",
+        en_title="Batch Min Items", en_desc="Consolidate after this many materials",
+    )
+    MEMLOG_BATCH_MAX_AGE_HOURS: float = _fav_field(
+        2.0, "攒批最长等待（小时）",
+        "即使条数不够，超过这个时长也会归纳一次（避免冷频道永远不触发）",
+        en_title="Batch Max Age (hours)", en_desc="Force consolidation after this age",
+    )
+    MEMLOG_MAX_PER_SCOPE: int = _fav_field(
+        200, "每频道记忆上限",
+        "超出后按热度淘汰（常被注入的保留，冷门的先删）",
+        en_title="Max Entries Per Channel", en_desc="Evict coldest entries beyond this",
+    )
+    MEMLOG_INJECT_ENABLED: bool = _fav_field(
+        True, "把关系记忆注入对话",
+        "关闭后只沉淀不注入（数据仍可在 WebUI 查看）",
+        en_title="Inject Memory Log", en_desc="Inject consolidated memories into prompts",
+    )
+    MEMLOG_INJECT_MAX: int = _fav_field(
+        3, "单轮注入条数", "每次对话最多注入几条关系记忆",
+        en_title="Inject Max Entries", en_desc="Max memory-log entries injected per turn",
+    )
+    MEMLOG_INJECT_CHARS: int = _fav_field(
+        700, "单轮注入字符预算", "注入关系记忆的字符上限（含标题与内容）",
+        en_title="Inject Char Budget", en_desc="Char budget for memory-log injection",
+    )
+
     # ==================== 身份锚点（tier4 生长层，阶段 A）====================
     # 前 3 档是「种子」（手工策划、模型不可写）；tier4 是「生长」——角色自己在运行时
     # 追加身份级锚点，记录「他怎么长成现在这样」。**只增不改种子**，且受硬频率闸约束
@@ -544,6 +591,8 @@ _RANK_TRIGGERS = ("查看好感度", "好感度排行", "好感榜")
 from . import card  # noqa: E402  # 依赖上方 plugin/config 完成初始化后再导入渲染模块
 from . import memory as persona_memory  # noqa: E402  # 阶梯记忆与好感度门控
 from . import tier4  # noqa: E402  # tier4 生长层（身份锚点，阶段 A）
+from . import consolidator as persona_consolidator  # noqa: E402  # 关系记忆归纳
+from . import memory_log as persona_memlog  # noqa: E402  # 关系记忆存储
 
 # 背景记忆数据目录：**按访问解析**（多账号隔离）。
 # ⚠️ 绝不能在这里写下 `plugin.get_plugin_data_dir() / "backgrounds"` 的求值结果：
@@ -553,6 +602,8 @@ from . import tier4  # noqa: E402  # tier4 生长层（身份锚点，阶段 A�
 persona_memory.configure_bg_dir_provider(lambda: plugin.get_plugin_data_dir() / "backgrounds")
 # tier4 生长层与阶梯记忆同目录（tier4.json / _channel_index.json 落到同一 backgrounds/）
 tier4.configure_bg_dir_provider(lambda: plugin.get_plugin_data_dir() / "backgrounds")
+# 关系记忆与生长层同目录（memory_log.json 落到同一 backgrounds/）
+persona_memlog.configure_bg_dir_provider(lambda: plugin.get_plugin_data_dir() / "backgrounds")
 # v2.0.2：目录状态缓存改为**有界 LRU**（每个账号目录约 20MB 常驻向量，旧实现只增不减）。
 # 这里只做一次初始化：取环境变量 NEKRO_PERSONA_STATE_MAX_DIRS，没有就用 memory.py 的
 # 默认值（8）。**刻意不新增插件配置项**——那会让 NA 在加载时回写 config.yaml，
@@ -1222,6 +1273,7 @@ async def _recover_pass() -> int:
 
 
 _decay_task: "asyncio.Task | None" = None
+_memlog_task: "asyncio.Task | None" = None
 
 
 async def _decay_loop() -> None:
@@ -2122,6 +2174,12 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
     """
     parts: List[str] = []
 
+    # 登记「本账号见过这个频道」，供关系记忆的素材扫描做归属过滤
+    try:
+        _memlog_touch_channel(_ctx.chat_key)
+    except Exception:  # noqa: BLE001
+        pass
+
     # ① 关系卡（原好感度插件逻辑，保持原样）
     state = await _open_archive(_ctx.chat_key)
     current_user_id = (_ctx.from_platform_userid or state.last_active_user_id or "").strip()
@@ -2175,6 +2233,45 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
             )
     except Exception as e:  # noqa: BLE001
         plugin.logger.warning(f"[persona] tier4 块渲染失败，本轮跳过: {e}")
+
+    # ④ 关系记忆（memory_log · 系统自动沉淀的事件史）
+    # 与 ③ 的 tier4 note 分工不同：note 是角色自己记的功能小抄（模型主动写），
+    # 这里是后台从互动里归纳出来的「发生过什么」，模型不参与写入。
+    try:
+        if (bool(getattr(config, "MEMLOG_ENABLED", True))
+                and bool(getattr(config, "MEMLOG_INJECT_ENABLED", True))):
+            entries = await persona_memlog.list_entries(_ctx.chat_key)
+            if entries:
+                _now = time.time()
+                # 按热度排序：常被想起的优先，热度相同则新的优先
+                entries.sort(
+                    key=lambda e: (persona_memlog.heat_factor(e, _now),
+                                   e.event_at or e.created_at),
+                    reverse=True,
+                )
+                max_n = max(1, int(getattr(config, "MEMLOG_INJECT_MAX", 3) or 3))
+                budget = max(100, int(getattr(config, "MEMLOG_INJECT_CHARS", 700) or 700))
+                head = "【关系记忆 · 你记得发生过的事】"
+                picked = []
+                used = len(head)
+                for e in entries:
+                    line = f"- {e.title}：{e.content}"
+                    if picked and used + len(line) + 1 > budget:
+                        break
+                    picked.append(e)
+                    used += len(line) + 1
+                    if len(picked) >= max_n:
+                        break
+                if picked:
+                    body = "\n".join(f"- {e.title}：{e.content}" for e in picked)
+                    parts.append(head + "\n" + body)
+                    # 命中即强化热度；失败不影响本轮注入
+                    try:
+                        await persona_memlog.bump_hits(picked)
+                    except Exception:  # noqa: BLE001
+                        pass
+    except Exception as e:  # noqa: BLE001
+        plugin.logger.warning(f"[persona] 关系记忆注入失败，本轮跳过: {e}")
 
     return "\n\n".join(p for p in parts if p)
 
@@ -3105,6 +3202,8 @@ def _persona_webui_router():
             "note_key": tier4._note_title_key,
             # tier4 生长层（阶段 A：身份锚点；阶段 B：+ note）
             "tier4": tier4,
+            # 关系记忆（memory_log · 系统自动沉淀的事件史）
+            "memory_log": persona_memlog,
             "anchor_cfg": _anchor_cfg,
             # 阶段 C：生长包导出/导入（关系档案枚举与原样读写）
             "enumerate_archives": _enumerate_archives,
@@ -3293,6 +3392,232 @@ async def _migrate_memos_on_load() -> None:
     )
 
 
+_MEMLOG_STATE_NAME = "_memlog_state.json"
+"""扫描游标与「本账号见过的频道」的状态文件（与 memory_log.json 同目录）。"""
+
+
+def _memlog_state_fp():
+    return plugin.get_plugin_data_dir() / "backgrounds" / _MEMLOG_STATE_NAME
+
+
+def _read_memlog_state() -> dict:
+    """读取扫描状态。失败一律返回空结构，绝不抛。"""
+    try:
+        fp = _memlog_state_fp()
+        if not fp.exists():
+            return {"cursor": 0, "channels": []}
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("根节点不是对象")
+        return {
+            "cursor": int(data.get("cursor") or 0),
+            "channels": [str(x) for x in (data.get("channels") or [])][:500],
+        }
+    except Exception as exc:  # noqa: BLE001
+        plugin.logger.debug(f"[memory_log] 状态读取失败（按空处理）: {exc}")
+        return {"cursor": 0, "channels": []}
+
+
+def _write_memlog_state(state: dict) -> None:
+    try:
+        fp = _memlog_state_fp()
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = fp.with_suffix(fp.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        tmp.replace(fp)
+    except Exception as exc:  # noqa: BLE001
+        plugin.logger.debug(f"[memory_log] 状态写入失败（忽略）: {exc}")
+
+
+_memlog_chan_cache: "dict[str, set]" = {}
+"""按 backgrounds 目录缓存的「已登记频道」集合。
+
+为什么必须缓存：`_memlog_touch_channel` 在 `persona_prompt` 里每轮都调用，
+而 prompt 注入是消息热路径。不加缓存的话每条消息都要读一次状态文件，
+在活跃群里（实测 127 条/30 分钟）会造成不必要的磁盘读。
+缓存按 backgrounds 路径区分，天然跟随多账号切换。
+"""
+
+
+def _memlog_touch_channel(chat_key: str) -> None:
+    """记录「本账号见过这个频道」。
+
+    为什么需要：`exec_code` 是**全局表**，多账号实例下所有账号的会话都在里面，
+    而 `chat_channel` / `adapter_instance` 都不带账号归属字段（实测 adapter_instance
+    为空、chat_channel 只有 adapter_key），数据库层面无法按账号过滤。
+    因此改成运行期采集：只有本账号真的处理过消息的频道才会被记录下来，
+    扫描时据此过滤，避免把别的账号的会话串进本账号的记忆库。
+    """
+    ck = (chat_key or "").strip()
+    if not ck:
+        return
+    try:
+        dir_key = str(plugin.get_plugin_data_dir() / "backgrounds")
+    except Exception:  # noqa: BLE001
+        return
+
+    cached = _memlog_chan_cache.get(dir_key)
+    if cached is not None and ck in cached:
+        return          # 热路径：命中最常见，直接返回，零 IO
+
+    state = _read_memlog_state()
+    chans = cached if cached is not None else set(state.get("channels") or [])
+    chans.add(ck)
+    _memlog_chan_cache[dir_key] = chans
+    state["channels"] = sorted(chans)[-500:]
+    _write_memlog_state(state)
+
+
+async def _memlog_scan_once() -> int:
+    """扫一遍 exec_code 里比游标新的行，抽素材推进攒批桶。返回新增素材数。
+
+    为什么从 exec_code 抽而不是在 adjust_favorability 里挂钩：
+      · 覆盖面更广 —— 除 reason 外还能抓到 send_voice_clone 的语音文本（**多源**）
+      · **被规则拒绝的调用同样有素材** —— code_text 是模型写的调用源码，
+        reason 在参数里，不管这次调用最后成功、被最小间隔拒、还是被每日上限拒，
+        源码都一样留痕。所以严格模式下调用变少的影响被大幅抵消。
+    """
+    from nekro_agent.models.db_exec_code import DBExecCode
+
+    state = _read_memlog_state()
+    cursor = int(state.get("cursor") or 0)
+    known = set(state.get("channels") or [])
+
+    if not known:
+        # 还没见过任何频道：把游标推到当前最大 id，避免把历史一次性灌进来
+        try:
+            latest = await DBExecCode.all().order_by("-id").first()
+            if latest is not None and int(cursor) < int(latest.id):
+                state["cursor"] = int(latest.id)
+                _write_memlog_state(state)
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
+
+    try:
+        rows = await DBExecCode.filter(id__gt=cursor).order_by("id").limit(200)
+    except Exception as exc:  # noqa: BLE001
+        plugin.logger.debug(f"[memory_log] 扫描 exec_code 失败: {exc}")
+        return 0
+    if not rows:
+        return 0
+
+    added = 0
+    max_id = cursor
+    for row in rows:
+        max_id = max(max_id, int(row.id))
+        ck = (row.chat_key or "").strip()
+        if ck not in known:
+            continue          # 别的账号的会话，跳过
+        created = 0
+        try:
+            created = int(row.create_time.timestamp())
+        except Exception:  # noqa: BLE001
+            created = 0
+        mats = persona_consolidator.extract_materials(
+            row.code_text or "", created_at=created, msg_id=str(row.id))
+        if mats:
+            # 注意：push_materials 返回的是「桶内累计条数」而非本次增量，
+            # 直接累加会把 1+3+5+… 全部相加，日志严重虚高（实测把 15 条报成 50 条）。
+            # 这里用 len(mats) 才是真正的「本次新采集数」。
+            persona_consolidator.push_materials(ck, mats)
+            added += len(mats)
+
+    if max_id > cursor:
+        state["cursor"] = max_id
+        _write_memlog_state(state)
+    return added
+
+
+async def _memlog_loop() -> None:
+    """关系记忆归纳循环。
+
+    每 60 秒扫一次攒批桶，对「达到条数阈值」或「超时」的频道做一次归纳。
+
+    设计约束：
+      · 归纳失败**不丢素材** —— 把整批放回桶头，按正常节奏等下一轮重试
+      · 模型返回空（判断无值得记的事）**不回填** —— 否则同一批会被反复喂进模型
+      · 单频道独立，一个频道失败不影响其它频道
+      · 全程只捕异常、不向上抛，绝不打断消息处理
+    """
+    await asyncio.sleep(120)   # 启动后等 2 分钟，避开启动高峰
+    _memlog_last_pending = -1
+    while True:
+        try:
+            if not bool(getattr(config, "MEMLOG_ENABLED", True)):
+                await asyncio.sleep(60)
+                continue
+
+            # 先把新素材扫进桶，再看有没有该归纳的频道
+            try:
+                scanned = await _memlog_scan_once()
+                if scanned:
+                    plugin.logger.info(f"[memory_log] 新采集素材 {scanned} 条")
+            except Exception as exc:  # noqa: BLE001
+                plugin.logger.warning(f"[memory_log] 素材扫描异常（已隔离）: {exc}")
+
+            now = time.time()
+            ready = persona_consolidator.buckets_ready(now)
+            if not ready:
+                _stats = persona_consolidator.bucket_stats()
+                if _stats.get("pending"):
+                    # 有素材但还没到阈值：记一条，便于判断「是不是阈值定太高」
+                    _pend = sum(_stats["pending"].values())
+                    if _pend != _memlog_last_pending:
+                        _memlog_last_pending = _pend
+                        plugin.logger.info(
+                            f"[memory_log] 攒批中：{_pend} 条待归纳"
+                            f"（阈值 {_stats['min_items']} 条 / 超时 "
+                            f"{_stats['max_age_hours']} 小时）")
+                await asyncio.sleep(60)
+                continue
+
+            # 把配置的容量上限同步给存储层（未配置时沿用 memory_log 的默认值）
+            try:
+                _cap = int(getattr(config, "MEMLOG_MAX_PER_SCOPE", 0) or 0)
+                if _cap > 0:
+                    persona_memlog.MAX_ENTRIES_PER_SCOPE = _cap
+            except Exception:  # noqa: BLE001
+                pass
+
+            model_group = str(getattr(config, "MEMLOG_MODEL_GROUP", "") or "")
+            for chat_key in ready:
+                batch = persona_consolidator.take_batch(chat_key)
+                if not batch:
+                    continue
+                try:
+                    memories = await persona_consolidator.consolidate_with_llm(
+                        batch, model_group_name=model_group,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    plugin.logger.warning(
+                        f"[memory_log] 归纳异常，素材回填: {chat_key}: {exc}")
+                    persona_consolidator.pushes_back(chat_key, batch)
+                    continue
+
+                if not memories:
+                    plugin.logger.info(
+                        f"[memory_log] {chat_key}：{len(batch)} 条素材未产出记忆"
+                        "（模型判断无可记内容，不回填）")
+                    continue
+
+                try:
+                    res = await persona_memlog.add_entries(
+                        memories, scope=chat_key, source="auto")
+                    plugin.logger.info(
+                        f"[memory_log] {chat_key}：{len(batch)} 条素材 → "
+                        f"{res['added']} 条记忆入库"
+                        f"（去重跳过 {res['skipped']}，淘汰 {res['evicted']}）")
+                except Exception as exc:  # noqa: BLE001
+                    plugin.logger.warning(
+                        f"[memory_log] 写入失败，素材回填: {chat_key}: {exc}")
+                    persona_consolidator.pushes_back(chat_key, batch)
+        except Exception as exc:  # noqa: BLE001
+            plugin.logger.warning(f"[memory_log] 归纳循环异常（已隔离）: {exc}")
+        await asyncio.sleep(60)
+
+
 @plugin.mount_init_method()
 async def _start_decay_loop() -> None:
     """插件加载时：先跑一次 memo→note 迁移（阶段 B），再启动好感度结算后台任务。"""
@@ -3306,6 +3631,16 @@ async def _start_decay_loop() -> None:
     if _decay_task is not None and not _decay_task.done():
         return
     _decay_task = asyncio.create_task(_decay_loop())
+
+    # 关系记忆归纳任务（与好感度结算独立）
+    global _memlog_task
+    if not (_memlog_task is not None and not _memlog_task.done()):
+        _memlog_task = asyncio.create_task(_memlog_loop())
+        plugin.logger.info(
+            f"[memory_log] 关系记忆归纳任务已启动：攒批 {config.MEMLOG_BATCH_MIN_ITEMS} 条"
+            f" / {config.MEMLOG_BATCH_MAX_AGE_HOURS} 小时，"
+            f"注入 {'开' if config.MEMLOG_INJECT_ENABLED else '关'}"
+        )
     _decay_state = "启用" if config.DECAY_ENABLED else "关闭（运行期可经配置开启）"
     _recover_state = "启用" if config.RECOVER_ENABLED else "关闭（运行期可经配置开启）"
     plugin.logger.info(
@@ -3319,12 +3654,23 @@ async def _start_decay_loop() -> None:
 @plugin.mount_cleanup_method()
 async def clean_up():
     """停掉插件自己的后台任务。"""
-    global _decay_task
+    global _decay_task, _memlog_task
     # A4：落盘去抖残留的命中统计，避免丢最后几次强化
     try:
         persona_memory.flush_hit_stats()
     except Exception:  # noqa: BLE001
         plugin.logger.debug("[persona] 命中统计落盘失败（忽略）")
+    ml = _memlog_task
+    if ml is not None and not ml.done():
+        ml.cancel()
+        try:
+            await ml
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+        plugin.logger.info("[memory_log] 关系记忆归纳任务已停止")
+
     pending = _decay_task
     if pending is not None and not pending.done():
         pending.cancel()

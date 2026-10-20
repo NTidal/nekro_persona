@@ -1008,6 +1008,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="5" r="2.2"/><path d="M12 7.2V21M5 12a7 7 0 0 0 14 0M8.5 11H5M19 11h-3.5M12 21c-2 0-3.5-1.2-3.5-3M12 21c2 0 3.5-1.2 3.5-3"/></svg>
         <span>锚点记忆</span>
       </button>
+      <button class="nav-item" type="button" data-tab="memlog">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 5.5A2.5 2.5 0 0 1 5.5 3H19a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H5.5A2.5 2.5 0 0 1 3 18.5v-13Z"/><path d="M7.5 8h9M7.5 12h9M7.5 16h5"/></svg>
+        <span>关系记忆</span>
+      </button>
       <button class="nav-item" type="button" data-tab="rules">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h2M10 12h10M4 18h8M16 18h4"/><circle cx="16" cy="6" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="14" cy="18" r="2"/></svg>
         <span>规则与门控</span>
@@ -1180,6 +1184,34 @@
           <table class="data-table" aria-label="身份锚点">
             <thead><tr><th>锚点</th><th>核心度</th><th>来源</th><th>更新时间</th><th>操作</th></tr></thead>
             <tbody id="anchorBody"><tr><td class="empty" colspan="5">正在加载…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="page" id="page-memlog" data-page="memlog" aria-labelledby="memlogTitle">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title" id="memlogTitle">关系记忆</h1>
+          <p class="page-desc">系统<strong>自动沉淀</strong>的事件史——从互动里归纳出「发生过什么」，与好感度分数无关。素材是关系变化依据与语音内容，被好感度规则拒绝的调用同样计入。备忘录是角色自己写的小抄，这里是系统归纳的编年史。</p>
+        </div>
+        <div class="head-actions">
+          <select id="memlogChannel" class="select" aria-label="选择频道"><option value="">选择频道…</option></select>
+          <button class="btn" id="memlogRefresh" type="button">刷新</button>
+        </div>
+      </div>
+      <div id="memlogStats" class="overview-note" style="margin-bottom:12px">加载中…</div>
+      <div class="panel">
+        <div class="panel-body" style="border-bottom:1px solid var(--line)">
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <input id="memlogSearch" class="field" type="search" placeholder="搜索标题 / 内容 / 标签" aria-label="搜索关系记忆" autocomplete="off" style="max-width:320px">
+            <span id="memlogSearchInfo" class="hint"></span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" aria-label="关系记忆">
+            <thead><tr><th>记忆</th><th>热度</th><th>命中</th><th>发生时间</th><th>操作</th></tr></thead>
+            <tbody id="memlogBody"><tr><td class="empty" colspan="5">请先选择一个频道。</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -1532,6 +1564,7 @@ const state = {
   favorPageSize: 25,
   favorChannel: 'all',
   memo: { channel: '', items: [], meta: null, editId: '', query: '' },
+  memlog: { channel: '', items: [], meta: null, total: 0, query: '' },
   anchor: { items: [], meta: null },
   channels: null,
   channelsPromise: null,
@@ -1563,6 +1596,7 @@ const TAB_META = {
   favor: ['好感度档案', '好感度档案'],
   memo: ['备忘录', '备忘录'],
   anchor: ['锚点记忆', '锚点记忆'],
+  memlog: ['关系记忆', '关系记忆'],
   rules: ['规则与门控', '规则与门控'],
   preview: ['注入预览', '注入预览']
 };
@@ -1778,6 +1812,7 @@ function activateTab(tab, options = {}) {
   if (tab === 'favor') return loadFavorIndex();
   if (tab === 'memo') return loadMemos();
   if (tab === 'anchor') return loadAnchors();
+  if (tab === 'memlog') return loadMemlog();
   if (tab === 'rules') return state.rulesLoaded ? Promise.resolve() : loadRules();
   if (tab === 'preview') {
     return loadChannels()
@@ -1805,6 +1840,7 @@ async function refreshCurrent() {
       else if (state.tab === 'favor') await loadFavorIndex({ quiet: true });
       else if (state.tab === 'memo') await loadMemos({ quiet: true });
       else if (state.tab === 'anchor') await loadAnchors({ quiet: true });
+      else if (state.tab === 'memlog') await loadMemlog({ quiet: true });
       else if (state.tab === 'rules') {
         if (!confirmDiscardRules()) return;
         await loadRules({ quiet: true });
@@ -2411,6 +2447,89 @@ async function deleteMemoById(id) {
 }
 
 // ===== 身份锚点（tier4 生长层 · 阶段 A）=====
+async function loadMemlog(options = {}) {
+  const select = $('#memlogChannel');
+  if (select && !select.dataset.ready) {
+    try {
+      const data = await api('channels');
+      const list = Array.isArray(data.items) ? data.items : (data.channels || []);
+      const entries = list.map(item => [item.chat_key || item.key || '', item]);
+      select.innerHTML = '<option value="">选择频道…</option>' + entries
+        .map(([key]) => `<option value="${escapeHtml(key)}">${escapeHtml(key)}</option>`).join('');
+      select.dataset.ready = '1';
+      if (!state.memlog.channel && entries.length) state.memlog.channel = entries[0][0];
+      select.value = state.memlog.channel;
+    } catch (error) { toast(`频道加载失败：${error.message}`, 'error'); }
+  }
+  if (!state.memlog.channel) {
+    $('#memlogBody').innerHTML = '<tr><td class="empty" colspan="5">请先选择一个频道。</td></tr>';
+    $('#memlogStats').textContent = '尚未选择频道。';
+    return;
+  }
+  if (!options.quiet) $('#memlogBody').innerHTML = '<tr><td class="empty" colspan="5">正在加载…</td></tr>';
+  try {
+    const data = await api(`memory_log?chat_key=${encodeURIComponent(state.memlog.channel)}`);
+    state.memlog.items = Array.isArray(data.items) ? data.items : [];
+    state.memlog.meta = data.stats || {};
+    state.memlog.total = Number(data.total || 0);
+    renderMemlog();
+    markConnected();
+  } catch (error) {
+    setConnection('offline', '连接失败');
+    $('#memlogBody').innerHTML = `<tr><td class="empty" colspan="5"><strong>加载失败</strong>${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+function renderMemlog() {
+  const meta = state.memlog.meta || {};
+  const heatAvg = meta.heat_avg == null ? '—' : Number(meta.heat_avg).toFixed(2);
+  $('#memlogStats').innerHTML = `本频道 <b>${Number(state.memlog.total || 0)}</b> 条 · 单频道上限 <b>${Number(meta.max_per_scope || 0)}</b> 条 · 平均热度 <b>${heatAvg}</b> · 超上限时按热度淘汰（常被注入的保留；从未注入过的新记忆带 0.7 惩罚系数，避免退化成「按时间删最旧」）`;
+  const all = state.memlog.items || [];
+  if (!all.length) {
+    $('#memlogSearchInfo').textContent = '';
+    $('#memlogBody').innerHTML = '<tr><td class="empty" colspan="5"><strong>该频道暂无关系记忆</strong>素材来自互动里的关系变化依据与语音内容，攒够一定条数（或超过等待时长）后会自动归纳。</td></tr>';
+    return;
+  }
+  const q = String(state.memlog.query || '').trim().toLowerCase();
+  const items = q
+    ? all.filter(m => [m.title || '', m.content || '', (m.tags || []).join(' ')]
+        .join(' ').toLowerCase().includes(q))
+    : all;
+  $('#memlogSearchInfo').textContent = q
+    ? `匹配 ${items.length} / ${all.length} 条`
+    : `共 ${all.length} 条`;
+  if (!items.length) {
+    $('#memlogBody').innerHTML = '<tr><td class="empty" colspan="5"><strong>没有匹配的记忆</strong>换个短一点的关键词，或清空搜索框。命中范围：标题、内容、标签。</td></tr>';
+    return;
+  }
+  $('#memlogBody').innerHTML = items.map(m => {
+    const heat = Number(m.heat || 0);
+    const heatCls = heat >= 0.9 ? 'success' : (heat >= 0.7 ? 'accent' : '');
+    const hits = Number(m.hits || 0);
+    const at = Number(m.event_at || m.created_at || 0);
+    const tags = (m.tags || []).length
+      ? `<div class="badge-row" style="margin-top:4px">${(m.tags || []).map(x => `<span class="badge">${escapeHtml(x)}</span>`).join(' ')}</div>`
+      : '';
+    return `<tr data-memlog-id="${escapeHtml(m.id || '')}">
+      <td data-label="记忆"><span class="entry-title">${escapeHtml(m.title || '(无标题)')}</span><div class="entry-preview">${escapeHtml(m.content || '')}</div>${tags}</td>
+      <td data-label="热度"><div class="badge-row"><span class="badge ${heatCls}">${heat.toFixed(2)}</span></div></td>
+      <td data-label="命中" class="muted">${hits > 0 ? hits : '—'}</td>
+      <td data-label="发生时间" class="muted">${at ? escapeHtml(formatTime(at)) : '—'}</td>
+      <td data-label="操作" class="actions-cell"><div class="table-actions"><button class="mini-btn danger" type="button" data-memlog-action="delete">删除</button></div></td>
+    </tr>`;
+  }).join('');
+}
+
+async function deleteMemlogById(id) {
+  if (!id) return;
+  if (!confirm('永久删除这条关系记忆？删除后无法恢复。')) return;
+  try {
+    await api('memory_log', { method: 'POST', body: { op: 'delete', id } });
+    toast('已删除');
+    await loadMemlog({ quiet: true });
+  } catch (error) { toast(`删除失败：${error.message}`, 'error'); }
+}
+
 async function loadAnchors(options = {}) {
   if (!options.quiet) $('#anchorBody').innerHTML = '<tr><td class="empty" colspan="5">正在加载…</td></tr>';
   try {
@@ -3485,6 +3604,24 @@ function wireEvents() {
     const action = event.target.closest('[data-memo-action]')?.dataset.memoAction;
     if (action === 'edit') openMemoEditor(row.dataset.memoId);
     else if (action === 'delete') deleteMemoById(row.dataset.memoId);
+  });
+
+  // ===== 关系记忆（memory_log）=====
+  $('#memlogRefresh').addEventListener('click', event => withButton(event.currentTarget, () => loadMemlog({ quiet: true })));
+  $('#memlogChannel').addEventListener('change', () => {
+    state.memlog.channel = $('#memlogChannel').value;
+    loadMemlog({ quiet: true });
+  });
+  $('#memlogSearch').addEventListener('input', event => {
+    state.memlog.query = event.currentTarget.value;
+    renderMemlog();
+  });
+  $('#memlogBody').addEventListener('click', event => {
+    const row = event.target.closest('[data-memlog-id]');
+    if (!row) return;
+    if (event.target.closest('[data-memlog-action="delete"]')) {
+      deleteMemlogById(row.dataset.memlogId);
+    }
   });
 
   // ===== 身份锚点（tier4）=====
