@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.0.6",
+    version="2.0.7",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -1311,6 +1311,16 @@ def _ago_cn(timestamp: int) -> str:
     return f"{span // 86400} 天前"
 
 
+OBSERVATION_KIND = "observation"
+"""冷却期内的「观察」记录（ArchiveEvent.kind 值）。
+
+与 manual 的区别：不改分（delta 恒 0），也不进「最近关系变化」列表，
+单独展示在关系卡的「冷却期内的观察」段。用途有两个：
+  ① 让模型在不能改分时也能表达「我注意到了什么」，而不是被规则按住不动；
+  ② 这些 reason 会随 exec_code 落库，成为关系记忆（memory_log）的素材。
+"""
+
+
 @dataclass
 class ArchiveEvent:
     """一次关系变动。
@@ -1379,6 +1389,10 @@ class UserArchive:
     day_key: int = 0
     day_net: int = 0
     last_adjust_at: int = 0
+    # ---- 冷却期观察（v2.0.7）----
+    # 单独一个列表，**不占用 recent_events 的 MAX_EVENT_HISTORY 槽位**：
+    # 观察写入频率可能高于真实调分，混在 recent_events 里会把真实变化挤掉。
+    observations: List["ArchiveEvent"] = field(default_factory=list)
 
     # ---------- 构造 ----------
     @staticmethod
@@ -1416,6 +1430,9 @@ class UserArchive:
         item.recent_events = [
             ArchiveEvent.from_raw(x) for x in (data.get("recent_events") or [])
         ]
+        item.observations = [
+            ArchiveEvent.from_raw(x) for x in (data.get("observations") or [])
+        ]
         return item
 
     def to_raw(self) -> Dict[str, object]:
@@ -1435,6 +1452,7 @@ class UserArchive:
             "day_key": self.day_key,
             "day_net": self.day_net,
             "last_adjust_at": self.last_adjust_at,
+            "observations": [e.to_raw() for e in self.observations],
         }
 
     # ---------- 变更 ----------
@@ -1772,10 +1790,12 @@ def _daily_budget_line(profile: UserArchive) -> str:
             elapsed_min = max(0, (now - int(profile.last_adjust_at)) // 60)
             wait_min = gap_min - elapsed_min
             if wait_min > 0:
-                parts.append(f"距上次调整 {elapsed_min} 分钟，"
-                             f"还需 {wait_min} 分钟才可再次调整")
+                parts.append(
+                    f"距上次调整 {elapsed_min} 分钟，还需 {wait_min} 分钟才可改分"
+                    "（期间仍可用「调整好感度」记录本轮观察：只留档、不改分）"
+                )
             else:
-                parts.append("间隔已满足，可以调整")
+                parts.append("间隔已满足，可以改分")
         return "；".join(parts) + "。"
     except Exception:  # noqa: BLE001
         return ""
@@ -1824,9 +1844,14 @@ def _compose_archive_card(profile: UserArchive, *, current: bool) -> str:
         f"关系标签：{', '.join(profile.tags) if profile.tags else '无'}",
         "最近关系变化：",
         *event_lines,
-        "规则：",
-        *_CARD_RULES,
     ]
+    # 冷却期内的观察：让模型看到「我记过什么」，形成正反馈（v2.0.7）
+    _obs = [e for e in (profile.observations or [])
+            if str(getattr(e, "kind", "") or "") == OBSERVATION_KIND][-2:]
+    if _obs:
+        body.append("冷却期内的观察（已留档，未改分）：")
+        body.extend(f"- {e.reason}（{_ago_text(e.timestamp)}）" for e in _obs)
+    body.extend(["规则：", *_CARD_RULES])
     return "\n".join(head + body)
 
 
@@ -2388,10 +2413,34 @@ async def adjust_favorability(
         _min_gap = max(0, int(_sc.get("min_interval_minutes", 120))) * 60
         if profile.last_adjust_at and _min_gap and (now - profile.last_adjust_at) < _min_gap:
             _wait = (_min_gap - (now - profile.last_adjust_at)) // 60
+            # v2.0.7：冷却期内**不再直接拒绝**——记成「观察」不改分。
+            # 实测：卡里播报「还需 N 分钟」后，模型在冷却期内一次都不调用，
+            # 导致一段连续对话最多只有 1 次调分机会，且这些 reason 全部丢失
+            # （关系记忆也收不到素材）。记录观察让模型有落点，同时不动分数。
+            try:
+                profile.observations.append(ArchiveEvent(
+                    delta=0,
+                    reason=_one_line(cleaned_reason, 160),
+                    score_after=int(profile.score),
+                    timestamp=now,
+                    kind=OBSERVATION_KIND,
+                ))
+                if len(profile.observations) > 5:
+                    profile.observations = profile.observations[-5:]
+                profile.updated_at = now
+                await _store_archive(_ctx.chat_key, state)
+            except Exception as _exc:  # noqa: BLE001
+                plugin.logger.warning(
+                    f"[favorability] 冷却期观察写入失败（忽略）: {_exc}")
             plugin.logger.info(
-                f"[favorability] 距上次调整不足，跳过: user={resolved_user_id} 还需 {_wait} 分钟",
+                f"[favorability] 冷却期内记录观察（未改分）: "
+                f"user={resolved_user_id} 还需 {_wait} 分钟",
             )
-            return (f"本次未调整：距上次调整不足 {int(_sc.get('min_interval_minutes', 120))} 分钟（还需约 {_wait} 分钟）。")
+            return (
+                f"已记录本轮观察，未改分：距上次调整不足 "
+                f"{int(_sc.get('min_interval_minutes', 120))} 分钟（还需约 {_wait} 分钟）。"
+                "这条观察已留档，好感度分数保持不变。"
+            )
 
         # ③ 单次上限
         _cap = max(1, int(_sc.get("max_single_delta", 10)))
