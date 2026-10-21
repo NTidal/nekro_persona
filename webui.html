@@ -3831,7 +3831,7 @@ function openProfileDialog(chatKey, p, maxAbs) {
   });
 }
 
-$('#dialogFoot').addEventListener('click', async (e) => {
+const onProfileDlgClick = async (e) => {
   const btn = e.target.closest('[data-dlg]');
   if (!btn) return;
   const act = btn.dataset.dlg;
@@ -3877,7 +3877,14 @@ $('#dialogFoot').addEventListener('click', async (e) => {
     });
     if (res) { closeDialog(); loadFavor(); }
   }
-});
+};
+
+/* ⚠️ 档案弹窗的按钮分居两处： 「改分」在 body， 「保存档案 / 删除档案」在 foot。
+   早先只把监听挂在 #dialogFoot，导致 body 里的「改分」点了毫无反应
+   （接口本身正常，是事件根本没触发）。这里 body 与 foot 都挂。 */
+$('#dialogFoot').addEventListener('click', onProfileDlgClick);
+$('#dialogBody').addEventListener('click', onProfileDlgClick);
+
 function maxAbsSafe() { return (state.overview && state.overview.score_limit && state.overview.score_limit.max_abs) || 100; }
 
 /* 阶段徽章配色：按 /api/overview 的真实阶段配置推导。
