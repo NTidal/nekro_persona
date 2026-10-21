@@ -1941,7 +1941,7 @@ body.is-scrolling .dialog-foot {
 .group-row .badge-row { display: inline-flex; gap: 6px; margin-left: 8px; vertical-align: middle; }
 .group-row strong { font-size: 12px; letter-spacing: 0.01em; }
 
-/* ---------- 门槛 · 阶段 单元格 ---------- */
+/* ---------- 门控单元格（门槛 / 阶段 / 熟悉度） ---------- */
 /* 这一格有三个元素（门槛数字 + 阶段徽章 + 熟悉度徽章）。旧实现复用全局 .row
    （flex-wrap: wrap）加上 .score-value 的 min-width:40px，挤不进列宽时
    「熟人」会折到第二行并左对齐，看起来是歪的。这里改成专用类：单行不换行，
@@ -1954,6 +1954,23 @@ body.is-scrolling .dialog-foot {
 .gate-cell .gate-key { color: var(--muted); font-size: 10px; letter-spacing: 0.02em; }
 .gate-cell .score-value { min-width: 0; }   /* 覆盖全局 40px，否则白占宽度 */
 .gate-cell .badge { flex: 0 0 auto; }       /* 徽章不许被压缩换行 */
+
+/* ---------- 背景记忆表格列宽 ---------- */
+/* 条目/触发是内容列，门控·权重·热度·启用·操作都是窄列。
+   给窄列 width:1% + nowrap，auto 布局会把它们压到刚好内容宽，
+   余量全部让给「触发」（chips 最多、最容易被挤扁的那一列）。 */
+@media (min-width: 821px) {
+  #memoryTable th:nth-child(1),
+  #memoryTable td:nth-child(1) { width: 30%; }
+  #memoryTable th:nth-child(3), #memoryTable td:nth-child(3),
+  #memoryTable th:nth-child(4), #memoryTable td:nth-child(4),
+  #memoryTable th:nth-child(5), #memoryTable td:nth-child(5),
+  #memoryTable th:nth-child(6), #memoryTable td:nth-child(6),
+  #memoryTable th:nth-child(7), #memoryTable td:nth-child(7) {
+    width: 1%;
+    white-space: nowrap;
+  }
+}
 @media (max-width: 820px) {
   /* 移动端每格自带 data-label 标题，允许正常换行，避免横向溢出 */
   .gate-cell { flex-wrap: wrap; white-space: normal; gap: 6px; }
@@ -2125,7 +2142,9 @@ body.is-scrolling .dialog-foot {
         <div class="table-wrap">
           <table class="data-table" id="memoryTable">
             <thead><tr>
-              <th>条目</th><th>触发</th><th>门槛 · 阶段</th><th>权重</th><th>热度</th><th>启用</th><th></th>
+              <th>条目</th><th>触发</th>
+              <th title="门槛（好感度门槛）· 阶段 · 熟悉度">门控</th>
+              <th>权重</th><th>热度</th><th>启用</th><th></th>
             </tr></thead>
             <tbody id="memoryTbody"></tbody>
           </table>
@@ -3406,7 +3425,7 @@ function renderMemory() {
         <span class="entry-id">${idEsc} · ${esc(e.file || '')}</span>
       </td>
       <td data-label="触发"><div class="badge-row">${trig}</div></td>
-      <td data-label="门槛 · 阶段">
+      <td data-label="门控">
         <div class="gate-cell">
           <span class="gate-min"><span class="gate-key">门槛</span><span class="score-value">${e.min_favor}</span></span>
           ${e.stage ? `<span class="badge accent">${esc(e.stage)}</span>` : '<span class="badge">公开</span>'}${fam}
