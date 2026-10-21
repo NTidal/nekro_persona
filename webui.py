@@ -1185,6 +1185,42 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             tier1_cfg=_tier1_cfg(), tier2_cfg=_tier2_cfg(), tier3_cfg=_t3_cfg(),
         )
 
+        # 生长层 tier4：身份锚点（anchor · 全局）+ 频道笔记（note · 本频道）
+        # ⚠️ 必须与 persona_prompt 的第 ③ 段同口径：preview 早先只实现了 ② 三档记忆
+        #    和 ④ memory_log，漏掉 tier4，导致预览里看不到锚点和笔记，
+        #    调试时会误判「锚点/笔记没生效」（实测踩过）。
+        tier4_text = ""
+        tier4_anchor_n = 0
+        tier4_note_n = 0
+        try:
+            t4 = helpers["tier4"]
+            acfg = helpers["anchor_cfg"]()
+            ncfg = helpers["note_cfg"]()
+            recent_text = await memory._recent_text(ctx)
+            doc = await t4.open_tier4()
+            subs: List[str] = []
+            if acfg["enabled"]:
+                ab = t4.render_anchor_block(doc, acfg, helpers["anchor_guide"])
+                if ab:
+                    subs.append(ab)
+            if ncfg["enabled"]:
+                nb = t4.render_note_block(
+                    doc, ncfg, chat_key, effective_score, recent_text,
+                    helpers["note_guide"],
+                )
+                if nb:
+                    subs.append(nb)
+            if subs:
+                tier4_text = "\n\n".join(subs)
+                text = (text + "\n\n" + tier4_text).strip()
+            tier4_anchor_n = sum(1 for e in doc.entries if e.kind == t4.ANCHOR_KIND)
+            tier4_note_n = sum(
+                1 for e in doc.entries
+                if e.kind == t4.NOTE_KIND and e.scope == chat_key and not e.is_expired()
+            )
+        except Exception:  # noqa: BLE001
+            tier4_text = ""
+
         # 关系记忆（memory_log · 系统自动沉淀的事件史）—— 与 persona_prompt 同口径
         memlog_text = ""
         memlog_picked: List[Any] = []
@@ -1239,42 +1275,58 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "tier3_hit": str(memory._state().get("last_hit_tier3") or ""),
                 "tier3_enabled": memory.tier3_settings(_t3_cfg())["enabled"],
                 "message_scan_limit": int(memory.tier2_settings(_tier2_cfg())["scan_msgs"]),
+                "tier4_anchor_count": tier4_anchor_n,
+                "tier4_note_count": tier4_note_n,
                 "memory_log_total": memlog_total,
                 "memory_log_injected": len(memlog_picked),
             },
+            "tier4_text": tier4_text,
             "memory_log_text": memlog_text,
         }
 
     @router.get("/api/memory_log", summary="关系记忆（自动沉淀的事件史）")
     async def api_memory_log(request: Request, chat_key: str = "",
-                             limit: int = 100) -> Dict[str, Any]:
-        """列出关系记忆。chat_key 为空时返回全部频道（按频道分组统计）。"""
+                             limit: int = 100, q: str = "") -> Dict[str, Any]:
+        """列出关系记忆。chat_key 为空时返回全部频道（按频道分组统计）。
+
+        带 `q` 时按「频道号 / 标题 / 内容 / 标签 / id」做大小写不敏感子串匹配。
+        注意：关系记忆条目本身**没有用户账号字段**（事件史由后台归纳），
+        想按人搜只能命中正文里出现过的名字。
+        """
         _check_key(request)
         memlog = helpers["memory_log"]
         entries = await memlog.list_entries(chat_key or None)
-        total = len(entries)
         entries.sort(key=lambda e: e.event_at or e.created_at, reverse=True)
-        n = max(1, min(500, int(limit or 100)))
         now = time.time()
+        rows: List[Dict[str, Any]] = [
+            {
+                "id": e.id,
+                "scope": e.scope,
+                "title": e.title,
+                "content": e.content,
+                "tags": e.tags,
+                "event_at": e.event_at,
+                "created_at": e.created_at,
+                "hits": e.hits,
+                "last_hit": e.last_hit,
+                "heat": round(memlog.heat_factor(e, now), 4),
+            }
+            for e in entries
+        ]
+        query = str(q or "").strip()
+        if query:
+            rows = [
+                r for r in rows
+                if _search_hit(query, r, ("scope", "title", "content", "tags", "id"))
+            ]
+        total = len(rows)
+        n = max(1, min(500, int(limit or 100)))
         return {
             "chat_key": chat_key,
+            "q": query,
             "total": total,
             "stats": await memlog.stats(chat_key or None),
-            "items": [
-                {
-                    "id": e.id,
-                    "scope": e.scope,
-                    "title": e.title,
-                    "content": e.content,
-                    "tags": e.tags,
-                    "event_at": e.event_at,
-                    "created_at": e.created_at,
-                    "hits": e.hits,
-                    "last_hit": e.last_hit,
-                    "heat": round(memlog.heat_factor(e, now), 4),
-                }
-                for e in entries[:n]
-            ],
+            "items": rows[:n],
         }
 
     @router.post("/api/memory_log", summary="关系记忆操作（delete）")
@@ -1621,6 +1673,23 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     # ---------------- 频道笔记（阶段 B：tier4 note，接替旧 memo）----------------
     # 端点路径 /api/memos、/api/memo 保持不变（前端无需改），底层数据源从
     # ChannelArchive.memos 换成 tier4.json 里 kind=note、scope=chat_key 的条目。
+    def _search_hit(query: str, row: Dict[str, Any], fields) -> bool:
+        """大小写不敏感的跨字段子串匹配（列表搜索用）。
+
+        列表字段（tags）拼成空格分隔的串一起匹配，行为与前端 matchQuery 保持一致。
+        """
+        low = str(query or "").strip().lower()
+        if not low:
+            return True
+        for f in fields:
+            val = row.get(f)
+            if val is None:
+                continue
+            hay = " ".join(str(x) for x in val) if isinstance(val, (list, tuple)) else str(val)
+            if low in hay.lower():
+                return True
+        return False
+
     def _note_items(chat_key: str, entries, now: int) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         for n in entries:
@@ -1639,28 +1708,50 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     "created_at": int(n.created_at or 0),
                     "updated_at": int(n.updated_at or 0),
                     "source_user_id": str(n.source_user_id or ""),
+                    # 跨频道聚合时前端要显示「这条属于哪个频道」
+                    "chat_key": str(n.scope),
                 },
             )
         items.sort(key=lambda x: -x["updated_at"])
         return items
 
     @router.get("/api/memos", summary="频道笔记")
-    async def api_memos(request: Request, chat_key: str = "") -> Dict[str, Any]:
+    async def api_memos(request: Request, chat_key: str = "",
+                        q: str = "") -> Dict[str, Any]:
+        """列出频道笔记。
+
+        - `chat_key` 为空时聚合**全部频道**（供页面跨频道搜索）；
+        - 带 `q` 时按「频道号 / 用户账号 / 标题 / 内容 / 标签」做大小写不敏感子串匹配。
+        原有「按单个 chat_key 取笔记」的行为与返回结构保持不变。
+        """
         _check_key(request)
-        if not chat_key:
-            raise HTTPException(status_code=400, detail="缺少 chat_key")
         t4 = helpers["tier4"]
         now = int(helpers["now_ts"]())
         entries = await t4.list_entries(t4.NOTE_KIND)
-        items = _note_items(chat_key, entries, now)
+        if chat_key:
+            items = _note_items(chat_key, entries, now)
+        else:
+            items = []
+            for scope in sorted({str(n.scope) for n in entries}):
+                items.extend(_note_items(scope, entries, now))
+            items.sort(key=lambda x: -int(x.get("updated_at") or 0))
+        query = str(q or "").strip()
+        if query:
+            items = [
+                x for x in items
+                if _search_hit(query, x, ("chat_key", "source_user_id",
+                                          "title", "content", "tags"))
+            ]
         ncfg = helpers["note_cfg"]()
         return {
             "chat_key": chat_key,
+            "q": query,
             "items": items,
             "meta": {
                 **ncfg,
                 "total": len(items),
                 "live": sum(1 for x in items if not x["expired"]),
+                "scopes": len({str(x.get("chat_key") or "") for x in items}),
             },
         }
 

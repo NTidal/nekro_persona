@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.0.9",
+    version="2.1.0",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -497,7 +497,7 @@ class FavorabilityConfig(ConfigBase):
         en_desc="Let the character grow identity-level anchors at runtime; never overwrites the tier 1-3 seeds; injects nothing when empty",
     )
     ANCHOR_MAX_TOTAL: int = _fav_field(
-        30, "锚点总量上限", "全局最多保留几条锚点；达上限后新写入被拒绝，需先在 WebUI 清理",
+        15, "锚点总量上限", "全局最多保留几条锚点；达上限后新写入被拒绝，需先在 WebUI 清理",
         en_title="Anchor Total Cap", en_desc="Global maximum number of anchors; further writes are rejected once reached",
         ge=1, le=500,
     )
@@ -751,6 +751,33 @@ _NOTE_GUIDE = (
 )
 
 
+# 锚点注入时的标题与用法约束。
+# 为什么必须有：锚点是 scope=global 的，会出现在每个频道的 prompt 里，
+# 而早先注入的是裸 bullet（连标题都没有），模型无从判断「这是全局立场」
+# 还是「这是对当前对话者的承诺」，很容易把锚点里的「你」绑到当前群友身上。
+_ANCHOR_GUIDE = (
+    "#你对自己定下的\n"
+    "以下是你这些日子里对自己想明白的事——是你这个人本身，不是谁的要求。\n"
+    "使用规则：\n"
+    "1. **它们与具体某个人无关**，换到任何地方都成立。不要说成「我答应过你」，"
+    "也不要当成对当前对话者的约定去兑现。\n"
+    "2. 自然地活出来，不要复述原文，也不要说「我记得我写过这条」。"
+)
+
+# 锚点禁写模式：绑定具体对象/频道的内容不该进全局身份层。
+# 历史教训：只靠工具说明软约束 + 4 个独占词替换，实测挡不住
+# 「我答应过你，不管你掉到多少…」这类写法 —— 一旦沉淀成锚点，
+# 那个「你」会在别的频道被重新绑定，直接穿帮。
+_ANCHOR_REJECT_PATTERNS = (
+    (re.compile(r"web[_-]?user[_-]?\w*|admin_\w+|onebot_v11", re.I), "具体账号标识"),
+    (re.compile(r"\d{6,}"), "具体账号或群号"),
+    (
+        re.compile(r"我(?:答应|承诺|保证|许)过?你|对你(?:答应|承诺|保证|许)|我向你(?:答应|承诺)"),
+        "针对某个人的承诺",
+    ),
+)
+
+
 def _anchor_cfg() -> dict:
     """tier4 身份锚点运行参数（来自插件配置）。
 
@@ -760,7 +787,7 @@ def _anchor_cfg() -> dict:
     """
     return {
         "enabled": bool(getattr(config, "ANCHOR_ENABLED", True)),
-        "max_total": max(1, int(getattr(config, "ANCHOR_MAX_TOTAL", 30) or 30)),
+        "max_total": max(1, int(getattr(config, "ANCHOR_MAX_TOTAL", 15) or 15)),
         "max_per_day": max(0, int(getattr(config, "ANCHOR_MAX_PER_DAY", 1) or 0)),
         "min_interval_hours": max(0, int(getattr(config, "ANCHOR_MIN_INTERVAL_HOURS", 6) or 0)),
         "max_content": max(20, int(getattr(config, "ANCHOR_MAX_CONTENT_CHARS", 200) or 200)),
@@ -1646,6 +1673,25 @@ async def _archive_lock(chat_key: str) -> asyncio.Lock:
         return lk
 
 
+async def _best_effort_user_id(_ctx: schemas.AgentCtx) -> str:
+    """尽力确定「当前说话的人」，拿不到就返回空串（绝不抛异常）。
+
+    与 `_resolve_target_user_id` 的区别：那是好感度工具的强约束（拿不到人就该
+    告诉模型别乱调）；而 `save_note` / `anchor_memory` 属于「顺手记一下」，
+    记不成来源用户也要照常记内容 —— 所以这里只做尽力而为。
+
+    兜底链与 `_resolve_target_user_id` 一致：触发用户 → 该频道最近活跃用户。
+    """
+    uid = (_ctx.from_platform_userid or "").strip()
+    if uid:
+        return uid
+    try:
+        state = await _open_archive(_ctx.chat_key)
+        return (state.last_active_user_id or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 async def _resolve_target_user_id(_ctx: schemas.AgentCtx, target_user_id: str) -> str:
     """解析目标用户 ID。
 
@@ -2250,7 +2296,7 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
         note_cfg = _note_cfg()
         sub: List[str] = []
         if anchor_cfg["enabled"]:
-            ab = tier4.render_anchor_block(doc, anchor_cfg, "")
+            ab = tier4.render_anchor_block(doc, anchor_cfg, _ANCHOR_GUIDE)
             if ab:
                 sub.append(ab)
         if note_cfg["enabled"]:
@@ -2737,7 +2783,7 @@ async def save_note(
     res = await tier4.add_or_update_note(
         _ctx.chat_key, title, content,
         ttl_hours=int(ttl_hours or 0), min_favor=int(min_favor or 0),
-        tags=list(tags or []), source_user_id=(_ctx.from_platform_userid or "").strip(),
+        tags=list(tags or []), source_user_id=await _best_effort_user_id(_ctx),
         cfg=cfg,
     )
     action = res.get("action")
@@ -2841,6 +2887,17 @@ async def anchor_memory(
         )
     scrubbed, blocked = _scrub_profile_text(clean_content)
 
+    # 内容级硬过滤：身份锚点绝不绑定具体对象或频道。
+    # 放在 write_anchor 之前 —— 命中即返回，不消耗频率闸额度。
+    for _pat, _why in _ANCHOR_REJECT_PATTERNS:
+        _hit = _pat.search(scrubbed)
+        if _hit:
+            return (
+                f"本次未沉淀：锚点里出现了{_why}「{_hit.group(0)[:16]}」。"
+                "身份锚点必须是「我是谁」的立场，不能绑定某个人或某个频道——"
+                "这类内容请用 `save_note` 记在对应频道里。"
+            )
+
     # 去重：与既有锚点精确等值（归一化后）则就地刷新，而非新增（不占当日额度）。
     def _matcher(clean: str, existing) -> bool:  # noqa: ANN001
         return _anchor_norm(clean) == _anchor_norm(existing.content)
@@ -2849,7 +2906,7 @@ async def anchor_memory(
         scrubbed,
         salience=int(salience or 1),
         tags=list(tags or []),
-        source_user_id=(_ctx.from_platform_userid or "").strip(),
+        source_user_id=await _best_effort_user_id(_ctx),
         source_chat_key=_ctx.chat_key,
         cfg=cfg,
         salience_max=cfg["salience_max"],
@@ -3318,6 +3375,8 @@ def _persona_webui_router():
             "now_ts": _ts_now,
             # 频道笔记（阶段 B：tier4 note，接替旧 memo）
             "note_cfg": _note_cfg,
+            "note_guide": _NOTE_GUIDE,
+            "anchor_guide": _ANCHOR_GUIDE,
             "note_key": tier4._note_title_key,
             # tier4 生长层（阶段 A：身份锚点；阶段 B：+ note）
             "tier4": tier4,
