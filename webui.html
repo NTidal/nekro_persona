@@ -2003,6 +2003,29 @@ body.is-scrolling .dialog-foot {
     max-width: none;
   }
 }
+
+/* ---------- 关系档案 工具条等高校准 ---------- */
+/* 这一排三个控件原本是三种高度（* 已 box-sizing: border-box）：
+   搜索框 .field/.select min-height 34
+   分段控件 .segmented padding 3*2 + border 1*2 + .segment min-height 28 = 36
+   .btn.sm min-height 28
+   无论居中还是底对齐，上下边都会差几像素，看起来就是参差。
+   这里统一到 34px：分段内部 = 34 - padding 4 - border 2 = 28，正好容得下 .segment。
+   等高了之后 align-items 用哪种都对齐，不必再改对齐方式。 */
+#page-favor .card-head .segmented {
+  height: 34px;
+  padding: 2px;
+}
+#page-favor .card-head .segment {
+  height: 28px;
+  min-height: 0;
+  line-height: 1;
+}
+#page-favor .card-head .btn.sm {
+  height: 34px;
+  min-height: 34px;
+  padding: 4px 11px;
+}
 @media (max-width: 820px) {
   /* 移动端每格自带 data-label 标题，允许正常换行，避免横向溢出 */
   .gate-cell { flex-wrap: wrap; white-space: normal; gap: 6px; }
