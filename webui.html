@@ -1940,6 +1940,24 @@ body.is-scrolling .dialog-foot {
 }
 .group-row .badge-row { display: inline-flex; gap: 6px; margin-left: 8px; vertical-align: middle; }
 .group-row strong { font-size: 12px; letter-spacing: 0.01em; }
+
+/* ---------- 门槛 · 阶段 单元格 ---------- */
+/* 这一格有三个元素（门槛数字 + 阶段徽章 + 熟悉度徽章）。旧实现复用全局 .row
+   （flex-wrap: wrap）加上 .score-value 的 min-width:40px，挤不进列宽时
+   「熟人」会折到第二行并左对齐，看起来是歪的。这里改成专用类：单行不换行，
+   让表格自动把这列撑到刚好够宽。 */
+.gate-cell {
+  display: flex; align-items: center; gap: 8px;
+  flex-wrap: nowrap; white-space: nowrap;
+}
+.gate-cell .gate-min { display: inline-flex; align-items: center; gap: 5px; }
+.gate-cell .gate-key { color: var(--muted); font-size: 10px; letter-spacing: 0.02em; }
+.gate-cell .score-value { min-width: 0; }   /* 覆盖全局 40px，否则白占宽度 */
+.gate-cell .badge { flex: 0 0 auto; }       /* 徽章不许被压缩换行 */
+@media (max-width: 820px) {
+  /* 移动端每格自带 data-label 标题，允许正常换行，避免横向溢出 */
+  .gate-cell { flex-wrap: wrap; white-space: normal; gap: 6px; }
+}
 @media (max-width: 820px) {
   .data-table tbody tr.group-row td::before { content: none !important; }
   .data-table tbody tr.group-row td { padding: 10px 12px !important; }
@@ -3389,7 +3407,10 @@ function renderMemory() {
       </td>
       <td data-label="触发"><div class="badge-row">${trig}</div></td>
       <td data-label="门槛 · 阶段">
-        <div class="row"><span class="score-value">${e.min_favor}</span>${e.stage ? `<span class="badge accent">${esc(e.stage)}</span>` : '<span class="badge">公开</span>'}${fam}</div>
+        <div class="gate-cell">
+          <span class="gate-min"><span class="gate-key">门槛</span><span class="score-value">${e.min_favor}</span></span>
+          ${e.stage ? `<span class="badge accent">${esc(e.stage)}</span>` : '<span class="badge">公开</span>'}${fam}
+        </div>
       </td>
       <td data-label="权重"><span class="score-value">${e.weight}</span></td>
       <td data-label="热度">${e.heat_enabled ? `<span class="badge ${e.heat_on ? 'warning' : ''}" title="命中 ${e.hits} 次">${e.hits} 次 · ${e.heat}</span>` : '<span class="muted">不参与</span>'}</td>
