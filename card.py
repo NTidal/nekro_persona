@@ -1,8 +1,10 @@
 """好感度排行榜图片卡片渲染（Pillow）。
 
-暖色卡片主题（三段式渐变背景 + 圆角排行行）：
-- 三段式竖向渐变背景（#dff4f4 → #fffaf1 → #ffe4d5）
-- 强调色 #d96e64、深青文字 #294651
+暖色卡片主题 v3「焦糖奶油 · 毛玻璃」（三段式渐变 + 暖色光斑 + 磨砂玻璃面板）：
+- 三段式竖向渐变背景（#fdf6ec 奶油白 → #fbe9d2 杏黄 → #f6d5b8 蜜桃）+ 暖色装饰光斑
+- 强调色 #c46a4a 赤陶橙、暖棕文字 #4a3728
+- 毛玻璃卡片与排行行：GaussianBlur 模糊背后内容 + 暖白半透明叠加 + 圆角遮罩
+  + 玻璃描边/顶部高光（独立图层 alpha 混合）
 - 圆角排行行：名次徽标 + 昵称/ID + 阶段标签 + 好感度分值
 
 Pillow 优先直接 import 主环境已装版本；缺失时通过 NA dynamic_import_pkg
@@ -28,37 +30,60 @@ from nekro_agent.core.os_env import PLUGIN_DYNAMIC_PACKAGE_DIR
 
 logger = get_sub_logger("nekro_persona")
 
-# MomoTune 暖色配色
-_ACCENT = (217, 110, 100)         # #d96e64
-_ACCENT_SOFT = (255, 240, 231)    # #fff0e7
-_TEXT = (41, 70, 81)              # #294651
-_SUBTEXT = (95, 133, 136)         # #5f8588
-_MUTED = (141, 167, 164)          # #8da7a4
-_NEUTRAL = (150, 163, 166)        # 0 分中性色（避免把 0 渲染成"正分"珊瑚色）
-_COOL = (57, 125, 134)            # #397d86 深青（负分）
-_BG_TOP = (223, 244, 244)         # #dff4f4
-_BG_MID = (255, 250, 241)         # #fffaf1
-_BG_BOTTOM = (255, 228, 213)      # #ffe4d5
-_ROW_BG = (255, 255, 255)
-_BORDER = (224, 139, 119)
+# MomoTune 暖色配色 v2「焦糖奶油」：赤陶橙 + 暖棕 + 奶油米黄
+_ACCENT = (196, 106, 74)         # #c46a4a 赤陶橙（主强调）
+_ACCENT_LIGHT = (224, 148, 92)   # #e0945c 琥珀（渐变亮端）
+_ACCENT_SOFT = (252, 240, 228)    # #fcf0e4 浅杏（标签底）
+_TEXT = (74, 55, 40)              # #4a3728 暖棕（主文字）
+_SUBTEXT = (140, 110, 88)         # #8c6e58 驼色（次级文字）
+_MUTED = (176, 152, 132)          # #b09884 沙色（弱化文字）
+_NEUTRAL = (160, 140, 122)        # 0 分中性色（避免把 0 渲染成"正分"赤陶色）
+_COOL = (110, 128, 138)           # #6e808a 灰蓝（负分，暖调体系里的冷色对照）
+_BG_TOP = (253, 246, 236)         # #fdf6ec 奶油白
+_BG_MID = (251, 233, 210)         # #fbe9d2 杏黄
+_BG_BOTTOM = (246, 213, 184)      # #f6d5b8 蜜桃
+_BORDER = (232, 190, 160)
 _WHITE = (255, 255, 255)
 
-# 各阶段标签配色 (背景, 前景)
+# 毛玻璃背景装饰光斑 (cx_frac_w, cy_frac_h, r_frac_min, RGBA)
+# 固定构图（不用随机），保证每次渲染一致；给磨砂玻璃提供"可模糊"的内容——
+# 纯平渐变上毛玻璃效果几乎不可见。
+_BLOB_SPECS = [
+    (0.18, 0.10, 0.20, (224, 148, 92, 150)),   # 琥珀（左上）
+    (0.78, 0.06, 0.24, (196, 106, 74, 110)),   # 赤陶（右上）
+    (0.92, 0.45, 0.20, (240, 180, 140, 140)),  # 蜜桃（右中）
+    (0.08, 0.55, 0.18, (250, 220, 190, 170)),  # 奶油（左中）
+    (0.45, 0.97, 0.22, (232, 160, 110, 100)),  # 焦糖（底部）
+    (0.62, 0.35, 0.15, (246, 200, 160, 85)),   # 浅杏（中部）
+]
+
+# 各阶段标签配色 (背景, 前景) —— 全部落在暖色系，靠明度/色相微差区分层级
 _STAGE_STYLES = {
-    "排斥": ((255, 228, 213), (191, 84, 62)),
-    "保留": ((223, 244, 244), (57, 125, 134)),
-    "中立": ((240, 240, 240), (95, 133, 136)),
-    "亲近": ((221, 240, 225), (62, 142, 90)),
-    "偏爱": ((255, 240, 231), (217, 110, 100)),
-    "特别亲密": ((217, 110, 100), (255, 255, 255)),
+    "排斥": ((244, 216, 202), (170, 74, 44)),      # 深赤陶
+    "保留": ((245, 238, 222), (150, 118, 60)),      # 暖沙
+    "中立": ((240, 236, 230), (130, 112, 96)),      # 暖灰
+    "亲近": ((226, 238, 222), (86, 128, 84)),       # 鼠尾草绿（暖体系里的自然色）
+    "偏爱": ((252, 235, 220), (196, 106, 74)),      # 蜜桃
+    "特别亲密": ((196, 106, 74), (255, 255, 255)),  # 赤陶实底
 }
 
-# 前三名名次徽章配色 (底色, 字色) —— 金 / 银 / 铜
+# 前三名名次徽章配色 (底色, 字色) —— 金 / 银 / 铜（统一暖金属调）
 _RANK_METALS = [
-    ((230, 168, 42), (255, 255, 255)),
-    ((186, 197, 205), (255, 255, 255)),
-    ((202, 150, 107), (255, 255, 255)),
+    ((216, 160, 52), (255, 255, 255)),     # 暖金
+    ((190, 182, 172), (255, 255, 255)),     # 暖银
+    ((198, 138, 94), (255, 255, 255)),      # 暖铜
 ]
+
+# 字体文件名关键字，分两段：
+#   LEGACY —— 历史名单，先匹配，保证既有实例的字体选择不变
+#   EXTRA  —— 兜底名单，补充项目自带但旧名单漏掉的名字（关键：msyh）
+_FONT_HINTS_LEGACY = (
+    "cjk", "wqy", "ming", "song", "hei", "yahei",
+    "pingfang", "noto", "wenkai", "misans",
+)
+_FONT_HINTS_EXTRA = (
+    "msyh", "lxgw", "deng", "source", "harmony", "alibaba", "siyuan", "kai",
+)
 
 _FONT_CANDIDATES = [
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -76,6 +101,7 @@ _PIL_MIRRORS = ["https://mirrors.aliyun.com/pypi/simple/", "https://pypi.org/sim
 
 _font_cache: str | None = None
 _font_checked = False
+_font_key: tuple | None = None
 
 
 def _load_pil() -> Any | None:
@@ -107,11 +133,17 @@ def _load_pil() -> Any | None:
 
 
 def _find_font(font_path: str = "", font_dir: str = "") -> str | None:
-    """查找可用的中文字体文件路径，找不到返回 None。"""
-    global _font_cache, _font_checked
-    if _font_checked:
+    """查找可用的中文字体文件路径，找不到返回 None。
+
+    ⚠️ 缓存按 (font_path, font_dir) 做 key，且**只缓存成功结果**。
+       旧实现用一个全局 bool：① 换了配置不生效（参数被完全忽略）；
+       ② 首次查找失败后 _font_checked 已置位，即使之后把字体放进
+       fonts/ 也永远返回 None，只能重启进程。
+    """
+    global _font_cache, _font_checked, _font_key
+    _key = (font_path.strip(), font_dir.strip())
+    if _font_checked and _font_key == _key:
         return _font_cache
-    _font_checked = True
 
     candidates: list[str] = []
     if font_path.strip():
@@ -123,18 +155,20 @@ def _find_font(font_path: str = "", font_dir: str = "") -> str | None:
     for item in candidates:
         p = Path(item)
         if p.is_file() and p.suffix.lower() in (".ttf", ".ttc", ".otf"):
-            _font_cache = str(p)
+            _font_cache, _font_key, _font_checked = str(p), _key, True
             return _font_cache
         if p.is_dir():
-            for ext in ("*.ttf", "*.ttc", "*.otf"):
-                for f in sorted(p.rglob(ext)):
-                    name = f.name.lower()
-                    if any(
-                        k in name
-                        for k in ("cjk", "wqy", "ming", "song", "hei", "yahei", "pingfang", "noto", "wenkai", "misans")
-                    ):
-                        _font_cache = str(f)
-                        return _font_cache
+            # ⚠️ 两段匹配必须是「名单在外层、文件在内层」：
+            #    第一段用历史名单扫一遍整个目录，保证既有实例选中的字体不变
+            #    （把两个名单写进文件循环内部会让 Deng.ttf 按字母序压过
+            #     LXGWWenKai，画风静默改变）；只有第一段全目录都没命中，
+            #    才用补充名单再扫一遍 —— 兜底「只放了 msyh.ttc 的账号」。
+            for _hints in (_FONT_HINTS_LEGACY, _FONT_HINTS_EXTRA):
+                for ext in ("*.ttf", "*.ttc", "*.otf"):
+                    for f in sorted(p.rglob(ext)):
+                        if any(k in f.name.lower() for k in _hints):
+                            _font_cache, _font_key, _font_checked = str(f), _key, True
+                            return _font_cache
     logger.warning("未找到中文字体，好感度排行榜卡片将回退为文本")
     return None
 
@@ -154,45 +188,112 @@ _EMOJI_FONT_CANDIDATES = [
 
 _emoji_font_path: str | None = None
 _emoji_font_checked = False
+_emoji_font_key: tuple | None = None
 _emoji_font_cache: dict = {}
+# 选中的 emoji 字体是否含彩色图层（决定要不要传 embedded_color）
+_emoji_font_color = True
+
+
+def _font_has_color(path: str) -> bool:
+    """粗判字体是否含彩色图层（COLR / CBDT / sbix / SVG）。
+
+    单色字体（NotoEmoji-Regular、Symbola 之类）传 embedded_color=True
+    不会出颜色，部分 Pillow 版本直接报错，所以要先分辨。
+    判断失败一律当作彩色，保持旧行为。
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(12)
+            if len(head) < 12:
+                return True
+            if head[:4] == b"ttcf":      # 字体集合：表目录分散，不深究
+                return True
+            num = int.from_bytes(head[4:6], "big")
+            tags = set()
+            for _ in range(min(num, 64)):
+                rec = fh.read(16)
+                if len(rec) < 16:
+                    break
+                tags.add(rec[:4])
+            return bool(tags & {b"COLR", b"CBDT", b"sbix", b"SVG "})
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _pick_emoji_font(paths: list) -> str | None:
+    """在候选里优先挑彩色字体；没有彩色字体时退回第一个存在的（单色也能显示）。"""
+    exists = [p for p in paths if Path(p).is_file()]
+    for p in exists:
+        if _font_has_color(p):
+            return p
+    return exists[0] if exists else None
 
 
 def _find_emoji_font(font_dir: str = "") -> str | None:
-    """查找 emoji 字体：插件数据目录 fonts 下文件名含 emoji 的字体 → 系统常见路径。"""
-    global _emoji_font_path, _emoji_font_checked
-    if _emoji_font_checked:
+    """查找 emoji 字体：插件数据目录 fonts 下文件名含 emoji 的字体 → 系统常见路径。
+
+    缓存同样按 font_dir 做 key，失败不锁死。
+    """
+    global _emoji_font_path, _emoji_font_checked, _emoji_font_key, _emoji_font_color
+    _key = (font_dir.strip(),)
+    if _emoji_font_checked and _emoji_font_key == _key:
         return _emoji_font_path
-    _emoji_font_checked = True
+
+    found: str | None = None
     if font_dir.strip():
         d = Path(font_dir.strip())
         if d.is_dir():
-            for ext in ("*.ttf", "*.ttc", "*.otf"):
-                for f in sorted(d.rglob(ext)):
-                    if "emoji" in f.name.lower():
-                        _emoji_font_path = str(f)
-                        return _emoji_font_path
-    for item in _EMOJI_FONT_CANDIDATES:
-        p = Path(item)
-        if p.is_file():
-            _emoji_font_path = str(p)
-            return _emoji_font_path
-    logger.warning("未找到 emoji 字体，卡片中的 emoji 将显示为豆腐块（可放 *emoji*.ttf 到数据目录 fonts/）")
-    return None
+            local = [
+                str(f)
+                for ext in ("*.ttf", "*.ttc", "*.otf")
+                for f in sorted(d.rglob(ext))
+                if "emoji" in f.name.lower()
+            ]
+            found = _pick_emoji_font(local)
+    if not found:
+        found = _pick_emoji_font(list(_EMOJI_FONT_CANDIDATES))
+
+    if not found:
+        logger.warning("未找到 emoji 字体，卡片中的 emoji 将显示为豆腐块（可放 *emoji*.ttf 到数据目录 fonts/）")
+        return None
+
+    _emoji_font_path = found
+    _emoji_font_color = _font_has_color(found)
+    _emoji_font_key = _key
+    _emoji_font_checked = True
+    if not _emoji_font_color:
+        logger.info(f"emoji 字体为单色（{Path(found).name}），将按单色渲染")
+    return _emoji_font_path
+
+
+# 散布在"非 emoji 区"里、但确实算 emoji 的孤立符号
+_EMOJI_EXTRA = frozenset({
+    0x2194, 0x2195, 0x2196, 0x2197, 0x2198, 0x2199,   # ↔ ↕ ↖ ↗ ↘ ↙
+    0x21A9, 0x21AA,                                    # ↩ ↪
+    0x2934, 0x2935,                                    # ⤴ ⤵
+    0x2B05, 0x2B06, 0x2B07,                            # ⬅ ⬆ ⬇
+    0x2B1B, 0x2B1C, 0x2B50, 0x2B55,                    # ⬛ ⬜ ⭐ ⭕
+    0x200D, 0x20E3, 0x3030, 0x303D, 0x3297, 0x3299,
+    0x00A9, 0x00AE, 0x2122,
+})
 
 
 def _is_emoji_cp(cp: int) -> bool:
-    """粗略判断码点是否属于 emoji 区间（含 ZWJ / 变体选择符 / 肤色 / 国旗）。"""
+    """判断码点是否属于 emoji（含 ZWJ / 变体选择符 / 肤色 / 国旗）。
+
+    ⚠️ 不要用 0x2190–0x21FF（箭头）、0x2900–0x297F 这类宽区间：
+       它们绝大多数不是 emoji（← → ↑ ↓ ⇒ …），交给 emoji 字体渲染会变
+       豆腐块或风格错乱，而中文字体本来能画好。这里只覆盖真正的 emoji 区，
+       外加一个显式白名单 _EMOJI_EXTRA。
+    """
     return (
         0x1F300 <= cp <= 0x1FAFF
         or 0x1F000 <= cp <= 0x1F2FF
         or 0x1F1E6 <= cp <= 0x1F1FF
         or 0x2600 <= cp <= 0x27BF
-        or 0x2190 <= cp <= 0x21FF
-        or 0x2900 <= cp <= 0x297F
-        or 0x2B00 <= cp <= 0x2BFF
         or 0xFE00 <= cp <= 0xFE0F
         or 0x1F3FB <= cp <= 0x1F3FF
-        or cp in (0x200D, 0x20E3, 0x3030, 0x303D, 0x3297, 0x3299, 0x00A9, 0x00AE, 0x2122)
+        or cp in _EMOJI_EXTRA
     )
 
 
@@ -256,7 +357,14 @@ class _EmojiDraw:
         x = xy[0]
         for seg, is_e in runs:
             if is_e:
-                self._draw.text((x, xy[1]), seg, font=ef, embedded_color=True, **kwargs)
+                if _emoji_font_color:
+                    self._draw.text((x, xy[1]), seg, font=ef,
+                                    embedded_color=True, **kwargs)
+                else:
+                    # 单色 emoji 字体：embedded_color 无效（部分 Pillow 直接报错），
+                    # 退回用普通填充色绘制，至少字形可见。
+                    self._draw.text((x, xy[1]), seg, font=ef,
+                                    fill=fill, **kwargs)
                 x += self._draw.textlength(seg, font=ef)
             else:
                 self._draw.text((x, xy[1]), seg, fill=fill, font=font, **kwargs)
@@ -306,7 +414,12 @@ class _ScaledDraw:
     def _font(self, font: Any) -> Any:
         if font is None:
             return None
-        key = id(font)
+        # ⚠️ 不能用 id(font) 做 key：_fit_font 在缩字号循环里不断造新字体，
+        #    旧对象立即被回收，CPython 会复用 id → 命中上一轮的缓存，
+        #    拿到错误字号的字体（实测 id 确实会重复）。用 (path, size) 才稳。
+        _p = getattr(font, "path", None)
+        _sz = getattr(font, "size", None)
+        key = (_p, _sz) if (_p and _sz) else ("id", id(font))
         if key in self._font_cache:
             return self._font_cache[key]
         scaled = font
@@ -425,24 +538,108 @@ def _truncate(draw: Any, text: str, font: Any, max_width: int) -> str:
 
 
 def _vertical_bg(PIL, width: int, height: int):
-    """三段暖色竖向渐变，近似 MomoTune 模板 linear-gradient。"""
-    img = PIL.Image.new("RGB", (width, height))
-    px = img.load()
+    """三段暖色竖向渐变。
+
+    先算 1px 宽的色列再 NEAREST 横向拉伸（每行是纯色，拉伸无损失），
+    比逐像素双循环快约两个数量级。
+    """
     stops = [(0.0, _BG_TOP), (0.49, _BG_MID), (1.0, _BG_BOTTOM)]
+    col = PIL.Image.new("RGB", (1, height))
+    px = col.load()
     for y in range(height):
         t = y / max(height - 1, 1)
+        c = _BG_BOTTOM
         for i in range(len(stops) - 1):
             t0, c0 = stops[i]
             t1, c1 = stops[i + 1]
             if t0 <= t <= t1:
                 k = (t - t0) / max(t1 - t0, 1e-9)
-                col = tuple(int(c0[j] + (c1[j] - c0[j]) * k) for j in range(3))
+                c = tuple(int(c0[j] + (c1[j] - c0[j]) * k) for j in range(3))
                 break
-        else:
-            col = _BG_BOTTOM
-        for x in range(width):
-            px[x, y] = col
-    return img
+        px[0, y] = c
+    return col.resize((width, height), PIL.Image.NEAREST)
+
+
+def _decorative_blobs(PIL, width: int, height: int):
+    """暖色装饰光斑层：给毛玻璃提供"可模糊"的背景内容。
+
+    固定构图（_BLOB_SPECS），不用随机，保证每次渲染一致。
+    """
+    from PIL import ImageFilter
+
+    layer = PIL.Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    d = PIL.ImageDraw.Draw(layer)
+    mn = min(width, height)
+    for fx, fy, fr, col in _BLOB_SPECS:
+        cx, cy, r = fx * width, fy * height, fr * mn
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col)
+    return layer.filter(ImageFilter.GaussianBlur(radius=max(1, int(0.09 * mn))))
+
+
+def _frosted_panel(PIL, base, box, radius, *, blur=14, tint=(255, 250, 242), tint_alpha=70, scale=1.0):
+    """毛玻璃面板：裁剪背后区域 → 高斯模糊 → 暖白半透明叠加 → 圆角遮罩贴回。
+
+    box 为逻辑坐标 [x0, y0, x1, y1]（内部 × scale 转设备像素）。
+    裁剪外扩一个模糊半径的边距，否则面板边缘会露出未模糊的底图。
+    任何失败回退为实底圆角矩形，保证内容始终可读。
+    """
+    x0, y0, x1, y1 = [int(v * scale) for v in box]
+    w, h = x1 - x0, y1 - y0
+    if w <= 0 or h <= 0:
+        return base
+    m = max(1, int(blur * scale))
+    cx0, cy0 = max(0, x0 - m), max(0, y0 - m)
+    cx1, cy1 = min(base.width, x1 + m), min(base.height, y1 + m)
+    try:
+        from PIL import ImageFilter
+
+        region = base.crop((cx0, cy0, cx1, cy1))
+        blurred = region.filter(ImageFilter.GaussianBlur(radius=blur * scale))
+        overlay = PIL.Image.new("RGBA", blurred.size, tint + (tint_alpha,))
+        panel = PIL.Image.alpha_composite(blurred.convert("RGBA"), overlay)
+        center = panel.crop((x0 - cx0, y0 - cy0, x0 - cx0 + w, y0 - cy0 + h))
+        if center.mode != base.mode:
+            center = center.convert(base.mode)
+        mask = PIL.Image.new("L", (w, h), 0)
+        PIL.ImageDraw.Draw(mask).rounded_rectangle(
+            [0, 0, w - 1, h - 1], radius=int(radius * scale), fill=255,
+        )
+        base.paste(center, (x0, y0), mask)
+    except Exception:  # noqa: BLE001
+        logger.debug("毛玻璃面板绘制失败，回退实底", exc_info=True)
+        try:
+            fill = tint if base.mode == "RGB" else tint + (255,)
+            PIL.ImageDraw.Draw(base).rounded_rectangle(
+                [x0, y0, x1 - 1, y1 - 1], radius=int(radius * scale), fill=fill,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return base
+
+
+def _glass_edges(PIL, base, panels, scale=1.0):
+    """玻璃边缘：描边 + 顶部高光线，独立图层 alpha 混合后合成。
+
+    panels: [(box, radius, outline_rgba, highlight_rgba_or_None), ...]
+    ⚠️ ImageDraw 直接画在 RGBA 图上是**替换像素**而非混合，必须走独立图层。
+    ⚠️ 返回**新图像**：调用后不可再用此前创建的 draw 对象继续绘制。
+    """
+    try:
+        edge = PIL.Image.new("RGBA", base.size, (0, 0, 0, 0))
+        d = PIL.ImageDraw.Draw(edge)
+        lw = max(1, int(1.2 * scale))
+        for box, radius, outline, hl in panels:
+            x0, y0, x1, y1 = [int(v * scale) for v in box]
+            d.rounded_rectangle(
+                [x0, y0, x1 - 1, y1 - 1], radius=int(radius * scale), outline=outline, width=lw,
+            )
+            if hl:
+                inset = radius * scale * 0.7
+                d.line([(x0 + inset, y0 + 1), (x1 - inset, y0 + 1)], fill=hl, width=lw)
+        return PIL.Image.alpha_composite(base.convert("RGBA"), edge)
+    except Exception:  # noqa: BLE001
+        logger.debug("玻璃边缘绘制失败，已跳过", exc_info=True)
+        return base
 
 
 # 「无印象」的占位文案——不应作为标签渲染
@@ -459,22 +656,34 @@ _EMPTY_SUMMARY_TEXTS = {
 }
 
 
+def _as_int(value: Any, default: int = 0) -> int:
+    """宽松取整数：展示层遇到脏数据不应抛异常（卡片是"尽力渲染"）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
 def _clean_summary(value: Any) -> str:
     """取印象记录文本；空值或占位文案返回空串（调用方据此不渲染该标签）。"""
     s = str(value or "").strip()
     return "" if s in _EMPTY_SUMMARY_TEXTS else s
 
 
-# 头像占位配色（扩展）：按 user_id 哈希稳定取色，同一人始终同色
+# 头像占位配色（暖色系为主，保留少量低饱和冷色作区分）：按 user_id 哈希稳定取色
 _AVATAR_COLORS = [
-    ((255, 228, 213), (191, 84, 62)),    # 暖橙
-    ((223, 244, 244), (57, 125, 134)),   # 青
-    ((221, 240, 225), (62, 142, 90)),    # 绿
-    ((255, 240, 231), (217, 110, 100)),  # 粉
-    ((232, 236, 246), (86, 104, 160)),   # 蓝紫
-    ((245, 235, 250), (130, 92, 160)),   # 紫
-    ((252, 240, 218), (170, 128, 40)),   # 金
-    ((235, 242, 250), (70, 110, 150)),   # 灰蓝
+    ((246, 222, 208), (176, 84, 50)),    # 赤陶
+    ((250, 240, 222), (168, 122, 48)),    # 琥珀
+    ((240, 236, 226), (140, 110, 80)),    # 驼色
+    ((248, 230, 224), (190, 96, 96)),     # 玫瑰
+    ((238, 236, 246), (120, 106, 160)),   # 灰紫（少量冷色，避免全暖发闷）
+    ((246, 238, 228), (150, 100, 60)),    # 焦糖
+    ((250, 244, 230), (170, 140, 70)),    # 暖金
+    ((244, 238, 232), (130, 100, 90)),    # 摩卡
 ]
 
 
@@ -571,6 +780,34 @@ def render_favorability_rank(
 ) -> bytes | None:
     """渲染好感度排行榜为 PNG 卡片，返回字节；不可用时返回 None。
 
+    ⚠️ 这是**兜底包装**：契约承诺「不可用返回 None」，但内部实现有几十处
+       int()/字体/粘贴操作，任何一处被脏数据触发都会抛异常（实测
+       score="很高" 直接 ValueError）。调用方 plugin._render_rank_card 虽
+       也包了 try，但那会让整张卡片消失、回退成纯文本。这里统一兜住，
+       保证「要么出图，要么安静返回 None」。
+    """
+    try:
+        return _render_favorability_rank_impl(
+            entries, max_abs_score, limit=limit, font_path=font_path,
+            font_dir=font_dir, avatar_dir=avatar_dir, scale=scale,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("好感度排行榜卡片渲染异常，回退为文本")
+        return None
+
+
+def _render_favorability_rank_impl(
+    entries: List[dict],
+    max_abs_score: int,
+    *,
+    limit: int = 0,
+    font_path: str = "",
+    font_dir: str = "",
+    avatar_dir: str = "",
+    scale: float = 0.0,
+) -> bytes | None:
+    """真正的渲染实现（由 render_favorability_rank 兜底调用）。
+
     Args:
         entries: 已按 score 从高到低排序的档案摘要，每项含
             display_name / user_id / score / stage / updated_at。
@@ -639,7 +876,7 @@ def render_favorability_rank(
     # 注：调用方 plugin.py 的 _rank_profiles 已按 RANK_HIDE_EMPTY 过滤掉
     # 「0 分且无任何记录」的空壳档案（实测 363 → 76，最多 20 人 / 2 列），
     # 因此这里不再自行截断 —— 加了也永远触发不到，只会平白增加复杂度。
-    n_all = len(shown)
+    n_all = len(entries)      # 头部「共 N 人」用全量，与页脚「另有 X 人未显示」对齐
     n = len(shown)
     TARGET_PER_COL = 15
     if n <= 0:
@@ -662,6 +899,14 @@ def render_favorability_rank(
 
     img = _vertical_bg(PIL, int(img_w * S), int(img_h * S))
 
+    # 暖色装饰光斑：毛玻璃的"可模糊内容"（纯平渐变上看不出磨砂感）
+    try:
+        img = PIL.Image.alpha_composite(
+            img.convert("RGBA"), _decorative_blobs(PIL, img.width, img.height)
+        ).convert("RGB")
+    except Exception:  # noqa: BLE001
+        logger.debug("背景光斑绘制失败，已跳过", exc_info=True)
+
     # 卡片柔和投影（独立图层 + 高斯模糊；失败则静默跳过）
     # ⚠️ 这里必须用 card_w：旧代码误写成未定义的 `width`，一旦本 except
     #    被触发就是 NameError，然后被 except 吞掉 → 投影静默失效。
@@ -675,7 +920,7 @@ def render_favorability_rank(
                 int(MARGIN * S), int((MARGIN + 6) * S),
                 int((MARGIN + card_w) * S), int((MARGIN + card_h + 6) * S),
             ],
-            radius=int(26 * S), fill=(58, 72, 82, 64),
+            radius=int(26 * S), fill=(96, 64, 40, 70),
         )
         shadow = shadow.filter(ImageFilter.GaussianBlur(radius=10 * S))
         img = PIL.Image.alpha_composite(img.convert("RGBA"), shadow).convert("RGB")
@@ -684,11 +929,9 @@ def render_favorability_rank(
 
     draw = _make_draw(img, ImageDraw, font_dir, S)
 
-    # 卡片本体
-    draw.rounded_rectangle(
-        [MARGIN, MARGIN, MARGIN + card_w, MARGIN + card_h],
-        radius=24, fill=(255, 255, 255),
-    )
+    # 毛玻璃卡片本体（背后是渐变 + 暖色光斑，模糊后叠暖白半透明）
+    _card_box = [MARGIN, MARGIN, MARGIN + card_w, MARGIN + card_h]
+    img = _frosted_panel(PIL, img, _card_box, 24, blur=16, tint_alpha=80, scale=S)
 
     hy = MARGIN + pad                  # 标题区顶部
 
@@ -705,15 +948,32 @@ def render_favorability_rank(
     _bar_x = hx
     _bar_w = 5
     _bar_top = hy + 2 + _ink_top
-    draw.rounded_rectangle(
-        [_bar_x, _bar_top, _bar_x + _bar_w, _bar_top + _ink_h],
-        radius=2.5, fill=_ACCENT,
-    )
+    # 标题红标改为「赤陶 → 琥珀」竖向渐变 pill（超采样坐标系下直接贴图）
+    try:
+        _bw, _bh = max(1, int(_bar_w * S)), max(1, int(_ink_h * S))
+        grad = PIL.Image.new("RGB", (_bw, _bh))
+        gpx = grad.load()
+        for yy in range(_bh):
+            k = yy / max(_bh - 1, 1)
+            col = tuple(int(_ACCENT[j] + (_ACCENT_LIGHT[j] - _ACCENT[j]) * k) for j in range(3))
+            for xx in range(_bw):
+                gpx[xx, yy] = col
+        gmask = PIL.Image.new("L", (_bw, _bh), 0)
+        PIL.ImageDraw.Draw(gmask).rounded_rectangle(
+            [0, 0, _bw - 1, _bh - 1], radius=max(1, int(2.5 * S)), fill=255,
+        )
+        img.paste(grad, (int(_bar_x * S), int(_bar_top * S)), gmask)
+    except Exception:  # noqa: BLE001
+        logger.debug("标题渐变条绘制失败，回退纯色", exc_info=True)
+        draw.rounded_rectangle(
+            [_bar_x, _bar_top, _bar_x + _bar_w, _bar_top + _ink_h],
+            radius=2.5, fill=_ACCENT,
+        )
     draw.text((hx + 15, hy + 2), "好感度排行榜", font=f_title, fill=_TEXT)
 
     # 头部统计：填补原先空荡的标题右侧，同时让卡片一眼有"榜"的感觉
     if shown:
-        _scores = [int(e.get("score", 0)) for e in shown]
+        _scores = [_as_int(e.get("score"), 0) for e in shown]
         _hi, _lo = max(_scores), min(_scores)
         _stats = [f"共 {n_all} 人", f"最高 {_hi:+d}" if _hi else "最高 0"]
         if _lo < 0:
@@ -730,16 +990,15 @@ def render_favorability_rank(
         meta_text, font=f_meta, fill=_MUTED,
     )
 
-    # 标题区分隔线
+    # 标题区分隔线（暖米色）
     _line_y = hy + header_h - 16
-    draw.rectangle([hx, _line_y, hx + card_w - pad * 2, _line_y], fill=(240, 243, 245))
+    draw.rectangle([hx, _line_y, hx + card_w - pad * 2, _line_y], fill=(244, 236, 226))
 
     _av_fail = [0]   # 头像抓取连续失败计数（断网保护）
     row_base_y = hy + header_h
-    TOP_BG = [(255, 250, 235), (246, 249, 251), (253, 245, 237)]        # 前三名淡底
-    TOP_BORDER = [(240, 214, 150), (206, 216, 224), (232, 205, 178)]
-    SOFT_BORDER = (235, 239, 241)
-    TRACK = (236, 240, 242)
+    TRACK = (243, 235, 226)
+    # 玻璃边缘收集（卡片 + 各行），渲染结束后统一合成一层
+    _edge_panels = [(_card_box, 24, (255, 255, 255, 150), (255, 255, 255, 210))]
 
     for i, entry in enumerate(shown):
         rank = i + 1
@@ -756,15 +1015,19 @@ def render_favorability_rank(
         y = row_base_y + _row * (row_h + gap)
         is_top = rank <= 3
 
-        draw.rounded_rectangle(
-            [cx0, y, cx1, y + row_h],
-            radius=14,
-            fill=TOP_BG[rank - 1] if is_top else _ROW_BG,
-            outline=TOP_BORDER[rank - 1] if is_top else SOFT_BORDER,
-            width=1,
-        )
+        # 毛玻璃排行行：前三名 tint 略强、边缘用名次金属色，其余暖白细边
+        _row_box = [cx0, y, cx1, y + row_h]
+        if is_top:
+            img = _frosted_panel(
+                PIL, img, _row_box, 14, blur=10,
+                tint=(255, 246, 236), tint_alpha=64, scale=S,
+            )
+            _edge_panels.append((_row_box, 14, _RANK_METALS[rank - 1][0] + (170,), None))
+        else:
+            img = _frosted_panel(PIL, img, _row_box, 14, blur=10, tint_alpha=56, scale=S)
+            _edge_panels.append((_row_box, 14, (255, 255, 255, 90), None))
 
-        score = int(entry.get("score", 0))
+        score = _as_int(entry.get("score"), 0)
         # 0 分走中性色：旧实现 score>=0 一律珊瑚色，把 0 画成了"正分"
         if score > 0:
             score_color = _ACCENT
@@ -808,11 +1071,17 @@ def render_favorability_rank(
         ay = by
         ar = AV_R
         av_img = None
-        # 连续失败 3 次就放弃后续抓取，避免断网时整张图卡住
-        if avatar_dir and _av_fail[0] < 3:
+        # 连续失败 3 次就放弃后续抓取，避免断网时整张图卡住。
+        # ⚠️ 只有纯数字 ID（QQ 号）才有头像源：非数字 ID 直接跳过，
+        #    且**不计入失败**。旧实现把它当失败，导致混合频道里前 3 个
+        #    网页/管理员用户就把额度用光，后面所有 QQ 用户都没有头像
+        #    （实测 6 条混合数据只尝试了 3 次）。
+        if avatar_dir and _av_fail[0] < 3 and uid_for_avatar.isdigit():
             av_img = _load_avatar_image(PIL, uid_for_avatar, avatar_dir)
             if av_img is None:
                 _av_fail[0] += 1
+            else:
+                _av_fail[0] = 0      # 成功即归零，与「连续失败」的语义一致
         if av_img is not None:
             side = int(ar * 2 * S)
             try:
@@ -820,7 +1089,7 @@ def render_favorability_rank(
                 mask = PIL.Image.new("L", (side, side), 0)
                 PIL.ImageDraw.Draw(mask).ellipse([0, 0, side, side], fill=255)
                 img.paste(thumb, (int((ax - ar) * S), int((ay - ar) * S)), mask)
-                draw.ellipse([ax - ar, ay - ar, ax + ar, ay + ar], outline=(255, 255, 255), width=2)
+                draw.ellipse([ax - ar, ay - ar, ax + ar, ay + ar], outline=(255, 250, 243), width=2)
             except Exception:  # noqa: BLE001
                 av_img = None
         if av_img is None:
@@ -876,8 +1145,8 @@ def render_favorability_rank(
                         [mid_x - fw, bar_y, mid_x, bar_y + bar_h],
                         radius=2.5, fill=score_color,
                     )
-        # 中点刻度：让"零"在条上可见
-        draw.rectangle([mid_x, bar_y - 1, mid_x + 1, bar_y + bar_h], fill=(205, 213, 218))
+        # 中点刻度：让"零"在条上可见（暖棕刻度）
+        draw.rectangle([mid_x, bar_y - 1, mid_x + 1, bar_y + bar_h], fill=(224, 210, 194))
 
         # ---------- 右下：好感等级 ----------
         stage = str(entry.get("stage") or "").strip()
@@ -897,7 +1166,10 @@ def render_favorability_rank(
         # ---------- 左下：ID + 关系标签 + 印象记录（独占一行，空间充足）----------
         uid = str(entry.get("user_id") or "")
         summ = _clean_summary(entry.get("summary"))
-        rel = [str(t).strip() for t in (entry.get("tags") or []) if str(t).strip()]
+        _raw_tags = entry.get("tags") or []
+        if isinstance(_raw_tags, str):      # 后端/历史数据可能是逗号分隔的字符串
+            _raw_tags = _raw_tags.replace("，", ",").replace("、", ",").split(",")
+        rel = [str(t).strip() for t in _raw_tags if str(t).strip()]
         # 关系标签超过 3 个时随机取 3 个（避免总是展示同几条，也让卡片每次有变化）
         if len(rel) > 3:
             rel = random.sample(rel, 3)
@@ -947,9 +1219,9 @@ def render_favorability_rank(
             #   关系 → 珊瑚（分类标签，强调）
             #   印象 → 淡青（一句话描述，与标签区分）
             if kind == "ID":
-                tag_bg, tag_fg = (243, 245, 247), (124, 138, 148)
+                tag_bg, tag_fg = (244, 238, 230), (140, 118, 98)
             elif kind == "SUM":
-                tag_bg, tag_fg = (229, 243, 241), (54, 118, 114)
+                tag_bg, tag_fg = (247, 240, 226), (154, 120, 62)
             else:
                 tag_bg, tag_fg = _ACCENT_SOFT, _ACCENT
             draw.rounded_rectangle(
@@ -969,6 +1241,9 @@ def render_favorability_rank(
         tip = f"另有 {_omitted} 人未显示"
         draw.text((hx + 1, fy), tip, font=f_sub, fill=_MUTED)
 
+    # 玻璃边缘（描边 + 顶部高光）最后统一合成：返回新图像，之后不再绘制
+    img = _glass_edges(PIL, img, _edge_panels, scale=S)
+
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.convert("RGB").save(buf, format="PNG")
     return buf.getvalue()

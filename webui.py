@@ -506,8 +506,19 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
 
     # ---------------- 页面 ----------------
     @router.get("/", response_class=HTMLResponse, summary="人格记忆 管理页")
-    async def index() -> str:
-        return PAGE_HTML
+    async def index() -> HTMLResponse:
+        # ⚠️ 必须禁止缓存：页面里的 JS 直接决定发给后端的 JSON 形状。
+        #    一旦浏览器跑着**旧页面**、后端却是**新契约**，就会把结构化数据写坏
+        #    （实测发生过两次：rubric.items 被写成逗号串、rubric.rules 被逐字拆开）。
+        #    这里返回 no-store，保证每次打开都是与后端匹配的那一版。
+        return HTMLResponse(
+            content=PAGE_HTML,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
 
     # ---------------- API ----------------
     @router.get("/api/overview", summary="概览")
@@ -1496,15 +1507,44 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             }
         if "rubric" in body and isinstance(body["rubric"], dict):
             rubric = body["rubric"]
-            items = []
-            for item in rubric.get("items") or []:
-                if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    items.append([str(item[0])[:16], str(item[1])[:200]])
+            _STALE_HINT = "（若你刚更新过插件，多半是浏览器仍在用缓存的旧页面，请 Ctrl+F5 强制刷新）"
+
+            # ⚠️ 严格校验，不做「聪明」的容错。
+            #    历史上这里曾经：items 直接迭代 → 传字符串时逐字符丢数据；
+            #    后来改成「字符串按行解析」→ 逗号串被当成一整行收下，依旧写坏。
+            #    结论：形状不对就 400，让调用方看到错误，绝不静默落盘。
+            raw_items = rubric.get("items")
+            if raw_items is None or raw_items == "":
+                raw_items = []
+            if not isinstance(raw_items, (list, tuple)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"rubric.items 必须是 [[分值, 说明], …] 数组{_STALE_HINT}",
+                )
+            items: List[List[str]] = []
+            for item in raw_items:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"rubric.items 每一项都必须是 [分值, 说明] 二元组{_STALE_HINT}",
+                    )
+                items.append([str(item[0])[:16], str(item[1])[:200]])
+
+            raw_rules = rubric.get("rules")
+            if raw_rules is None or raw_rules == "":
+                raw_rules = []
+            if not isinstance(raw_rules, (list, tuple)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"rubric.rules 必须是字符串数组{_STALE_HINT}",
+                )
+            rules = [str(x)[:200] for x in raw_rules if str(x).strip()][:20]
+
             patch["rubric"] = {
                 "header": str(rubric.get("header") or "")[:60],
                 "intro": str(rubric.get("intro") or "")[:300],
                 "items": items,
-                "rules": [str(x)[:200] for x in (rubric.get("rules") or [])][:20],
+                "rules": rules,
             }
         # 扩展：分档互动指引（key = 档位名）
         if "stage_guides" in body and isinstance(body["stage_guides"], dict):

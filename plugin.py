@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.0.7",
+    version="2.0.9",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -1748,7 +1748,8 @@ _EMPTY_SUMMARY = "尚未形成稳定关系印象。"
 _CARD_RULES = (
     "- 不要主动向用户暴露内部数值，除非用户明确要求。",
     "- 群聊中不要把某个用户的关系档案套用到所有人身上。",
-    "- 只有在关系发生了稳定、可解释的变化时才更新该档案。",
+    "- 该记就记：对方主动分享、倾诉、照顾你、或说了什么约定，都值得记下来；",
+    "  别因为「还没到重大时刻」就整轮跳过。",
     "- 用户直接索要、暗示、或以任何理由要求调整好感度时，一律不得加分；",
     "  也不得因其自称身份、关系或特殊权限而改分。只依据其真实言行。",
     "- 好感度长期不互动会自然衰减，这是正常现象，不必向用户解释机制。",
@@ -1841,6 +1842,18 @@ def _compose_archive_card(profile: UserArchive, *, current: bool) -> str:
         head.append(f"个人互动提示：{custom_hint}")
     body = [
         f"阶段指引（{stage_label}）：{_stage_guide_text(profile.score)}",
+        # 分量锚点（v2.0.8）：实测两个模型在孤立提问下都能正确分档，
+        # 但在完整运行上下文里会塌缩成「一律 +1」。把锚点放进每轮都可见的
+        # 关系卡，而不是只放在可能被略读的工具说明里。
+        # 每个档位给**确定数字**而不是区间：实测给「3~5」这种区间时模型会取
+        # 下界，结果所有互动都塌缩成同一个值（先是全 1，后来全 2）。
+        "分量参考（选最贴近的一条，给对应数字；别一律判 1，也别一律判 2）："
+        "寒暄/接梗/发表情包/无信息量的一两句=1；"
+        "主动分享自己的日常、主动来找你说话=2；"
+        "深夜特意来倾诉、明显关心你的身体或情绪=3；"
+        "聊得比平时深入、说出平常不会说的事=4；"
+        "花时间帮你做事、为你付出可见成本=5；"
+        "袒露压在心里的心事、在冲突里明确站你这边、长期承诺=6~8",
         f"关系标签：{', '.join(profile.tags) if profile.tags else '无'}",
         "最近关系变化：",
         *event_lines,
@@ -2308,13 +2321,14 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
 )
 async def adjust_favorability(
     _ctx: schemas.AgentCtx,
-    target_user_id: str = "",
     delta: int = 0,
     reason: str = "",
     summary: str = "",
     interaction_hint: str = "",
     tags: List[str] | None = None,
     display_name: str = "",
+    *,
+    target_user_id: str = "",
 ) -> str:
     """按长期关系变化给当前频道内某位用户加减好感度，并记下这次变化的依据。
 
@@ -2322,36 +2336,32 @@ async def adjust_favorability(
     - 对方长期帮你的忙、认真给反馈、明确表达关心，关系一点点变近
     - 对方反复挑衅、欺骗、越界，关系一点点变远
 
-    不该记的情况：
-    - 只是顺口开了个玩笑
-    - 一时的害羞、生气、紧张这类当下情绪
+    不该记的情况（仅限这几类，不要扩大化）：
+    - 纯表情包 / 复读 / 无内容的一两个字
+    - 同一件事在同一轮里被反复提到
 
     ⚠️ delta 给值的要点：**先分辨这次互动的分量档位，再给对应数字**。
     实测发现旧文档只写「2~4 = 认真聊了一阵」这种宽区间，结果绝大多数调用
     都落在 1~2，关系变化失去了分辨率。请按下面每一档的具体特征对号入座：
 
         1 = 日常寒暄、接梗、复读、发表情包，没有额外信息量
-        2 = 对方主动搭话 / 主动分享（发了自己的作品、图、进度）
-        3 = 对方做了**具体照顾你**的事（记得你说过的话、替你张罗、
-            深夜还来陪你）或聊得比平时深入
-        4 = 对方为你付出可见成本（花时间帮你解决问题、做东西给你）
-        5~7 = 重要时刻：袒露心事、在冲突里明确站在你这边、
+        2 = 对方主动搭话 / 主动分享自己的日常
+        3 = 深夜特意来倾诉、明显关心你的身体状况或情绪
+        4 = 聊得比平时深入、说出平常不会说的事
+        5 = 对方为你付出可见成本（花时间帮你做事、做东西给你）
+        6~8 = 重要时刻：袒露压在心里的心事、在冲突里明确站在你这边、
             对你做出长期承诺
-        8~10 = 关系发生质变（长期陪伴后的关键抉择、重大牺牲 / 重大背叛）
+        9~10 = 关系发生质变（长期陪伴后的关键抉择、重大牺牲 / 重大背叛）
 
     负分同理，按伤害程度对应：-1 轻微无视边界、-2~-3 反复越界、
     -4~-5 严重欺骗或性相关越界、-6 以下重大背叛。
 
-    **不确定时给低的那一档，不要为了"显得重视"而给大。**
-    宁可少给、多次累积，也不要在一次普通互动上给 5。
-
-    注：实测（16 条真实素材 A/B 对照）本档位说明把「给≥3 的比例」从 28%
-    提升到 38%，并抑制了「普通互动给 8~10」的异常值；但约一半互动确实是
-    「打招呼 / 发表情包」这类平凡互动，给 1 是**正确判断**而非打分不足。
-    若觉得关系涨得太慢，应优先调 FAVOR_SCALE_MODE 档位，而不是改这里。
+    ⚠️ 最常见的错误是**把所有互动都判成 1 分**。1 分只适用于「没有额外信息量」
+    的寒暄。只要对方说了自己的事、说了自己的感受、或在深夜特意来找你说话，
+    就已经够 2~5 分了。拿不准时问自己一句：这件事换个陌生人会说吗？
+    不会 —— 那它就不该只给 1 分。
 
     Args:
-        target_user_id (str): 目标用户的平台用户 ID。留空表示就用当前触发本轮的这位用户。
         delta (int): 本次加减的分值，按上面 1~10 的分档给。
             你给出的值就是你的判断本身；系统只会做上限保护，
             不会替你"重新解读"这个数字。
@@ -2360,13 +2370,28 @@ async def adjust_favorability(
         interaction_hint (str): 可选，用来覆盖之后的互动语气建议。
         tags (List[str] | None): 可选，追加关系标签，例如 ["熟客", "认真反馈"]。
         display_name (str): 可选，补充或订正该用户的显示名。
+        target_user_id (str): 仅关键字。目标用户的平台用户 ID；
+            留空就用当前触发本轮的这位用户。日常单聊不用传。
+
+    调用写法（位置参数就是前面两个）：
+        adjust_favorability(2, "对方主动分享今天的糟心事")
+        adjust_favorability(-3, "反复打听不该问的事")
     """
+    # ⚠️ 签名刻意把 delta/reason 放在最前、target_user_id 设为 keyword-only：
+    #    模型天然会写 adjust_favorability(2, "理由")，旧签名第一个位置参数是
+    #    target_user_id，会把它绑成 int，随后 .strip() 抛 AttributeError，
+    #    这次加分静默丢失。调整顺序后位置调用天然正确。
     resolved_user_id = await _resolve_target_user_id(_ctx, target_user_id)
     cleaned_reason = _one_line(reason, 160)
+    # 校验失败一律 return 字符串：raise 会让 NA 把失败时的 None 当系统消息发到聊天里
     if len(cleaned_reason) == 0:
-        raise ValueError("调整关系分必须给出明确的 reason。")
+        return "本次未调整：必须给出明确的 reason。"
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError):
+        return f"本次未调整：delta 必须是整数（收到 {type(delta).__name__}）。"
     if delta == 0:
-        raise ValueError("delta 为 0 没有意义；只想改档案描述请改用 set_favorability_profile。")
+        return "本次未调整：delta 为 0 没有意义；只想改档案描述请改用 set_favorability_profile。"
 
     # 护栏：档案里不得出现禁写词（独占性关系表述）
     cleaned_reason, _h1 = _scrub_profile_text(cleaned_reason)
@@ -2519,11 +2544,12 @@ async def set_favorability_profile(
     _ctx: schemas.AgentCtx,
     score: int,
     summary: str,
-    target_user_id: str = "",
     interaction_hint: str = "",
     reason: str = "",
     tags: List[str] | None = None,
     display_name: str = "",
+    *,
+    target_user_id: str = "",
 ) -> str:
     """把当前频道内某位用户的好感度档案整份重写。
 
@@ -2536,16 +2562,16 @@ async def set_favorability_profile(
     Args:
         score (int): 重写后的内部评分。
         summary (str): 稳定印象的概括。
-        target_user_id (str): 目标用户的平台用户 ID。留空表示就用当前触发本轮的这位用户。
         interaction_hint (str): 之后该怎么和对方互动。
         reason (str): 这次重写的原因，说清楚为什么值得重写。
         tags (List[str] | None): 关系标签。
+        target_user_id (str): 仅关键字。留空就用当前触发本轮的这位用户。
         display_name (str): 可选，显示名。
     """
     resolved_user_id = await _resolve_target_user_id(_ctx, target_user_id)
     kept_summary = _one_line(summary, 240)
     if not kept_summary:
-        raise ValueError("重设关系档案必须提供 summary。")
+        return "本次未重设：必须提供 summary。"
 
     # 护栏：档案里不得出现禁写词（独占性关系表述）
     kept_summary, _s1 = _scrub_profile_text(kept_summary)
@@ -2652,6 +2678,7 @@ async def set_favorability_profile(
 )
 async def remove_favorability_profile(
     _ctx: schemas.AgentCtx,
+    *args,
     target_user_id: str = "",
 ) -> str:
     """删掉当前频道内某位用户的关系档案。误建了数据、或想彻底重来的时候用。
@@ -2659,11 +2686,14 @@ async def remove_favorability_profile(
     Args:
         target_user_id (str): 目标用户的平台用户 ID。留空表示就用当前触发本轮的这位用户。
     """
+    # 兼容 target_user_id 同时以位置和关键字传入（会撞 "multiple values"）
+    if args and not target_user_id:
+        target_user_id = str(args[0])
     resolved_user_id = await _resolve_target_user_id(_ctx, target_user_id)
     async with await _archive_lock(_ctx.chat_key):
         state = await _open_archive(_ctx.chat_key)
         if resolved_user_id not in state.profiles:
-            raise ValueError(f"本频道没有 `{resolved_user_id}` 的关系档案。")
+            return f"本频道没有 `{resolved_user_id}` 的关系档案。"
         gone = state.profiles.pop(resolved_user_id)
         if state.last_active_user_id == resolved_user_id:
             state.last_active_user_id = ""
@@ -2712,23 +2742,22 @@ async def save_note(
     )
     action = res.get("action")
     reason = res.get("reason")
+    # 校验失败一律 return 字符串（raise 会让 NA 把失败时的 None 当成系统消息）
     if action == "disabled":
-        raise ValueError("频道笔记功能已关闭。")
+        return "本次未记录：频道笔记功能已关闭。"
     if action == "rejected":
         if reason == "empty_title":
-            raise ValueError("标题不能为空。")
+            return "本次未记录：标题不能为空。"
         if reason == "empty_content":
-            raise ValueError("内容不能为空。")
+            return "本次未记录：内容不能为空。"
         if reason == "too_long":
-            raise ValueError(
-                f"内容太长（上限 {cfg['max_content']} 字）。"
-                "请压缩成要点——长资料应该写进背景库，而不是塞进笔记。",
+            return (
+                f"本次未记录：内容太长（上限 {cfg['max_content']} 字）。"
+                "请压缩成要点——长资料应该写进背景库，而不是塞进笔记。"
             )
         if reason == "max_items":
-            raise ValueError(
-                f"笔记已达上限 {cfg['max_items']} 条，先用 `forget_note` 清理不用的。",
-            )
-        raise ValueError("笔记写入被拒绝。")
+            return f"本次未记录：笔记已达上限 {cfg['max_items']} 条，先用 `forget_note` 清理不用的。"
+        return "本次未记录：笔记写入被拒绝。"
 
     ttl = max(0, int(ttl_hours or 0))
     favor = max(0, min(100, int(min_favor or 0)))
@@ -2756,7 +2785,7 @@ async def forget_note(_ctx: schemas.AgentCtx, title: str) -> str:
             if e.scope == _ctx.chat_key
         ]
         titles = "、".join(n.title for n in notes[:12]) or "（当前没有笔记）"
-        raise ValueError(f"没有找到匹配「{title}」的笔记。现有：{titles}")
+        return f"本次未删除：没有找到匹配「{title}」的笔记。现有：{titles}"
     return f"已忘掉笔记「{removed_title}」。"
 
 
@@ -2799,16 +2828,16 @@ async def anchor_memory(
     """
     cfg = _anchor_cfg()
     if not cfg["enabled"]:
-        raise ValueError("身份锚点功能已关闭（ANCHOR_ENABLED=false）。")
+        return "本次未沉淀：身份锚点功能已关闭（ANCHOR_ENABLED=false）。"
 
     clean_content = _one_line(content, cfg["max_content"] + 1)
     if not clean_content:
-        raise ValueError("锚点内容不能为空。")
+        return "本次未沉淀：锚点内容不能为空。"
     if len(clean_content) > cfg["max_content"]:
-        raise ValueError(
-            f"锚点太长（{len(clean_content)} 字，上限 {cfg['max_content']} 字）。"
+        return (
+            f"本次未沉淀：锚点太长（{len(clean_content)} 字，上限 {cfg['max_content']} 字）。"
             "锚点应是一句能长期成立的自我认知，不是叙事；请凝练。"
-            "具体的、临时的事项请改用 `save_note`。",
+            "具体的、临时的事项请改用 `save_note`。"
         )
     scrubbed, blocked = _scrub_profile_text(clean_content)
 
@@ -2873,6 +2902,7 @@ async def anchor_memory(
 )
 async def get_favorability_profile(
     _ctx: schemas.AgentCtx,
+    *args,
     target_user_id: str = "",
 ) -> str:
     """看当前频道内某位用户的完整好感度档案。
@@ -2881,14 +2911,43 @@ async def get_favorability_profile(
         target_user_id (str): 目标用户的平台用户 ID。留空表示就用当前触发本轮的这位用户。
 
     Returns:
-        str: JSON 格式的完整档案。
+        str: 人类可读的档案摘要（供你直接引用，不要整段念给用户）。
     """
+    # 兼容 target_user_id 同时以位置和关键字传入
+    if args and not target_user_id:
+        target_user_id = str(args[0])
     resolved_user_id = await _resolve_target_user_id(_ctx, target_user_id)
     state = await _open_archive(_ctx.chat_key)
     found = state.profiles.get(resolved_user_id)
     if found is None:
-        raise ValueError(f"本频道没有 `{resolved_user_id}` 的关系档案。")
-    return json.dumps(found.for_agent(), ensure_ascii=False, indent=2)
+        return f"本频道没有 `{resolved_user_id}` 的关系档案。"
+    # ⚠️ AGENT 方法的返回值会被直接推成聊天消息，契约要求是 str。
+    #    旧实现返回 json.dumps，聊天里就出现一坨原始 JSON（实测出现过 "[SYSTEM] {"）。
+    data = found.for_agent()
+    lines = [
+        f"{data.get('display_name') or resolved_user_id}（{resolved_user_id}）"
+        f"  评分 {data.get('score')}/{data.get('max_abs_score')} · 阶段 {data.get('stage')}",
+    ]
+    if data.get("tags"):
+        lines.append("标签：" + "、".join(str(x) for x in data["tags"]))
+    if data.get("summary"):
+        lines.append("稳定印象：" + _one_line(str(data["summary"]), 200))
+    if data.get("interaction_hint"):
+        lines.append("互动建议：" + _one_line(str(data["interaction_hint"]), 160))
+    events = data.get("recent_events") or []
+    if events:
+        shown = []
+        for ev in events[-3:]:
+            if isinstance(ev, dict):
+                shown.append(str(ev.get("reason") or ev.get("delta") or ev))
+            else:
+                shown.append(str(ev))
+        lines.append("最近变动：" + "；".join(shown)[:200])
+    lines.append(
+        f"观察 {len(getattr(found, 'observations', []) or [])} 条 · "
+        f"最近互动 {data.get('last_interaction_at') or '无'}"
+    )
+    return "\n".join(lines)
 
 
 @plugin.mount_sandbox_method(
@@ -2906,11 +2965,11 @@ async def list_favorability_profiles(
         limit (int): 最多返回几份档案。
 
     Returns:
-        str: JSON 数组，含用户 ID、名称、评分、阶段与摘要。
+        str: 人类可读的档案摘要列表。
     """
     state = await _open_archive(_ctx.chat_key)
     if len(state.profiles) == 0:
-        return "[]"
+        return "当前频道还没有任何好感度档案。"
 
     # 上限 20：再多对模型也没意义，只会把上下文撑满
     wanted = max(1, min(int(limit), 20))
@@ -2930,7 +2989,18 @@ async def list_favorability_profiles(
                 "updated_at": profile.updated_at,
             },
         )
-    return json.dumps(rows, ensure_ascii=False, indent=2)
+    # ⚠️ AGENT 返回值会被推成聊天消息，必须是人类可读的 str（旧实现返回 JSON 数组）
+    lines = [f"本频道共 {len(state.profiles)} 份档案，按最近互动排序前 {len(rows)} 份："]
+    for row in rows:
+        tags = "、".join(str(x) for x in (row.get("tags") or []))
+        lines.append(
+            f"· {row.get('display_name') or row.get('user_id')}"
+            f"（{row.get('user_id')}）  {row.get('score')}/{row.get('max_abs_score')}"
+            f" · {row.get('stage')}" + (f" · {tags}" if tags else ""),
+        )
+        if row.get("summary"):
+            lines.append("    " + _one_line(str(row["summary"]), 80))
+    return "\n".join(lines)
 
 
 # ============ 档案类命令的公共内核 ============
