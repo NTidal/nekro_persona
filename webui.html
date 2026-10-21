@@ -1971,6 +1971,38 @@ body.is-scrolling .dialog-foot {
     white-space: nowrap;
   }
 }
+
+/* ---------- 笔记 / 关系记忆 工具条对齐 ---------- */
+/* .toolbar 默认 align-items:center，但这两页里两个子元素高度不同：
+   左边 .search-wrap 只有一个输入框（34px），右边 .field-label 是
+   「频道」文字 + 下拉（约 57px）。居中之后输入框顶边比下拉框高约 11px，
+   看起来就是歪的。改成底对齐，两个控件的边线才会齐。
+   不给搜索框加假标签，避免凭空多出一行空白。 */
+#page-memo .card-head .toolbar,
+#page-memlog .card-head .toolbar {
+  align-items: flex-end;
+}
+/* 频道名很长（带「124 人 · 最高 100」），不加限制会把搜索框和右侧徽章挤扁 */
+#page-memo .card-head .field-label,
+#page-memlog .card-head .field-label {
+  max-width: min(380px, 42vw);
+  min-width: 200px;
+}
+#page-memo .card-head .search-wrap,
+#page-memlog .card-head .search-wrap {
+  flex: 1 1 240px;
+}
+@media (max-width: 820px) {
+  /* 窄屏换行后底对齐会让空行参差，回到居中对齐更稳 */
+  #page-memo .card-head .toolbar,
+  #page-memlog .card-head .toolbar {
+    align-items: stretch;
+  }
+  #page-memo .card-head .field-label,
+  #page-memlog .card-head .field-label {
+    max-width: none;
+  }
+}
 @media (max-width: 820px) {
   /* 移动端每格自带 data-label 标题，允许正常换行，避免横向溢出 */
   .gate-cell { flex-wrap: wrap; white-space: normal; gap: 6px; }
