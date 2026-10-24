@@ -2036,6 +2036,12 @@ body.is-scrolling .dialog-foot {
   .data-table tbody tr.group-row { border-radius: var(--radius-sm); }
 }
 
+/* 锚点核心度圆点：可点，给出手型与吸附反馈 */
+#anchorList .salience-dots { cursor: pointer; }
+#anchorList .salience-dots i { transition: transform 0.12s ease, background 0.12s ease; }
+#anchorList .salience-dots:hover i { transform: scale(1.25); }
+#anchorList .salience-dots i:hover { background: var(--accent); }
+
 </style>
 </head>
 <body>
@@ -2871,6 +2877,7 @@ const state = {
   memlogSearch: '',
   previewChannel: '',
   previewScore: 0,
+  previewRendered: false,
   maxAbs: 100,
 };
 
@@ -2882,6 +2889,13 @@ function setDemo(on, reason = '') {
   // 把真实原因挂在 tooltip 上：接口路径写错 / 500 / 字段不匹配全都走这条
   // 回落路径，只显示"演示数据"极难排查。
   badge.title = on ? `后端不可用：${reason || '未知原因'}` : '';
+  // 演示模式下导出按钮没有意义（下载不到真实文件），直接禁用并说明原因
+  ['#exportPersonaBtn', '#exportTier4Btn'].forEach((sel) => {
+    const b = document.querySelector(sel);
+    if (!b) return;
+    b.disabled = on;
+    b.title = on ? '演示数据模式下无法导出真实文件（后端不可达）' : '';
+  });
   if (on && changed) {
     toast(`后端暂不可达，已切换为内置演示数据${reason ? '（' + reason + '）' : ''}`, 'warning', 4200);
   } else if (on && reason) {
@@ -3916,7 +3930,22 @@ const onProfileDlgClick = async (e) => {
       },
       okMsg: '分数已更新',
     });
-    if (res) { closeDialog(); loadFavor(); }
+    if (res) {
+      // ⚠️ 不关弹窗：改完分数接着改标签 / 稳定印象是常见操作，
+      //    原来一关就得重新从列表里把档案翻出来。
+      const applied = (typeof res.score === 'number') ? res.score : score;
+      if (typeof res.score === 'number' && res.score !== score) {
+        // 钳制要明说：后端会按 ±上限截断，静默变成 100 会让人以为没保存成功
+        toast(`已按上限截断：你输入 ${score}，实际生效 ${res.score}`, 'warning', 5200);
+      }
+      const inp = $('#pfScore');
+      if (inp) inp.value = applied;
+      if (res.stage) {
+        const sub = $('#dialogSubtitle');
+        if (sub) sub.textContent = `${chatKey} · ${uid} · ${res.stage}`;
+      }
+      loadFavor();   // 背景列表同步刷新（弹窗保持打开）
+    }
   }
   if (act === 'save-profile') {
     const chatKey = $('#pfChat').value, uid = $('#pfUid').value;
@@ -4234,6 +4263,7 @@ async function loadPreview() {
 $('#previewScore').addEventListener('input', (e) => {
   state.previewScore = parseInt(e.target.value, 10) || 0;
   $('#previewScoreOut').textContent = state.previewScore;
+  _schedulePreview();
 });
 $('#previewPresets').addEventListener('click', (e) => {
   const b = e.target.closest('.preset');
@@ -4241,10 +4271,11 @@ $('#previewPresets').addEventListener('click', (e) => {
   state.previewScore = parseInt(b.dataset.v, 10);
   $('#previewScore').value = state.previewScore;
   $('#previewScoreOut').textContent = state.previewScore;
+  _schedulePreview();
 });
 $('#previewChannel').addEventListener('change', (e) => { state.previewChannel = e.target.value; });
 
-$('#previewRunBtn').addEventListener('click', async () => {
+async function runPreview() {
   const chatKey = $('#previewChannel').value;
   if (!chatKey) { toast('请先选择频道', 'warning'); return; }
   const btn = $('#previewRunBtn');
@@ -4271,7 +4302,18 @@ $('#previewRunBtn').addEventListener('click', async () => {
     ['消息扫描上限', d.message_scan_limit],
     ['关系记忆', `${d.memory_log_injected}/${d.memory_log_total} 条`],
   ].map(([k, v]) => `<div class="debug-cell"><span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join('');
-});
+  state.previewRendered = true;
+}
+$('#previewRunBtn').addEventListener('click', runPreview);
+
+/* 滑块 / 预设改动后自动重渲：首次点「生成预览」之前不打扰（避免一进页面就发请求），
+   渲染过一次之后调整分数即时生效，不用每次再点按钮。 */
+let _pvTimer = null;
+function _schedulePreview() {
+  if (!state.previewRendered) return;
+  clearTimeout(_pvTimer);
+  _pvTimer = setTimeout(() => { runPreview(); }, 300);
+}
 
 /* ---------------- 频道笔记 ---------------- */
 async function loadMemo() {
@@ -4411,7 +4453,8 @@ function renderAnchor(data) {
         <strong>${esc(a.title || a.id)}</strong>
         <p>${esc(a.content || '')}</p>
         <div class="list-meta">
-          <span class="salience-dots" title="权重 ${a.salience}">${Array.from({ length: max }, (_, i) => `<i class="${i < a.salience ? 'on' : ''}"></i>`).join('')}</span>
+          <span class="salience-dots" role="button" tabindex="0" data-act="salience-set" data-id="${esc(a.id)}"
+                title="核心度 ${a.salience}/${max} · 点圆点直接设置">${Array.from({ length: max }, (_, i) => `<i data-v="${i + 1}" class="${i < a.salience ? 'on' : ''}"></i>`).join('')}</span>
           ${a.min_favor ? `<span class="badge accent">门槛 ${a.min_favor}</span>` : ''}
           ${(a.tags || []).map((t) => `<span class="chip">${esc(t)}</span>`).join('')}
           <span class="muted" style="font-size:10px">${esc(a.scope || '')} · ${fmtTs(a.created_at)}</span>
@@ -4427,6 +4470,22 @@ function renderAnchor(data) {
 }
 
 $('#anchorList').addEventListener('click', async (e) => {
+  // 点「核心度」圆点 = 直接设为第 N 档（原来只能下拉选，圆点纯装饰、点了没反应）
+  const dots = e.target.closest('[data-act="salience-set"]');
+  if (dots) {
+    const dot = e.target.closest('i[data-v]');
+    if (!dot) return;
+    const v = parseInt(dot.dataset.v, 10) || 1;
+    const res = await mutate('tier4', { op: 'salience', id: dots.dataset.id, salience: v }, {
+      mockApply: () => {
+        const a2 = MOCK.raw.anchors.find((x) => x.id === dots.dataset.id);
+        if (a2) a2.salience = v;
+      },
+      okMsg: `核心度已设为 ${v}`,
+    });
+    if (res) loadAnchor();
+    return;
+  }
   const btn = e.target.closest('[data-act="del"]');
   if (!btn) return;
   const id = btn.dataset.id;
@@ -4859,7 +4918,8 @@ $('#exportPersonaBtn').addEventListener('click', (e) => withBusy(e.currentTarget
     const name = await downloadFile('backup/export', 'persona_bundle.zip');
     toast(`已导出整套人设：${name}`, 'success', 4600);
   } catch (err) {
-    toast(`导出整套人设失败：${err.message}`, 'error', 6000);
+    // 导出是唯一没有「本地模拟」兜底的写操作类动作；演示模式下 404 会显得莫名其妙
+    toast(`导出整套人设失败：${err.message}${state.demo ? '（当前是演示数据模式，后端不可达时无法导出真实文件）' : ''}`, 'error', 6000);
   }
 }));
 
@@ -4868,7 +4928,7 @@ $('#exportTier4Btn').addEventListener('click', (e) => withBusy(e.currentTarget, 
     const name = await downloadFile('tier4/export', 'tier4.json');
     toast(`已导出 tier4：${name}`, 'success', 4600);
   } catch (err) {
-    toast(`导出 tier4 失败：${err.message}`, 'error', 6000);
+    toast(`导出 tier4 失败：${err.message}${state.demo ? '（当前是演示数据模式，后端不可达时无法导出真实文件）' : ''}`, 'error', 6000);
   }
 }));
 
