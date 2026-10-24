@@ -2340,6 +2340,20 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 detail="包里没有可导入的人设文件（需要 backgrounds/tier1、tier2、tier3 或 favor.json）",
             )
 
+        # ⚠️ 预设文本必须**先解析完**再动盘：旧实现在人设 JSON 已写完之后才读 presets/*.md，
+        #    文件名不是合法 id / DB 报错就直接 500 —— 用户以为整包没生效，实际人设已经被换掉了。
+        preset_payloads = []
+        for _n in sorted(x for x in names if x.startswith("presets/") and x.endswith(".md")):
+            try:
+                _pid = int(_n.split("/")[-1].split(".")[0])
+            except (ValueError, IndexError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"预设文件名不是合法 id：{_n}（已拒绝导入，未改动任何文件）",
+                ) from exc
+            _ptext = zf.read(_n).decode("utf-8", "replace")
+            if _ptext.strip():
+                preset_payloads.append((_pid, _ptext.replace('\\n', '\\\\n')))
         # 导入前先备份当前文件
         stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
         bdir = _bg_dir().parent / "persona_import_backups" / stamp
@@ -2353,27 +2367,29 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(raw)
             applied.append(f"{arc}（{n} 条）" if n >= 0 else f"{arc}")
+        # 人设文件此时已经落盘：预设部分即便失败也不能再让整个请求 500
+        #（否则用户会以为什么都没生效）。逐条记录成功/失败并如实返回。
         preset_applied = []
+        preset_failed = []
         try:
             from nekro_agent.models.db_preset import DBPreset
-
-            for n_ in sorted(x for x in names if x.startswith('presets/') and x.endswith('.md')):
-                pid = int(n_.split('/')[-1].split('.')[0])
-                ptext = zf.read(n_).decode('utf-8')
-                if not ptext.strip():
-                    continue
-                content_db = ptext.replace('\\n', '\\\\n')
-                row = await DBPreset.get_or_none(id=pid)
-                if row:
-                    row.content = content_db
-                    await row.save(update_fields=['content'])
-                else:
-                    await DBPreset.create(id=pid, name=f'导入人设 {pid}', content=content_db)
-                preset_applied.append(pid)
-        except HTTPException:
-            raise
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=f"人设文本导入失败：{exc}")
+            DBPreset = None
+            preset_failed.append(f"无法加载 DBPreset：{exc}")
+        if DBPreset is not None:
+            for pid, content_db in preset_payloads:
+                try:
+                    row = await DBPreset.get_or_none(id=pid)
+                    if row:
+                        row.content = content_db
+                        await row.save(update_fields=["content"])
+                    else:
+                        await DBPreset.create(id=pid, name=f"导入人设 {pid}", content=content_db)
+                    preset_applied.append(pid)
+                except Exception as exc:  # noqa: BLE001
+                    preset_failed.append(f"{pid}: {exc}")
+        if preset_failed:
+            plugin.logger.error(f"[persona] 人设已导入，但预设写入失败：{preset_failed}")
 
         reload_state = await _reload_after_write()
         plugin.logger.info(
@@ -2383,6 +2399,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "ok": True,
             "applied": applied,
             "preset_applied": preset_applied,
+            "preset_failed": preset_failed,
             "backup_dir": str(bdir),
             **reload_state,
         }

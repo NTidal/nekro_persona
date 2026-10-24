@@ -1331,6 +1331,14 @@ async def _vectorize(items: List[Dict[str, Any]], label: str, dir_key: Path,
                 logger.error(f"[persona] {label} 条目 {items[i].get('id')} 向量化失败，只能靠关键词命中")
             await asyncio.sleep(0.3)
         logger.info(f"[persona] {label} 重试后向量数 {sum(1 for v in vecs if v)}/{len(items)}")
+        # 逐条重试救回来的向量也要落盘：上面的写缓存发生在重试之前，
+        # 不补这一步的话下次加载又得重嵌一遍（429 限流时这步最贵）。
+        newly = {keys[i]: _pack_vec(vecs[i]) for i in failed if vecs[i]}
+        if newly:
+            cache2 = _load_vec_cache(dir_key)
+            cache2.update(newly)
+            _save_vec_cache(cache2, dir_key)
+            logger.info(f"[persona] {label} 重试救回 {len(newly)} 条向量已写入磁盘缓存")
     return vecs
 
 
@@ -1803,12 +1811,35 @@ async def _match_tier2_text(
         return _order_by_heat([(1.0, "keyword", e) for e in kw], 2, now, lc), "keyword"
     vh = await _vector_hits(text, threshold=s["threshold"])
     merged: Dict[str, ScoredEntry] = {}
+
+    def _base_key(entry: Dict[str, Any]) -> str:
+        """条目的合并键。
+
+        ⚠️ 旧实现直接 `str(e.get("id"))`：手改文件里缺 id 的条目全被压成 "None"、
+        只留下最后一条；重复 id 也会互相覆盖。现在缺 id 退回对象身份，
+        重复 id 由 `_unique_key` 加后缀，谁都不会凭空消失。
+        """
+        raw_id = str(entry.get("id") or "").strip()
+        return raw_id or f"__noid_{id(entry)}"
+
+    def _unique_key(base: str) -> str:
+        if base not in merged:
+            return base
+        n = 2
+        while f"{base}#{n}" in merged:
+            n += 1
+        return f"{base}#{n}"
+
+    def _seen(base: str) -> bool:
+        return any(k == base or k.startswith(base + "#") for k in merged)
+
     for e in kw:
-        merged[str(e.get("id"))] = (1.0, "keyword", e)
+        merged[_unique_key(_base_key(e))] = (1.0, "keyword", e)
     for sc, e in vh:
-        k = str(e.get("id"))
-        if k not in merged:
-            merged[k] = (float(sc), "vector", e)
+        base = _base_key(e)
+        if _seen(base):      # 关键词分恒为 1.0，同一条不必再插向量版本
+            continue
+        merged[_unique_key(base)] = (float(sc), "vector", e)
     if not merged:
         return [], ""
     src = "mixed" if (kw and vh) else ("keyword" if kw else "vector")
@@ -1889,11 +1920,14 @@ def _render_tier2(
             continue
         # 超预算的条目跳过而非 break：否则一条过长记忆会永久阻断其后所有条目，
         # 且作者收不到任何提示（与 _render_tier1 的截断口径保持一致）。
-        if used + len(content) > max_chars:
+        # ⚠️ 预算必须按**渲染后的整行**算（含 "· " 前缀）：只数 content 会让实际注入
+        #    超出 max_chars 约 2×条数，配置 1200 实际能到 1250+。
+        line = f"· {content}"
+        if used + len(line) > max_chars:
             dropped += 1
             continue
-        lines.append(f"· {content}")
-        used += len(content)
+        lines.append(line)
+        used += len(line)
         if injected_out is not None:
             injected_out.append(e)
     if dropped:

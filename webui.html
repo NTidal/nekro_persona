@@ -2897,6 +2897,8 @@ const state = {
   previewChannel: '',
   previewScore: 0,
   previewRendered: false,
+  dirtyPage: '',
+  favorSeq: 0,
   maxAbs: 100,
 };
 
@@ -3277,8 +3279,10 @@ const LOADERS = {
 const DIRTY_PAGES = ['rules', 'settings'];
 state.dirty = false;
 
-function setDirty(on) {
+function setDirty(on, page) {
   state.dirty = !!on;
+  if (state.dirty && page) state.dirtyPage = page;
+  if (!state.dirty) state.dirtyPage = '';
   const b = document.getElementById('dirtyBadge');
   if (b) b.hidden = !state.dirty;
 }
@@ -3286,7 +3290,8 @@ function setDirty(on) {
 ['#page-rules', '#page-settings'].forEach((sel) => {
   const page = document.querySelector(sel);
   if (!page) return;
-  const mark = () => setDirty(true);
+  const name = page.dataset.page;
+  const mark = () => setDirty(true, name);
   page.addEventListener('input', mark);
   page.addEventListener('change', mark);
 });
@@ -3787,9 +3792,12 @@ function matchQuery(query, row, fields) {
 
 /* ---------------- 好感度档案 ---------------- */
 async function loadFavor() {
+  // 搜索框 220ms 防抖 + 网络时序不定：慢的旧响应回来时不能覆盖新结果
+  const seq = ++state.favorSeq;
   const q = state.favorQuery;
   const kind = state.favorKind;
   const data = await load(`index?q=${encodeURIComponent(q)}&kind=${encodeURIComponent(kind)}`, () => MOCK.index(q, kind));
+  if (seq !== state.favorSeq) return;   // 已经有更新的请求发出去了，丢弃过期响应
   if (!data) return;
   state.favorIndex = data;
   renderFavor();
@@ -4037,6 +4045,9 @@ function scoreColorVar(score) {
 
 /* ---------------- 规则与门控 ---------------- */
 async function loadRules() {
+  // 有未保存改动时**不重绘**：重绘会把正在编辑的表单（含刚加/刚删的阶段行）整块覆盖。
+  // 保存成功或用户明确「放弃修改」后 dirty 会清零，下次进入才会重新渲染。
+  if (state.dirty && state.dirtyPage === 'rules') return;
   const data = await load('overview', () => MOCK.overview());
   if (!data) return;
   const g = data.gating || {};
@@ -4804,6 +4815,7 @@ function fieldHTML(f, v) {
 }
 
 async function loadSettings() {
+  if (state.dirty && state.dirtyPage === 'settings') return;   // 同 loadRules：别覆盖未保存的输入
   if (!state.overview) {
     const ov = await load('overview', () => MOCK.overview());
     if (ov) state.overview = ov;
@@ -4850,7 +4862,11 @@ $('#settingsSaveBtn').addEventListener('click', async () => {
   });
   if (res) { setDirty(false); state.overview = null; loadSettings(); }
 });
-$('#settingsResetBtn').addEventListener('click', () => { renderSettings(); toast('已还原为当前生效值', 'info', 1600); });
+$('#settingsResetBtn').addEventListener('click', () => {
+  setDirty(false);                      // 明确放弃未保存改动，允许重绘
+  renderSettings();
+  toast('已还原为当前生效值', 'info', 1600);
+});
 
 /* ---------------- 备份与迁移（导出 / 导入） ---------------- */
 /* 通用：带密钥下载二进制并触发浏览器保存 */
