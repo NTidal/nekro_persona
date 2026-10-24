@@ -2777,15 +2777,22 @@ function confirmAction({ title, message, okText = '确认删除', cancelText = '
       settle(act === 'cf-yes');
       confirmDlg.close();
     };
-    const onClose = () => { cleanup(); settle(false); };   // Esc / 点遮罩 / 右上角关 = 取消
+    const onClose = () => { cleanup(); settle(false); };   // Esc / 右上角关 = 取消
+    // 点遮罩也取消：原生 <dialog> 默认点遮罩**不会**关闭，
+    // 习惯「点旁边关掉」的用户会以为卡住了。
+    const onBackdrop = (e) => {
+      if (e.target === confirmDlg) { cleanup(); settle(false); confirmDlg.close(); }
+    };
     function cleanup() {
       $('#confirmFoot').removeEventListener('click', onFoot);
       $('#confirmClose').removeEventListener('click', onX);
+      confirmDlg.removeEventListener('click', onBackdrop);
       confirmDlg.removeEventListener('close', onClose);
     }
     function onX() { cleanup(); settle(false); confirmDlg.close(); }
     $('#confirmFoot').addEventListener('click', onFoot);
     $('#confirmClose').addEventListener('click', onX);
+    confirmDlg.addEventListener('click', onBackdrop);
     confirmDlg.addEventListener('close', onClose);
   });
 }
@@ -3296,18 +3303,30 @@ function setDirty(on, page) {
   page.addEventListener('change', mark);
 });
 
-async function goto(tab) {
-  if (!PAGES.includes(tab)) return;
-  if (state.dirty && DIRTY_PAGES.includes(state.tab) && tab !== state.tab) {
+async function goto(tab, opts = {}) {
+  if (!PAGES.includes(tab)) return false;
+  // ⚠️ 守卫必须覆盖**同页刷新**：顶栏「刷新当前页」走的也是 goto(state.tab)，
+  //    早先判断里有 `tab !== state.tab`，刷新路径整条都绕过了确认，
+  //    然后 setDirty(false) 无条件清脏、loader 重绘把表单覆盖 —— 改动静默消失。
+  const dirtyPage = state.dirty ? (state.dirtyPage || state.tab) : '';
+  if (dirtyPage && DIRTY_PAGES.includes(dirtyPage)) {
+    const leaving = tab !== state.tab;
+    const pageLabel = dirtyPage === 'rules' ? '规则与门控' : '运行参数';
     const ok = await confirmAction({
       title: '有未保存的修改',
-      message: `「${state.tab === 'rules' ? '规则与门控' : '运行参数'}」页还有未保存的修改，离开将丢失。确定离开吗？`,
-      okText: '放弃修改并离开',
+      message: leaving
+        ? `「${pageLabel}」页还有未保存的修改，离开将丢失。确定离开吗？`
+        : `「${pageLabel}」页还有未保存的修改，刷新会丢弃这些改动。确定刷新吗？`,
+      okText: leaving ? '放弃修改并离开' : '放弃修改并刷新',
       cancelText: '留下继续编辑',
     });
-    if (!ok) return;
+    if (!ok) return false;          // 取消 → 不清脏、不重绘，表单原地保留
   }
-  setDirty(false);
+  setDirty(false);                  // 到这里才真的要走，可以清脏
+  if (opts.fresh) {                 // 「刷新」要真的从后端重拉，清缓存
+    state.entries = null;
+    state.overview = null;
+  }
   state.tab = tab;
   $$('#sideNav .nav-item').forEach((b) => {
     const on = b.dataset.tab === tab;
@@ -3316,6 +3335,7 @@ async function goto(tab) {
   });
   $$('.page').forEach((p) => p.classList.toggle('active', p.dataset.page === tab));
   (LOADERS[tab] || (() => {}))();
+  return true;
 }
 $('#sideNav').addEventListener('click', (e) => {
   const btn = e.target.closest('.nav-item');
@@ -3325,13 +3345,13 @@ document.addEventListener('click', (e) => {
   const g = e.target.closest('[data-goto]');
   if (g) goto(g.dataset.goto);
 });
-$('#refreshBtn').addEventListener('click', () => {
+$('#refreshBtn').addEventListener('click', async () => {
   // 走 goto 而不是直接调 loader：goto 包装里有转场和数字滚动（FX.replay）。
   // 直接调 loader 会让概览指标停在全 0（见 renderOverviewMetrics 里的注释）。
-  // 同时清掉缓存，保证「刷新」是真的从后端重拉（平时切页面走缓存）。
-  state.entries = null;
-  state.overview = null;
-  goto(state.tab);
+  // fresh:true 清掉缓存，保证「刷新」是真的从后端重拉（平时切页面走缓存）。
+  // 缓存清理放进 goto 内部：用户若取消「放弃修改并刷新」，缓存不该已经被清掉。
+  const proceeded = await goto(state.tab, { fresh: true });
+  if (!proceeded) return;
   toast('已刷新', 'info', 1400);
 });
 
