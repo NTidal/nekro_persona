@@ -3887,8 +3887,10 @@ function renderFavor() {
     return;
   }
   // 收纳：按频道分组，默认全部收起（避免一打开就是一大串）。
-  // 搜索或筛选命中时自动展开，否则用户搜到了却看不见。
-  const searching = !!String(state.favorQuery || '').trim() || state.favorKind !== 'all';
+  // ⚠️ 展开与否**只**由 favorExpanded 决定。「搜索/筛选时自动展开」必须做成
+  //    一次性的动作（见 expandAllFavorGroups），不能在这里强制 —— 早先把
+  //    `favorKind !== 'all'` 也算进 searching，导致切到群聊/私聊后每个分组都被
+  //    强制展开，点分组头改了 favorExpanded 又被覆盖，「展开/收起」按钮同样失效。
   const groups = new Map();
   items.forEach((x) => {
     const k = x.chat_key || '（未知频道）';
@@ -3897,7 +3899,7 @@ function renderFavor() {
   });
   const parts = [];
   groups.forEach((rows, ck) => {
-    const open = searching || state.favorExpanded.has(ck);
+    const open = state.favorExpanded.has(ck);
     const top = rows.reduce((m, r) => Math.max(m, Number(r.score) || 0), -Infinity);
     parts.push(`
     <tr class="group-row" data-group="${esc(ck)}" aria-expanded="${open}" tabindex="0" role="button">
@@ -3931,15 +3933,34 @@ function renderFavor() {
 let favorTimer = null;
 $('#favorSearch').addEventListener('input', (e) => {
   clearTimeout(favorTimer);
-  favorTimer = setTimeout(() => { state.favorQuery = e.target.value; loadFavor(); }, 220);
+  favorTimer = setTimeout(async () => {
+    state.favorQuery = e.target.value;
+    await loadFavor();
+    if (String(state.favorQuery || '').trim()) {
+      expandAllFavorGroups();          // 搜到了要看得见
+    } else {
+      state.favorExpanded = new Set(); // 清空搜索 → 回到「默认全收起」的收纳态
+      renderFavor();
+    }
+  }, 220);
 });
-$('#favorKind').addEventListener('click', (e) => {
+$('#favorKind').addEventListener('click', async (e) => {
   const b = e.target.closest('.segment');
   if (!b) return;
+  if (state.favorKind === b.dataset.kind) return;
   state.favorKind = b.dataset.kind;
   $$('#favorKind .segment').forEach((x) => x.classList.toggle('active', x === b));
-  loadFavor();
+  await loadFavor();
+  expandAllFavorGroups();   // 换分类先展开看结果；之后点分组头即可收起
 });
+
+/* 换分类 / 输入搜索词后把当前结果的分组展开一次：保证命中可见；
+   之后收纳完全交给用户，点分组头随时生效。 */
+function expandAllFavorGroups() {
+  const items = (state.favorIndex && state.favorIndex.items) || [];
+  state.favorExpanded = new Set([...new Set(items.map((x) => x.chat_key || '（未知频道）'))]);
+  renderFavor();
+}
 
 function toggleFavorGroup(ck) {
   if (state.favorExpanded.has(ck)) state.favorExpanded.delete(ck);
