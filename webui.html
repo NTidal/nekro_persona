@@ -2042,6 +2042,53 @@ body.is-scrolling .dialog-foot {
 #anchorList .salience-dots:hover i { transform: scale(1.25); }
 #anchorList .salience-dots i:hover { background: var(--accent); }
 
+/* ── 布局修补（v2.1.8） ─────────────────────────────────────────── */
+
+/* ① 状态行：标签与值原先是没有 gap 的两个相邻 inline span（实测 0px），
+   等宽值会直接焊在标签后面（「最近命中evt_rain」「1 档 · 身份8 条」）。 */
+.status-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.status-line .status-name { flex: 0 0 auto; }
+.status-line .status-value { flex: 1 1 auto; min-width: 0; text-align: right; }
+
+/* ② 稳定印象是 LLM 生成的，字段上限 200 字 —— 长印象会把行高顶到 175px
+   （同表其它行 59px），整表参差不齐、一屏看到的人数骤减。钳到 2 行，
+   全文靠 title 悬停看。 */
+.summary-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: break-word;
+}
+
+/* ③ 真实 NA 频道 key 形如 xxx::group_123456789012345 @OneBot V11，
+   原来 10px 等宽字 + 允许换行，被折成 3–4 行微缩文字，既难读又顶高行高。
+   频道 key 本身没有可读性，折成单行 + 省略号更好，完整值走 title。 */
+.chat-key {
+  display: block;
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+.group-row .group-key {
+  display: inline-block;
+  max-width: min(46ch, 58vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
 </style>
 </head>
 <body>
@@ -3855,7 +3902,7 @@ function renderFavor() {
     parts.push(`
     <tr class="group-row" data-group="${esc(ck)}" aria-expanded="${open}" tabindex="0" role="button">
       <td colspan="7">
-        <span class="group-caret">${open ? '▾' : '▸'}</span><strong>${esc(ck)}</strong>
+        <span class="group-caret">${open ? '▾' : '▸'}</span><strong class="group-key" title="${esc(ck)}">${esc(ck)}</strong>
         <span class="badge-row">
           <span class="badge">${rows.length} 人</span>
           <span class="badge info">最高 ${top === -Infinity ? '—' : top}</span>
@@ -3870,11 +3917,11 @@ function renderFavor() {
           <div class="user-copy"><strong>${esc(x.display_name || '未命名')}</strong><small>${esc(x.user_id)}</small></div>
         </div>
       </td>
-      <td data-label="频道"><span class="mono" style="font-size:10px">${esc(x.chat_key)}</span></td>
+      <td data-label="频道"><span class="mono chat-key" title="${esc(x.chat_key)}">${esc(x.chat_key)}</span></td>
       <td data-label="分数"><span class="score-value" style="color:${scoreColorVar(x.score)}">${x.score}</span></td>
       <td data-label="阶段"><span class="badge ${stageClass(x.score)}">${esc(x.stage || '—')}</span></td>
       <td data-label="标签"><div class="badge-row">${(x.tags || []).map((t) => `<span class="chip">${esc(t)}</span>`).join('') || '<span class="muted">—</span>'}</div></td>
-      <td data-label="稳定印象"><div class="summary-text">${esc(x.summary || '—')}</div></td>
+      <td data-label="稳定印象"><div class="summary-text" title="${esc(x.summary || '')}">${esc(x.summary || '—')}</div></td>
       <td data-label="操作" class="actions-cell"><div class="table-actions"><button class="mini-btn" type="button" data-act="open">档案</button></div></td>
     </tr>`).join(''));
   });
