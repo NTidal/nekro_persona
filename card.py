@@ -176,6 +176,18 @@ def _find_font(font_path: str = "", font_dir: str = "") -> str | None:
                         if any(k in f.name.lower() for k in _hints):
                             _font_cache, _font_key, _font_checked = str(f), _key, True
                             return _font_cache
+    # 包内兜底字体（Noto Sans SC 子集，OFL 1.1，见 assets/fonts/OFL-LICENSE.txt）。
+    # ⚠️ 必须放在**最后**：系统字体 / 用户自备字体的观感优先，包内字体只在
+    #    「裸环境」（容器无 CJK 字体、数据目录也没放）时救场 —— 把「回退纯文本」
+    #    的失败模式变成「至少能出图」。子集按 GB2312 一级常用字（3755）+ 全 ASCII
+    #    + 卡片固定文案裁剪：昵称里的二级生僻字会显示为方块，可自行放完整字体到
+    #    插件数据目录 fonts/ 覆盖（检测顺序在包内字体之前）。
+    _bundled = Path(__file__).parent / "assets" / "fonts" / "NotoSansSC-Subset.otf"
+    if _bundled.is_file():
+        # 本项目的 logger 不做 %-参数替换（实测会把 "%s" 原样打出来），统一用 f-string
+        logger.info(f"使用包内兜底字体: {_bundled.name}")
+        _font_cache, _font_key, _font_checked = str(_bundled), _key, True
+        return _font_cache
     logger.warning("未找到中文字体，好感度排行榜卡片将回退为文本")
     return None
 
@@ -187,6 +199,7 @@ def _find_font(font_path: str = "", font_dir: str = "") -> str | None:
 
 _EMOJI_FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/windows/seguiemj.ttf",
+    "C:/Windows/Fonts/seguiemj.ttf",   # Windows 原生（COLR 矢量彩字，任意字号可彩色渲染）
     "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
     "/usr/share/fonts/opentype/noto/NotoColorEmoji.ttf",
     "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
