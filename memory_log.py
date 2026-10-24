@@ -182,6 +182,50 @@ def heat_factor(entry: MemEntry, now: Optional[float] = None) -> float:
 # ==================== 读写 ====================
 
 
+# ======================================================================
+# 损坏保护（v2.1.1）：解析失败时先备份原件，并在人工修复前**拒绝写入**。
+# 早先的行为是「按空文档继续」——渲染没问题，但写路径读到同一份空文档，
+# 第一次 write_anchor / save_note / 归纳落库就会把「只含新条目」的文档写回，
+# 静默抹掉此前全部内容且无备份。这里改成 fail-safe + fail-closed。
+# ======================================================================
+_DEGRADED: Dict[str, str] = {}
+
+
+class MemoryLogCorrupted(RuntimeError):
+    """memory_log.json 损坏或版本不符：拒绝写入，等待人工修复。"""
+
+
+def _backup_corrupt(fp: Path) -> str:
+    """把损坏文件原样复制一份到同目录，返回备份路径（失败返回空串）。"""
+    try:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        dst = fp.parent / f"{fp.stem}.corrupt_{stamp}{fp.suffix}"
+        dst.write_bytes(fp.read_bytes())
+        return str(dst)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[memory_log] 备份损坏文件失败: {exc}")
+        return ""
+
+
+def _mark_degraded(fp: Path, reason: str) -> None:
+    """记录降级原因；首次降级时备份原文件（只备份一次，避免反复读反复写）。"""
+    key = str(fp)
+    if key in _DEGRADED:
+        return
+    bak = _backup_corrupt(fp)
+    _DEGRADED[key] = reason
+    logger.error(
+        f"[memory_log] {fp.name} 已降级为只读：{reason}。"
+        f"原文件已备份到 {bak or '(备份失败)'}；修复或替换该文件之前，"
+        "所有写入都会被拒绝，以免覆盖掉既有数据。"
+    )
+
+
+def corruption_reason() -> str:
+    """当前文件是否处于降级状态；返回原因（空串 = 正常）。"""
+    return _DEGRADED.get(str(_log_file()), "")
+
+
 def _read_sync() -> Dict[str, Any]:
     """读全量文档（带 mtime+size 缓存）。失败返回空结构。"""
     fp = _log_file()
@@ -208,6 +252,7 @@ def _read_sync() -> Dict[str, Any]:
             data["entries"] = []
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[memory_log] 解析失败，按空处理：{exc}")
+        _mark_degraded(fp, f"JSON 解析失败：{exc}")
         data = {"version": MEMLOG_VERSION, "entries": []}
 
     _read_cache[fp.parent] = {"mtime": st.st_mtime, "size": st.st_size,
@@ -216,7 +261,15 @@ def _read_sync() -> Dict[str, Any]:
 
 
 def _write_sync(doc: Dict[str, Any]) -> None:
-    """原子写盘；成功后刷新缓存。失败只记日志。"""
+    """原子写盘；成功后刷新缓存。失败只记日志。
+
+    ⚠️ 降级期间**直接跳过写盘**：此处的 doc 是「按空处理」得到的空文档，
+    写回去等于把既有事件记忆整块清空（delete_entry / bump_hits 也会走到这里）。
+    """
+    _reason = corruption_reason()
+    if _reason:
+        logger.warning(f"[memory_log] 文件处于损坏保护状态（{_reason}），本次写盘已跳过")
+        return
     fp = _log_file()
     tmp = fp.with_suffix(fp.suffix + ".tmp")
     try:
@@ -254,6 +307,10 @@ async def add_entries(items: List[Dict[str, Any]], scope: str,
     """批量追加记忆（归纳结果），同一批内按 title 去重，并按热度淘汰超限。"""
     if not items:
         return {"added": 0, "skipped": 0, "evicted": 0}
+    _reason = corruption_reason()
+    if _reason:
+        # 文件损坏时不落盘：此时的 doc 是空文档，写回等于清空全部事件记忆
+        return {"added": 0, "skipped": 0, "evicted": 0, "corrupt": _reason}
     now = int(time.time())
     async with _lock:
         doc = _read_sync()

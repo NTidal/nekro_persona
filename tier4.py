@@ -418,6 +418,50 @@ def _invalidate_read_cache(dir_key: Optional[Path] = None) -> None:
     slot["doc"] = None
 
 
+# ======================================================================
+# 损坏保护（v2.1.1）：解析失败时先备份原件，并在人工修复前**拒绝写入**。
+# 早先的行为是「按空文档继续」——渲染没问题，但写路径读到同一份空文档，
+# 第一次 write_anchor / save_note / 归纳落库就会把「只含新条目」的文档写回，
+# 静默抹掉此前全部内容且无备份。这里改成 fail-safe + fail-closed。
+# ======================================================================
+_DEGRADED: Dict[str, str] = {}
+
+
+class Tier4Corrupted(RuntimeError):
+    """tier4.json 损坏或版本不符：拒绝写入，等待人工修复。"""
+
+
+def _backup_corrupt(fp: Path) -> str:
+    """把损坏文件原样复制一份到同目录，返回备份路径（失败返回空串）。"""
+    try:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        dst = fp.parent / f"{fp.stem}.corrupt_{stamp}{fp.suffix}"
+        dst.write_bytes(fp.read_bytes())
+        return str(dst)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[tier4] 备份损坏文件失败: {exc}")
+        return ""
+
+
+def _mark_degraded(fp: Path, reason: str) -> None:
+    """记录降级原因；首次降级时备份原文件（只备份一次，避免反复读反复写）。"""
+    key = str(fp)
+    if key in _DEGRADED:
+        return
+    bak = _backup_corrupt(fp)
+    _DEGRADED[key] = reason
+    logger.error(
+        f"[tier4] {fp.name} 已降级为只读：{reason}。"
+        f"原文件已备份到 {bak or '(备份失败)'}；修复或替换该文件之前，"
+        "所有写入都会被拒绝，以免覆盖掉既有数据。"
+    )
+
+
+def corruption_reason() -> str:
+    """当前文件是否处于降级状态；返回原因（空串 = 正常）。"""
+    return _DEGRADED.get(str(_tier4_file()), "")
+
+
 def _fresh_doc() -> Tier4Doc:
     return Tier4Doc()
 
@@ -448,12 +492,21 @@ def _read_tier4_sync() -> Tier4Doc:
         data = json.loads(fp.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[tier4] 解析失败，本次按空文档继续: {exc}")
+        _mark_degraded(fp, f"JSON 解析失败：{exc}")
         doc = _fresh_doc()
     else:
-        doc = Tier4Doc.from_raw(data) if isinstance(data, dict) else _fresh_doc()
-        if doc.version != _TIER4_VERSION:
-            logger.warning(f"[tier4] 版本不符（{doc.version}!={_TIER4_VERSION}），本次按空处理")
+        if not isinstance(data, dict):
+            _mark_degraded(fp, "根节点不是对象")
             doc = _fresh_doc()
+        else:
+            doc = Tier4Doc.from_raw(data)
+            if doc.version != _TIER4_VERSION:
+                logger.warning(
+                    f"[tier4] 版本不符（{doc.version}!={_TIER4_VERSION}），本次按空处理")
+                _mark_degraded(fp, f"版本不符（{doc.version}!={_TIER4_VERSION}）")
+                doc = _fresh_doc()
+            else:
+                _DEGRADED.pop(str(fp), None)   # 文件恢复正常 → 解除降级
     cache["mtime"] = mtime
     cache["size"] = size
     cache["doc"] = doc
@@ -461,6 +514,10 @@ def _read_tier4_sync() -> Tier4Doc:
 
 
 def _write_tier4_sync(doc: Tier4Doc) -> None:
+    # 降级期间绝不落盘：此时的 doc 是空文档，写回等于清空既有锚点/笔记
+    _reason = corruption_reason()
+    if _reason:
+        raise Tier4Corrupted(_reason)
     """原子写盘；成功后刷新读缓存。失败只记日志（调用方已持有写锁）。"""
     fp = _tier4_file()
     cache = _read_cache(fp.parent)
@@ -509,6 +566,7 @@ GATE_DISABLED = "disabled"
 GATE_MAX_TOTAL = "max_total"
 GATE_MAX_PER_DAY = "max_per_day"
 GATE_INTERVAL = "interval"
+GATE_CORRUPT = "corrupt"
 
 
 def check_anchor_gates(doc: Tier4Doc, cfg: Dict[str, Any], now: int) -> str:
@@ -567,6 +625,10 @@ async def write_anchor(
     - refreshed → dedup_matcher 命中已有条目，就地刷新而非新增（不 bump 当日计数）
     - added     → 新增并 bump meta.day_count / last_anchor_at
     """
+    _reason = corruption_reason()
+    if _reason:
+        return {"action": "rejected", "gate": GATE_CORRUPT, "entry": None,
+                "total": 0, "day_count": 0, "corrupt": _reason}
     now = _ts_now() if now is None else int(now)
     hi = max(1, int(salience_max))
     clean_salience = max(1, min(hi, int(salience or 1)))
@@ -894,6 +956,10 @@ async def add_or_update_note(
     """
     if not cfg.get("enabled", True):
         return {"action": "disabled", "note": None, "reason": "disabled"}
+    _reason = corruption_reason()
+    if _reason:
+        return {"action": "rejected", "note": None, "reason": "corrupt",
+                "corrupt": _reason}
     clean_title = _clip(title, 40)
     if not clean_title:
         return {"action": "rejected", "note": None, "reason": "empty_title"}

@@ -70,7 +70,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.1.0",
+    version="2.1.1",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -1216,7 +1216,12 @@ async def _decay_pass() -> int:
                 periods = int((now - anchor) // interval)
                 if periods < 1:
                     continue
-                idle_hours = (now - anchor) / 3600.0
+                # ⚠️ 「未互动时长」必须从**最后互动时间**起算，不能从 anchor 起算：
+                #    anchor 含 last_decay_at，而每次结算（哪怕一分没扣）都会把它推到 ≈现在，
+                #    于是 idle_hours 永远只有一个衰减周期（24h）上下，小于档位保底时长
+                #    （168h），_decay_floor 的 drops 恒为 0 —— 「超时后逐级解锁」永不生效。
+                idle_since = int(prof.last_interaction_at or 0) or anchor
+                idle_hours = max(0.0, (now - idle_since) / 3600.0)
                 stage_before = _stage_of(prof.score)[0]
                 total = 0
                 for _ in range(min(periods, 200)):
@@ -1635,8 +1640,18 @@ async def _open_archive(chat_key: str) -> ChannelArchive:
         return ChannelArchive()
     try:
         return ChannelArchive.from_raw(json.loads(blob))
-    except Exception:  # noqa: BLE001
-        plugin.logger.warning(f"[存档] 频道状态解析失败，本次按空档案继续: {chat_key}")
+    except Exception as exc:  # noqa: BLE001
+        # ⚠️ 返回空档案本身没问题（不让一轮对话因此崩），但**必须先把原始 blob 备份**：
+        #    否则下一次 _store_archive 会用这份空档案把原始数据整块覆盖掉，且无备份。
+        bak_key = f"{STATE_KEY}.corrupt_{int(_ts_now())}"
+        try:
+            await store.set(chat_key=chat_key, store_key=bak_key, value=blob)
+            where = f"已备份到 store_key={bak_key}"
+        except Exception as bexc:  # noqa: BLE001
+            where = f"备份失败（{bexc}）"
+        plugin.logger.error(
+            f"[存档] 频道状态解析失败（{type(exc).__name__}: {exc}），"
+            f"{where}；本次按空档案继续: {chat_key}")
         return ChannelArchive()
 
 
@@ -1826,10 +1841,10 @@ def _daily_budget_line(profile: UserArchive) -> str:
         net = int(profile.day_net) if int(profile.day_key) == dk else 0
         left = gain_cap - net
         if left <= 0:
-            return (f"今日额度：已用完（今日已 +{net}，上限 +{gain_cap}）——"
+            return (f"今日额度：已用完（今日已 {net:+d}，上限 +{gain_cap}）——"
                     "今天不要再给这位用户加分了，除非发生真正重要的事。")
         gap_min = max(0, int(sc.get("min_interval_minutes", 120)))
-        parts = [f"今日额度：还剩 +{left}（今日已 +{net}／上限 +{gain_cap}，"
+        parts = [f"今日额度：还剩 +{left}（今日已 {net:+d}／上限 +{gain_cap}，"
                  f"单次最多 +{single_cap}）"]
         if profile.last_adjust_at:
             # ⚠️ 用分钟直接算，不要折算成小时再 ×3600：
@@ -2274,7 +2289,14 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
         parts.append(_compose_overview_card(state))
 
     # ② 阶梯记忆（按好感度门控披露深度）
-    favor_cfg = persona_memory.load_favor_cfg()
+    # favor.json 损坏时 load_favor_cfg 会 raise（fail-closed 是对的：不能拿坏配置
+    # 当空配置继续），但这里是 persona_prompt 的主链路 —— 不兜底就会让**每一轮**注入
+    # 都炸。降级为「本轮不启用门控」，把故障留在日志里。
+    try:
+        favor_cfg = persona_memory.load_favor_cfg()
+    except Exception as exc:  # noqa: BLE001
+        plugin.logger.error(f"[persona] favor.json 不可用，本轮按不门控处理: {exc}")
+        favor_cfg = {}
     gating = bool(favor_cfg) and bool(favor_cfg.get("enabled", True))
     score = int(profile.score) if profile is not None else 0
     try:
@@ -2931,6 +2953,12 @@ async def anchor_memory(
                 f"本次未沉淀锚点：距上一条不足 {cfg['min_interval_hours']} 小时。"
                 "锚点是稀少的沉淀，不是即时记录，再等等。"
             )
+        if gate == tier4.GATE_CORRUPT:
+            return (
+                "本次未沉淀锚点：锚点文件当前处于损坏保护状态（已备份原件），"
+                "写入被拒绝以免覆盖掉既有锚点。请联系管理员修复 tier4.json，"
+                "本次内容请改用 `save_note` 记在频道笔记里。"
+            )
         return "本次未沉淀锚点：功能当前不可用。"
 
     entry = res.get("entry") or {}
@@ -3106,7 +3134,11 @@ async def _cmd_shift(
     def _apply(state: ChannelArchive) -> str:
         profile = state.profile_for(who)
         step = sign * delta
+        _before = int(profile.score)
         profile.nudge(step, _mystery_reason(profile, verb))
+        # ⚠️ 手工命令同样要吃预算：README 明说「手工设定走同一套预算，不是绕过约束的后门」。
+        #    早先只调 nudge，不占每日净额、不受最小间隔限制、也不动 last_adjust_at。
+        profile.record_adjust(int(profile.score) - _before, _ts_now())
         state.last_active_user_id = who
         word = "增加" if sign > 0 else "减少"
         return _adjust_receipt(profile, f"{word} {_delta_text(step)}")
@@ -3120,6 +3152,7 @@ async def _cmd_set(
     """favor_set：整份档案按给定分数重写，描述字段沿用原值。"""
     def _apply(state: ChannelArchive) -> str:
         profile = state.profile_for(who)
+        _before = int(profile.score)
         profile.reset_to(
             score,
             f"由于神秘原因，你对{profile.display_name or profile.user_id}的好感度被重新设定了",
@@ -3128,6 +3161,8 @@ async def _cmd_set(
             tags=list(profile.tags),
             display_name=profile.display_name,
         )
+        # 同 P1-10：手工重设也计入当日净额与间隔锚点
+        profile.record_adjust(int(profile.score) - _before, _ts_now())
         state.last_active_user_id = who
         return _adjust_receipt(profile, f"设定为 {profile.score}")
 
@@ -3369,6 +3404,12 @@ def _persona_webui_router():
             "favor_scale": favor_scale,
             "load_state": _open_archive,
             "save_state": _store_archive,
+            # per-chat 读写锁：WebUI 的读-改-写必须和消息处理/衰减循环共用同一把锁，
+            # 否则并发时 last-writer-wins 会把分数丢掉（锁本身的注释里就写了这个场景）。
+            "state_lock": _archive_lock,
+            # 关系卡（真实 prompt 的第①段）：预览要复刻完整注入，缺了它就不算「真实注入文本」
+            "compose_archive_card": _compose_archive_card,
+            "compose_overview_card": _compose_overview_card,
             "stage_info": _stage_of,
             "clamp_score": _bound_score,
             "max_abs_score": _score_cap,
@@ -3775,14 +3816,24 @@ async def _memlog_loop() -> None:
                     continue
 
                 if not memories:
+                    # 走到这里只剩一种可能：响应合法但模型认为没什么可记的。
+                    # 真正的失败（网络/超时/坏 JSON）现在会抛异常走上面的回填分支。
                     plugin.logger.info(
                         f"[memory_log] {chat_key}：{len(batch)} 条素材未产出记忆"
-                        "（模型判断无可记内容，不回填）")
+                        "（响应合法但模型判断无可记内容，不回填）")
                     continue
 
                 try:
                     res = await persona_memlog.add_entries(
                         memories, scope=chat_key, source="auto")
+                    if res.get("corrupt"):
+                        # 文件损坏时 add_entries 拒绝落盘（避免清空既有事件记忆），
+                        # 素材回填等修复后重试
+                        plugin.logger.error(
+                            f"[memory_log] {chat_key}：记忆文件处于损坏保护状态"
+                            f"（{res['corrupt']}），本轮 {len(batch)} 条素材已回填待重试")
+                        persona_consolidator.pushes_back(chat_key, batch)
+                        continue
                     plugin.logger.info(
                         f"[memory_log] {chat_key}：{len(batch)} 条素材 → "
                         f"{res['added']} 条记忆入库"
@@ -3809,6 +3860,19 @@ async def _start_decay_loop() -> None:
     if _decay_task is not None and not _decay_task.done():
         return
     _decay_task = asyncio.create_task(_decay_loop())
+
+    # 关系记忆攒批参数：consolidator 里是模块常量，必须在这里按配置注入，
+    # 否则 MEMLOG_BATCH_MIN_ITEMS / MEMLOG_BATCH_MAX_AGE_HOURS 两个配置项
+    # 只会在启动日志里被打印，实际行为仍按常量走（改配置静默无效）。
+    try:
+        persona_consolidator.BATCH_MIN_ITEMS = max(1, int(config.MEMLOG_BATCH_MIN_ITEMS))
+        persona_consolidator.BATCH_MAX_AGE_HOURS = max(
+            0.0, float(config.MEMLOG_BATCH_MAX_AGE_HOURS))
+        plugin.logger.info(
+            f"[memory_log] 攒批参数已按配置注入：{persona_consolidator.BATCH_MIN_ITEMS} 条 / "
+            f"{persona_consolidator.BATCH_MAX_AGE_HOURS} 小时")
+    except Exception as exc:  # noqa: BLE001
+        plugin.logger.warning(f"[memory_log] 攒批参数注入失败，沿用模块默认值: {exc}")
 
     # 关系记忆归纳任务（与好感度结算独立）
     global _memlog_task

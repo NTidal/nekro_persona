@@ -5,7 +5,7 @@
 > **2.0 起**：前 3 档是手工策划的「种子」（模型不可改）；**tier4 是「生长」**——角色在运行时自己沉淀的身份锚点（身份）与频道笔记（功能），
 > 并具备**种子包 / 生长包分离导出**：角色定义可公开版本化，「这一世活过的痕迹」可整体迁移备份。
 
-版本 **2.1.0**　作者 **NTidal**　许可 **GPLv3**
+版本 **2.1.1**　作者 **NTidal**　许可 **GPLv3**
 
 ---
 
@@ -619,6 +619,47 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
 
 > 本日志只保留**最近三个版本**的改动；更早的版本见 git 提交历史（`git log --oneline`）。
 
+### 2.1.1
+
+**审计修复批次：数据安全 · 静默失效 · 边界健壮性**
+
+本轮按一次完整代码审计逐条修复。判定为「修了什么 / 还剩什么」在文末。
+
+#### 数据安全（P0）
+
+- **种子包导出漏掉 WebUI 新建的条目**：导出原先只打 `tier1/core.json`、`tier2/lore.json`、`tier3/world.json`、`favor.json` 四个固定文件，而 WebUI「新建条目」写的是 `tierN/custom.json`、运行时又按 `*.json` 全量读 —— 于是 WebUI 里建的条目导出后在新实例导入即消失，且无任何提示。现在导出改为**各档目录下全部 `*.json`**，导入侧同步支持任意 `tierN/<name>.json`（含路径穿越过滤），并兼容只含四个固定文件的历史包。
+- **生长包导入不备份关系档案**：`archives.json` 会**整 blob 覆写**各频道档案（分数/标签/稳定印象），但导入前只复制了 `tier4.json`（注释还写成备份了 hit_stats）。现在把现有全部频道档案一并写入 `_growth_import_backups/<stamp>/archives.json`，返回值新增 `backed_up_archives`。
+- **归纳失败静默丢素材**：`consolidate_with_llm` 把超时/网络/坏 JSON 全部吞掉后 `return []`，而调用方把空列表理解成「模型判断无可记内容」→ 不回填，一批最多几十条素材永久丢失，日志还写「素材保留待下轮」。现在失败一律抛 `ConsolidationFailed`，由调用方回填；`parse_response` 增加 `strict` 语义（坏 JSON/结构错抛异常，只有「JSON 合法但模型没产出」才返回空列表）。顺带修 `pushes_back` 不重置 `first_at`（失败桶每 60 秒重试一次）。
+- **tier4 / memory_log 解析失败会被写路径覆盖**：读失败按空文档继续对渲染合理，但写路径读到同一份空文档，第一次写入就把「只含新条目」的文档落盘，静默抹掉全部锚点/笔记/事件记忆。现在读失败立即把原文件复制为 `<name>.corrupt_<stamp>` 并进入**降级只读**：`write_anchor` / `add_or_update_note` / `add_entries` 直接拒绝，文件恢复正常后自动解除。工具侧给出可读回执（`GATE_CORRUPT`）。
+- **频道档案损坏会覆盖原始 blob**：`_open_archive` 解析失败返回空档案后，下一次 `_store_archive` 会把空档案写回。现在先把原始 blob 备份到 `store_key=…corrupt_<ts>` 并 error 级记日志。
+- **坏字段值把管理台打成 500**：`int(e.get("min_favor",0) or 0)` 这类强转遇到 `"20分"` 直接 ValueError。读取侧统一走新的 `_as_int()`；导入侧新增 `_validate_tier_entries()`，在写盘前拦住非整数的 `min_favor`/`weight`、非布尔的 `enabled`、非字符串的 `id/title/content`、非字符串数组的 `triggers`。
+
+#### 静默失效（P1）
+
+- **衰减档位保底永不解锁**：`idle_hours` 原来从 `anchor = max(last_interaction_at, last_decay_at)` 起算，而每次结算（哪怕没扣分）都会把 `last_decay_at` 推到 ≈现在 → 看到的空闲时长恒为一个衰减周期（24h）< 保底时长（168h），`drops` 恒为 0。改为从**最后互动时间**起算。
+- **回收站恢复/永久删除后列表不刷新**：`const res` 声明在 `if/else` 分支里，块外 `if (res) loadTrash()` 读的是未声明标识符，脚本又在 `'use strict'` 下 → 每次点击必抛 `ReferenceError`。改为外层 `let res`。
+- **保存规则静默丢弃分档互动指引**：页面给每个档位渲染了 `[data-k="guide"]` 文本框，但 POST body 只有 `enabled/stages/avoid/rubric`，从不发 `stage_guides`（只有演示模式的 mock 分支读了 DOM）。后端 `_write_gating` 早已支持该字段，现已补上。
+- **超管命令与 WebUI 改分绕过预算**：`favor_add/favor_sub/favor_set` 与 `/api/score`、`/api/profile` 都直接改分数，不占当日净额、不受最小间隔限制、不动 `last_adjust_at`，与 README「手工设定走同一套预算」矛盾。现在统一调用 `record_adjust`。
+- **WebUI 档案写入无锁**：`/api/score`、`/api/profile` 拿到的是裸 `load_state/save_state`，无锁 read-modify-write 与消息处理/衰减循环并发时会 last-writer-wins 丢分。helpers 新增 `state_lock`，两个端点整个 RMW 都在 per-chat 锁内。
+- **`/api/preview` 污染生产数据且缺第①段**：预览调用 `render_memory_block` 会写 `last_hit`、并在生命周期开启时 `_bump_hits` 落盘 `.hit_stats.json`（虚增热度、扭曲排序）。新增 `dry_run` 参数，预览全部走只读；同时补上真实 prompt 的第 ① 段「关系卡」，与 `persona_prompt` 的段序一致。
+- **MEMLOG 攒批配置从未接线**：`consolidator.BATCH_MIN_ITEMS / BATCH_MAX_AGE_HOURS` 是模块常量，两个同名配置项只被打印、从不生效。现在初始化时按配置注入。
+
+#### 边界健壮性（P2）
+
+- `scripts/calibrate_threshold.py`：`S = M._state` 少调用括号（`_state` 在 v2.0.2 后是函数），READM 反复强调的「换嵌入模型后必须跑标定」这条路径原本 100% 崩；同时给 `max()` 空序列兜底、纠正 docstring 里「只读，不改任何数据」的错误声明（实际会写向量缓存）。
+- 访问密钥改用 `compare_digest(bytes)`：原先对含中文的两个 str 比较会抛 `TypeError`，让**每个请求（含只读）**都 500。
+- `memory.py` 的 `weight or 1` 改为只对 `None` 回落（合法的 `weight=0` 不再被吞成 1）。
+- 设置页扫描条数上限 30 → 200（配置默认是 32，存一次就被静默夹到 30）。
+- 注入文案「今日已 +-5」改为带符号格式；`persona_prompt` 里 `load_favor_cfg()` 补齐兜底（`favor.json` 坏掉不再让每轮注入都炸）。
+
+#### 已知未修（后续）
+
+- `memory.py`：2 档预算只数 `content` 不算渲染后整块；候选合并按 `id` 为键会让手改文件里缺 id/重复 id 的条目被挤掉；批量嵌入失败后逐条重试救回的向量没写回磁盘缓存。
+- `webui.py`：导入预设在人设 JSON 已落盘后才解析失败 → 500（部分应用）。
+- `webui.html`：README 宣称的「未保存编辑快照回写」并不存在；好感度搜索无请求时序保护（旧响应可能覆盖新结果）。
+
+**兼容性**：接口均为追加参数或内部加固，无破坏性变更；`tier4.json` / `memory_log.json` 结构不变。损坏保护会额外产生 `.corrupt_<stamp>` 备份文件（不参与加载）。
+
 ### 2.1.0
 
 **注入预览补齐 tier4 · 锚点防串加固 · 列表搜索与档案收纳**
@@ -710,28 +751,3 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
 | `None` 系统消息 | 0 条 | — | 改前每个实例都在持续产生 |
 
 **兼容性**：工具参数顺序有变更 —— `target_user_id` 变为仅关键字。显式关键字调用完全兼容，位置调用 `(delta, reason)` 现在才是正确写法。历史档案、`favor.json`、`tier4` 均无需迁移。
-
-### 2.0.8
-
-**好感度：分量锚点与规则松绑**
-
-- **问题**：`gemini-3.8-flash-high` 在真实对话里把每件事都判 `+1`，而同一个事件在孤立提问下能正确判到 5 分。说明不是模型不会分档，而是运行时上下文把它压低了。
-- **追到的三个压制源**：
-  1. 关系卡规则「只有在关系发生了稳定、可解释的变化时才更新该档案」—— 在鼓励「别乱动」
-  2. 工具说明里的「不确定时给低的那一档，宁可少给」「约一半互动给 1 是正确判断」—— 两条都在直接教模型给 1
-  3. 档位表用区间（`5~7 = 重要时刻`），实测模型会取下界
-- **改法**：
-  - 关系卡新增**分量参考**，每个档位给**确定数字**而不是区间（寒暄=1、主动分享=2、深夜倾诉=3、深入交流=4、付出成本=5、袒露心事/站队/承诺=6~8），并且每轮都可见
-  - 卡片规则改为「该记就记：主动分享、倾诉、照顾你、约定都值得记，别因为还没到重大时刻就整轮跳过」
-  - 工具说明删掉「给 1 是正确判断」这类自我暗示，改为点明「最常见的错误是把所有互动都判成 1 分」
-  - 档位表与卡片锚点对齐，不再一处区间、一处数字
-
-**实测（NA1 / gemini-3.8-flash-high / 同一批 6 条消息）**
-
-| | 调用轮次 | 总加分 | 表现 |
-|---|---|---|---|
-| 改动前 | 1/4 | +1 | 全部塌缩成 +1 |
-| 松绑后 | 3/4 | +6 | 全部变成 +2（下限抬起来了，但仍无档位差异） |
-| 去区间后 | 6/6 | +12 | 档位终于拉开：告别=1、倾诉=3、主动分享=2 |
-
-**兼容性**：纯提示词/文案改动，无接口变更；`delta` 语义不变，历史档案无需迁移。

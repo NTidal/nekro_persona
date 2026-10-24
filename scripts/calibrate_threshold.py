@@ -13,7 +13,8 @@
 
 用法（在 NekroAgent 容器内，用插件 venv 跑）：
     python scripts/calibrate_threshold.py --bg <插件数据目录>/backgrounds [--sample 40]
-只读，不改任何数据。
+会创建向量缓存 `.vec_cache.json`（首次跑要重新嵌入），但**不改**
+背景条目内容、不动 tier4/关系档案。
 
 ⚠️ 后端一致性（v1.6.3）：标定必须在**与生产检索相同的向量空间**里做，否则结论失真。
 脚本会自动读取 <bg>/../config.yaml 的 EMBED_* 配置：provider=custom 时注入到 memory，
@@ -92,7 +93,7 @@ async def main():
     print("嵌入后端: %s" % backend)
     print("向量签名: %s" % M._embed_signature())
     print("（标定与生产检索同空间；如与线上 EMBED_PROVIDER 不符，结论不可用）")
-    S = M._state
+    S = M._state()      # ⚠️ v2.0.2 起 _state 是函数：漏掉括号会让下面 S["tier2"] 直接 TypeError
     qvecs = [(q, v) for q, v in zip(NEG, [await M._embed_query(q) for q in NEG]) if v]
     random.seed(7)
 
@@ -128,9 +129,9 @@ async def main():
                 rank1 += 1
 
         print("噪声天花板(无关query最高cos): P90=%.4f P95=%.4f MAX=%.4f" % (
-            pct(neg_max, 90), pct(neg_max, 95), max(neg_max)))
+            pct(neg_max, 90), pct(neg_max, 95), max(neg_max, default=0.0)))
         print("语义密度(随机条目对cos):    P90=%.4f P95=%.4f MAX=%.4f" % (
-            pct(pairs, 90), pct(pairs, 95), max(pairs)))
+            pct(pairs, 90), pct(pairs, 95), max(pairs, default=0.0)))
         if own:
             print("判别力(title当query,采样%d): 自己P5=%.4f 最佳他者P95=%.4f top1=%.0f%%" % (
                 len(own), pct(own, 5), pct(other, 95), 100.0 * rank1 / len(own)))

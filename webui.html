@@ -4101,9 +4101,21 @@ $('#rulesSaveBtn').addEventListener('click', async () => {
     unlock_hint: row.querySelector('[data-k="unlock_hint"]').value.trim(),
   })).filter((s) => s.name);
   const rubric = collectRubric();
+  // 分档互动指引：页面为每个档位渲染了 [data-k="guide"] 文本框（按阶段名索引），
+  // 但早先保存时**根本没发给后端**（只有 mockApply 里读了 DOM），
+  // 于是真实后端下改指引 → 提示已保存 → 刷新又变回旧值。后端 _write_gating
+  // 明确支持 stage_guides 字段，这里补上。
+  const stage_guides = {};
+  $$('#stageList .stage-row').forEach((row) => {
+    const nm = row.querySelector('[data-k="name"]').value.trim();
+    const gd = row.querySelector('[data-k="guide"]');
+    if (!nm || !gd) return;
+    stage_guides[nm] = gd.value;
+  });
   const body = {
     enabled: $('#gatingEnabled').checked,
     stages,
+    stage_guides,
     avoid: { header: $('#avoidHeader').value, note: $('#avoidNote').value },
     rubric,
   };
@@ -4256,7 +4268,12 @@ $('#memoList').addEventListener('click', async (e) => {
   // 搜索模式下结果来自不同频道，删除必须用条目自带的频道
   const chatKey = btn.dataset.chat || state.memoChannel;
   const res = await mutate('memo', { chat_key: chatKey, op: 'delete', id }, {
-    mockApply: () => { MOCK.raw.memos[state.memoChannel] = (MOCK.raw.memos[state.memoChannel] || []).filter((n) => n.id !== id); },
+    mockApply: () => {
+      // 演示模式下也要按条目自带频道删：跨频道搜索时 state.memoChannel 是旧值，
+      // 用它会把另一个频道的同 id 笔记删掉。
+      const k = chatKey || state.memoChannel;
+      MOCK.raw.memos[k] = (MOCK.raw.memos[k] || []).filter((n) => n.id !== id);
+    },
     okMsg: '笔记已删除',
   });
   if (res) loadMemo();
@@ -4459,8 +4476,12 @@ $('#trashList').addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-act]');
   if (!btn) return;
   const id = btn.dataset.id;
+  // ⚠️ res 必须声明在 if/else **外面**：原来两个分支各写 `const res`，
+  //    块外的 `if (res) loadTrash()` 读的是未声明标识符（脚本是 'use strict'），
+  //    每次点击都抛 ReferenceError —— 恢复成功了但列表永远不刷新。
+  let res = null;
   if (btn.dataset.act === 'restore') {
-    const res = await mutate('trash/restore', { trash_id: id }, {
+    res = await mutate('trash/restore', { trash_id: id }, {
       mockApply: () => {
         const item = MOCK.raw.trash.find((t) => t.trash_id === id);
         if (item) {
@@ -4472,7 +4493,7 @@ $('#trashList').addEventListener('click', async (e) => {
       okMsg: '已恢复',
     });
   } else {
-    const res = await mutate('trash/delete', { trash_id: id }, {
+    res = await mutate('trash/delete', { trash_id: id }, {
       mockApply: () => { MOCK.raw.trash = MOCK.raw.trash.filter((t) => t.trash_id !== id); },
       okMsg: '已永久删除',
     });

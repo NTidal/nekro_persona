@@ -913,7 +913,9 @@ def heat_factor(stat: Optional[Dict[str, Any]], now: float, lc: Dict[str, Any]) 
 
 def effective_rank(entry: Dict[str, Any], tier: int, now: float, lc: Dict[str, Any]) -> float:
     """排序用有效权重 = 作者 weight × 热度。高 weight 条目豁免降权（保护核心设定）。"""
-    w = float(entry.get("weight", 1) or 1)
+    # ⚠️ 只对 None 回落：`or 1` 会把合法的 weight=0 吞成 1
+    _wv = entry.get("weight", 1)
+    w = float(1 if _wv is None else _wv)
     if not lc.get("enabled") or w >= float(lc["protect_weight"]):
         return w
     stat = _state()["hit_stats"].get(_hit_key(tier, str(entry.get("id", ""))))
@@ -1973,6 +1975,7 @@ async def render_memory_block(
     tier3_cfg: Optional[Dict[str, Any]] = None,
     tier1_cfg: Optional[Dict[str, Any]] = None,
     tier2_cfg: Optional[Dict[str, Any]] = None,
+    dry_run: bool = False,
 ) -> str:
     """渲染记忆块（1 档 + 2 档 + 3 档 + 门控回避）。
 
@@ -1995,6 +1998,7 @@ async def render_memory_block(
     with _pin_state():
         return await _render_memory_block_impl(
             ctx, score, gating, tier3_cfg, tier1_cfg, tier2_cfg,
+            dry_run=dry_run,
         )
 
 
@@ -2005,7 +2009,14 @@ async def _render_memory_block_impl(
     tier3_cfg: Optional[Dict[str, Any]] = None,
     tier1_cfg: Optional[Dict[str, Any]] = None,
     tier2_cfg: Optional[Dict[str, Any]] = None,
+    dry_run: bool = False,
 ) -> str:
+    """渲染记忆块。dry_run=True 时**不产生任何写入副作用**（预览用）。
+
+    副作用包括：写 st["last_hit"] / st["last_hit_tier3"]，以及生命周期开启时的
+    `_bump_hits`（会去抖落盘 `.hit_stats.json`）。预览页点来点去会虚增热度、
+    扭曲真实排序，所以预览必须走 dry_run。
+    """
     await ensure_loaded()
 
     t1s = tier1_settings(tier1_cfg)
@@ -2056,11 +2067,12 @@ async def _render_memory_block_impl(
             # 不含因超预算被渲染器跳过的——否则长条会虚涨热度、挤掉真能注入的条目，
             # 且「最近命中」会谎报注入过其实没进输出的条目。
             names = ",".join(str(e.get("id", "?")) for e in injected2)
-            _state()["last_hit"] = f"{src}:{names}"
+            if not dry_run:
+                _state()["last_hit"] = f"{src}:{names}"
             logger.info(f"[persona] 2 档命中({src}): {names}")
             parts.append(t2)
             # A4：仅在生命周期开启时强化命中条目（关闭时零副作用、不写 sidecar）
-            if lifecycle_settings(t2s.get("lifecycle"))["enabled"]:
+            if not dry_run and lifecycle_settings(t2s.get("lifecycle"))["enabled"]:
                 _bump_hits(injected2, 2, time.time())
 
     # ---- 3 档：世界知识（扩展）----
@@ -2074,10 +2086,11 @@ async def _render_memory_block_impl(
             t3 = _render_tier3(hits3, t3s["max_entries"], t3s["max_chars"], injected3)
             if t3:
                 names3 = ",".join(str(e.get("id", "?")) for e in injected3)
-                _state()["last_hit_tier3"] = f"{src3}:{names3}"
+                if not dry_run:
+                    _state()["last_hit_tier3"] = f"{src3}:{names3}"
                 logger.info(f"[persona] 3 档命中({src3}): {names3}")
                 parts.append(t3)
-                if lifecycle_settings(t3s.get("lifecycle"))["enabled"]:
+                if not dry_run and lifecycle_settings(t3s.get("lifecycle"))["enabled"]:
                     _bump_hits(injected3, 3, time.time())
 
 

@@ -18,6 +18,7 @@ import glob
 import hmac
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -32,6 +33,55 @@ from fastapi.responses import HTMLResponse, Response
 BG_DIR = Path(__file__).parent / "backgrounds"   # ⚠️ 已废弃：仅为兼容外部引用保留，内部一律走 _bg_dir()
 # 合法档位（扩展：新增 tier3 世界知识）
 _TIERS = ("tier1", "tier2", "tier3")
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """把任意来源的值转成 int，坏值回落到 default（**绝不抛**）。
+
+    背景记忆的 min_favor / weight 可能被手改成 "20分" 这类值。早期到处写
+    `int(x or 0)`，一个坏字段就让 /api/overview、/api/entries 直接 500，
+    整个管理台打不开、也没法在 UI 里修 —— 读取侧一律走这里。
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+# 种子包里合法的人设文件名：不含路径分隔符、不以点开头（挡 `../` 之类穿越）
+_SAFE_TIER_FILE = re.compile(r"^[A-Za-z0-9_.\-\u4e00-\u9fff]+[.]json$")
+
+
+def _validate_tier_entries(entries: List[Any]) -> str:
+    """校验种子包条目的字段类型，返回第一处问题的描述（空串 = 通过）。
+
+    原先只校验「entries 是列表」，一个手改的 `"min_favor": "20分"` 能被导入成功，
+    随后整个 UI 打不开、也没法从 UI 里修 —— 所以在写盘前就拦住。
+    """
+    for i, e in enumerate(entries, 1):
+        if not isinstance(e, dict):
+            return f"第 {i} 条不是对象"
+        for key in ("min_favor", "weight"):
+            if key in e and e[key] is not None:
+                v = e[key]
+                ok_num = isinstance(v, (int, float)) and not isinstance(v, bool)
+                ok_str = isinstance(v, str) and v.strip().lstrip("+-").isdigit()
+                if not (ok_num or ok_str):
+                    return f'第 {i} 条 {key}="{v}" 不是整数'
+        if "enabled" in e and not isinstance(e["enabled"], bool):
+            return f"第 {i} 条 enabled 不是布尔值"
+        for key in ("id", "title", "content", "trigger", "file"):
+            if key in e and e[key] is not None and not isinstance(e[key], str):
+                return f"第 {i} 条 {key} 不是字符串"
+        if "triggers" in e and e["triggers"] is not None:
+            v = e["triggers"]
+            if not isinstance(v, list) or any(not isinstance(t, str) for t in v):
+                return f"第 {i} 条 triggers 必须是字符串数组"
+    return ""
 _TIER_LABEL = {"tier1": "1 档·身份", "tier2": "2 档·往事", "tier3": "3 档·世界知识"}
 
 
@@ -131,7 +181,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     detail="未配置 WEBUI_ACCESS_KEY，写操作已禁用；请在插件配置中设置访问密钥后再试",
                 )
             return
-        if not hmac.compare_digest(got, expect):
+        # ⚠️ hmac.compare_digest 对含非 ASCII 的两个 str 会抛
+        #    TypeError: comparing strings with non-ASCII characters ...
+        #    密钥里带汉字很常见，那会让**每个请求（含只读）**都 500。统一按 bytes 比。
+        if not hmac.compare_digest(got.encode("utf-8"), expect.encode("utf-8")):
             raise HTTPException(status_code=401, detail="访问密钥不正确")
 
     # ---------------- 数据读写 ----------------
@@ -587,7 +640,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         def _dist(entries: List[Dict[str, Any]]) -> Dict[str, int]:
             d: Dict[str, int] = {}
             for e in entries:
-                k = str(int(e.get("min_favor", 0) or 0))
+                k = str(_as_int(e.get("min_favor"), 0))
                 d[k] = d.get(k, 0) + 1
             return dict(sorted(d.items(), key=lambda kv: int(kv[0])))
 
@@ -774,13 +827,13 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         def _deco(items: List[Dict[str, Any]], tier: str) -> List[Dict[str, Any]]:
             out = []
             for e in items:
-                mf = int(e.get("min_favor", 0) or 0)
+                mf = _as_int(e.get("min_favor"), 0)
                 out.append(
                     {
                         "tier": tier,
                         "id": e.get("id", ""),
                         "title": e.get("title") or e.get("topic") or "",
-                        "weight": int(e.get("weight", 1) or 1),
+                        "weight": _as_int(e.get("weight"), 1),
                         "min_favor": mf,
                         "stage": "公开" if mf <= 0 else _stage_of(mf),
                         "enabled": bool(e.get("enabled", True)),
@@ -1069,13 +1122,21 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             score = int(raw_score)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="score 必须是整数") from exc
-        state = await helpers["load_state"](ck)
-        prof = state.profile_for(uid, "")
-        final_score = helpers["clamp_score"](score)
-        prof.score = final_score
-        prof.updated_at = helpers["now_ts"]()
-        prof.last_reason = str(body.get("reason") or "WebUI 手动调整")[:160]
-        await helpers["save_state"](ck, state)
+        now = helpers["now_ts"]()
+        # ⚠️ 读-改-写必须在 per-chat 锁内完成：消息处理与衰减/回升循环都会写同一份档案，
+        #    无锁 RMW 在并发下会 last-writer-wins 把分数丢掉（锁的注释里就写了这个场景）。
+        lock = await helpers["state_lock"](ck)
+        async with lock:
+            state = await helpers["load_state"](ck)
+            prof = state.profile_for(uid, "")
+            before = int(prof.score)
+            final_score = helpers["clamp_score"](score)
+            prof.score = final_score
+            prof.updated_at = now
+            prof.last_reason = str(body.get("reason") or "WebUI 手动调整")[:160]
+            # 手工改分同样计入当日净额与间隔锚点（与工具、超管命令同一套预算）
+            prof.record_adjust(final_score - before, now)
+            await helpers["save_state"](ck, state)
         stage, _ = helpers["stage_info"](final_score)
         return {
             "ok": True,
@@ -1102,69 +1163,79 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         if action not in ("update", "delete"):
             raise HTTPException(status_code=400, detail="action 只能是 update 或 delete")
 
-        state = await helpers["load_state"](ck)
-        prof = state.profile_for(uid, "")
+        now = helpers["now_ts"]()
+        # 同 /api/score：整个读-改-写要在同一把频道锁内，避免与消息处理并发丢更新
+        lock = await helpers["state_lock"](ck)
+        async with lock:
+            state = await helpers["load_state"](ck)
+            prof = state.profile_for(uid, "")
+            _before_score = int(prof.score)
 
-        if action == "delete":
-            profiles = getattr(state, "profiles", None)
-            if isinstance(profiles, dict) and uid in profiles:
-                profiles.pop(uid, None)
-                await helpers["save_state"](ck, state)
-                plugin.logger.info(f"[persona] WebUI 删除关系档案 {ck} / {uid}")
-                return {"ok": True, "action": "delete", "user_id": uid}
-            raise HTTPException(status_code=404, detail="该频道没有这个用户的档案")
+            if action == "delete":
+                profiles = getattr(state, "profiles", None)
+                if isinstance(profiles, dict) and uid in profiles:
+                    profiles.pop(uid, None)
+                    await helpers["save_state"](ck, state)
+                    plugin.logger.info(f"[persona] WebUI 删除关系档案 {ck} / {uid}")
+                    return {"ok": True, "action": "delete", "user_id": uid}
+                raise HTTPException(status_code=404, detail="该频道没有这个用户的档案")
 
-        changed: List[str] = []
-        if "summary" in body:
-            prof.summary = " ".join(str(body["summary"] or "").split())[:200]
-            changed.append("summary")
-        if "tags" in body:
-            raw = body["tags"]
-            if isinstance(raw, str):
-                raw = raw.replace("，", ",").replace("、", ",").split(",")
-            if not isinstance(raw, list):
-                raise HTTPException(status_code=400, detail="tags 必须是数组或逗号分隔的字符串")
-            tags: List[str] = []
-            for item in raw:
-                tag = " ".join(str(item or "").split())[:16]
-                if tag and tag not in tags:
-                    tags.append(tag)
-            prof.tags = tags[:12]
-            changed.append("tags")
-        if "interaction_hint" in body:
-            prof.interaction_hint = " ".join(str(body["interaction_hint"] or "").split())[:200]
-            changed.append("interaction_hint")
-        if "score" in body and body["score"] is not None and str(body["score"]) != "":
-            raw_score = body["score"]
-            if isinstance(raw_score, float) and not raw_score.is_integer():
-                raise HTTPException(status_code=400, detail="score 必须是整数")
-            try:
-                prof.score = helpers["clamp_score"](int(raw_score))
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail="score 必须是整数") from exc
-            changed.append("score")
-        if not changed:
-            raise HTTPException(status_code=400, detail="没有要修改的字段")
+            changed: List[str] = []
+            if "summary" in body:
+                prof.summary = " ".join(str(body["summary"] or "").split())[:200]
+                changed.append("summary")
+            if "tags" in body:
+                raw_tags = body["tags"]
+                if isinstance(raw_tags, str):
+                    raw_tags = raw_tags.replace("，", ",").replace("、", ",").split(",")
+                if not isinstance(raw_tags, list):
+                    raise HTTPException(status_code=400, detail="tags 必须是数组或逗号分隔的字符串")
+                tags: List[str] = []
+                for item in raw_tags:
+                    tag = " ".join(str(item or "").split())[:16]
+                    if tag and tag not in tags:
+                        tags.append(tag)
+                prof.tags = tags[:12]
+                changed.append("tags")
+            if "interaction_hint" in body:
+                prof.interaction_hint = " ".join(str(body["interaction_hint"] or "").split())[:200]
+                changed.append("interaction_hint")
+            if "score" in body and body["score"] is not None and str(body["score"]) != "":
+                raw_score = body["score"]
+                if isinstance(raw_score, float) and not raw_score.is_integer():
+                    raise HTTPException(status_code=400, detail="score 必须是整数")
+                try:
+                    prof.score = helpers["clamp_score"](int(raw_score))
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(status_code=400, detail="score 必须是整数") from exc
+                changed.append("score")
+            if not changed:
+                raise HTTPException(status_code=400, detail="没有要修改的字段")
 
-        prof.updated_at = helpers["now_ts"]()
-        if str(body.get("reason") or "").strip():
-            prof.last_reason = str(body["reason"]).strip()[:160]
-        elif "score" in changed:
-            prof.last_reason = "WebUI 手动调整"
-        await helpers["save_state"](ck, state)
-        stage, _hint = helpers["stage_info"](prof.score)
+            prof.updated_at = now
+            if str(body.get("reason") or "").strip():
+                prof.last_reason = str(body["reason"]).strip()[:160]
+            elif "score" in changed:
+                prof.last_reason = "WebUI 手动调整"
+            if "score" in changed:
+                prof.record_adjust(int(prof.score) - _before_score, now)
+            await helpers["save_state"](ck, state)
+            stage, _hint = helpers["stage_info"](prof.score)
+            snapshot = {
+                "score": prof.score,
+                "summary": prof.summary,
+                "tags": list(prof.tags),
+                "interaction_hint": prof.interaction_hint,
+            }
         plugin.logger.info(f"[persona] WebUI 修改关系档案 {ck} / {uid}: {changed}")
         return {
             "ok": True,
             "action": "update",
             "user_id": uid,
             "changed": changed,
-            "score": prof.score,
             "stage": stage,
-            "summary": prof.summary,
-            "tags": list(prof.tags),
-            "interaction_hint": prof.interaction_hint,
             "max_abs": helpers["max_abs_score"](),
+            **snapshot,
         }
 
     @router.get("/api/preview", summary="注入预览")
@@ -1180,10 +1251,30 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         ctx = await AgentCtx.create_by_chat_key(chat_key=chat_key)
         cfg = memory.load_favor_cfg()
         gating = bool(cfg) and bool(cfg.get("enabled", True))
-        text = await memory.render_memory_block(
+        # ⚠️ dry_run=True：预览绝不能在真实数据上留副作用。
+        #    render_memory_block 会写 st["last_hit"]、并在生命周期开启时 _bump_hits
+        #    （去抖落盘 .hit_stats.json）——在预览页点来点去就会虚增热度、扭曲真实排序，
+        #    与 /api/recall_test 的「只读」纪律相悖。
+        block = await memory.render_memory_block(
             ctx, effective_score, gating=gating,
             tier1_cfg=_tier1_cfg(), tier2_cfg=_tier2_cfg(), tier3_cfg=_t3_cfg(),
+            dry_run=True,
         )
+        # 真实 prompt 的第 ① 段是「关系卡」（persona_prompt 里的 parts[0]）。
+        # 早先预览从第 ② 段才开始，与「渲染真实注入文本」的契约不符。
+        card = ""
+        try:
+            _arch = await helpers["load_state"](chat_key)
+            _uid = (getattr(ctx, "from_platform_userid", "") or
+                    getattr(_arch, "last_active_user_id", "") or "").strip()
+            _prof = _arch.profiles.get(_uid) if _uid else None
+            card = (helpers["compose_archive_card"](_prof, current=True)
+                    if _prof is not None
+                    else helpers["compose_overview_card"](_arch))
+        except Exception as exc:  # noqa: BLE001
+            plugin.logger.warning(f"[persona] 预览关系卡组装失败（已跳过）: {exc}")
+            card = ""
+        text = "\n\n".join(p for p in (card, block) if p)
 
         # 生长层 tier4：身份锚点（anchor · 全局）+ 频道笔记（note · 本频道）
         # ⚠️ 必须与 persona_prompt 的第 ③ 段同口径：preview 早先只实现了 ② 三档记忆
@@ -1267,6 +1358,8 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "length": len(text),
             "text": text,
             "debug": {
+                "dry_run": True,
+                "card_chars": len(card),
                 "gating_enabled": gating,
                 "tier1_count": len(memory._state().get("tier1", [])),
                 "tier2_count": len(memory._state().get("tier2", [])),
@@ -1459,13 +1552,13 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "TIER2_MAX_ENTRIES": (int, 1, 10),
             "TIER2_MAX_CHARS": (int, 50, 3000),
             "TIER2_SIM_THRESHOLD": (float, 0.0, 1.0),
-            "TIER2_SCAN_MSGS": (int, 1, 30),
+            "TIER2_SCAN_MSGS": (int, 1, 200),
             # 扩展：3 档（世界知识）
             "TIER3_ENABLED": (bool, None, None),
             "TIER3_MAX_ENTRIES": (int, 1, 10),
             "TIER3_MAX_CHARS": (int, 100, 3000),
             "TIER3_SIM_THRESHOLD": (float, 0.0, 1.0),
-            "TIER3_SCAN_MSGS": (int, 1, 30),
+            "TIER3_SCAN_MSGS": (int, 1, 200),
             # 扩展：记忆生命周期（A2/A3，1.5.0）
             "LIFECYCLE_ENABLED": (bool, None, None),
             "LIFECYCLE_HALF_LIFE_DAYS": (int, 1, 3650),
@@ -2003,12 +2096,32 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         if not any(n.endswith("tier4.json") or n == "archives.json" for n in names):
             raise HTTPException(status_code=400, detail="包里没有可导入的生长数据（tier4.json / archives.json）")
 
-        # 导入前备份当前生长状态（tier4.json + hit_stats）到 _growth_import_backups/<stamp>/
+        # 导入前备份当前生长状态到 _growth_import_backups/<stamp>/
+        # ⚠️ archives.json 会**整 blob 覆写**各频道关系档案（分数 / 标签 / 稳定印象），
+        #    早先这里只备份了 tier4.json（注释还写成备份了 hit_stats，实际没有），
+        #    导错包就是不可逆丢失。现在把现有关系档案一并落盘备份。
         stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
         bdir = _bg_dir().parent / "_growth_import_backups" / stamp
         bdir.mkdir(parents=True, exist_ok=True)
         if t4.tier4_path().is_file():
             shutil.copy2(t4.tier4_path(), bdir / "tier4.json")
+        backed_arch = 0
+        try:
+            _cur_arch = await helpers["enumerate_archives"]()
+            _objs: Dict[str, Any] = {}
+            for _ck, _blob in (_cur_arch or {}).items():
+                try:
+                    _obj = json.loads(_blob)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(_obj, dict):
+                    _objs[str(_ck)] = _obj
+            if _objs:
+                (bdir / "archives.json").write_text(
+                    json.dumps(_objs, ensure_ascii=False), encoding="utf-8")
+            backed_arch = len(_objs)
+        except Exception as exc:  # noqa: BLE001
+            plugin.logger.warning(f"[growth] 备份现有关系档案失败（继续导入）: {exc}")
 
         applied: List[str] = []
 
@@ -2050,6 +2163,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "ok": True,
             "applied": applied,
             "backup_dir": str(bdir),
+            "backed_up_archives": backed_arch,
             "note": "关系档案与 tier4 即时生效；热度（命中统计）不随生长包迁移，由本实例自行累积。",
             **reload_state,
         }
@@ -2067,12 +2181,17 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             await memory.ensure_loaded()
         except ValueError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
-        files = [
-            ("backgrounds/tier1/core.json", _bg_dir() / "tier1" / "core.json"),
-            ("backgrounds/tier2/lore.json", _bg_dir() / "tier2" / "lore.json"),
-            ("backgrounds/tier3/world.json", _bg_dir() / "tier3" / "world.json"),
-            ("backgrounds/favor.json", _bg_dir() / "favor.json"),
-        ]
+        # 各档目录下的**全部** json 都要打进去：
+        #   core/lore/world 是手工策划的种子，custom.json 是 WebUI「新建条目」写的。
+        # 早先这里只列了固定四个文件，于是 WebUI 建的条目导出后在新实例导入即消失
+        # —— 而运行时 memory 是按 *.json 全量读的，两边口径必须一致。
+        files: List[Any] = []
+        for _tier in _TIERS:
+            _tdir = _bg_dir() / _tier
+            if _tdir.is_dir():
+                for _fp in sorted(_tdir.glob("*.json")):
+                    files.append((f"backgrounds/{_tier}/{_fp.name}", _fp))
+        files.append(("backgrounds/favor.json", _bg_dir() / "favor.json"))
         buf = _io.BytesIO()
         stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
         counts: Dict[str, Any] = {}
@@ -2137,12 +2256,28 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     return cand
             return None
 
-        targets = {
-            "tier1/core.json": _bg_dir() / "tier1" / "core.json",
-            "tier2/lore.json": _bg_dir() / "tier2" / "lore.json",
-            "tier3/world.json": _bg_dir() / "tier3" / "world.json",
-            "favor.json": _bg_dir() / "favor.json",
-        }
+        def _target_for(nm: str):
+            """包内路径 → (档内相对路径, 本地目标文件)；不认识的返回 None。
+
+            支持 `backgrounds/tierK/<name>.json` 与历史包的裸 `tierK/<name>.json`，
+            这样「只打四个固定文件」时期导出的老包仍然能导。
+            """
+            arc = nm.replace("\\", "/")
+            if arc.startswith("backgrounds/"):
+                arc = arc[len("backgrounds/"):]
+            if arc == "favor.json":
+                return "favor.json", _bg_dir() / "favor.json"
+            parts = arc.split("/")
+            if (len(parts) == 2 and parts[0] in _TIERS
+                    and _SAFE_TIER_FILE.match(parts[1])):
+                return arc, _bg_dir() / parts[0] / parts[1]
+            return None
+
+        targets: Dict[str, Any] = {}
+        for _nm in sorted(names):
+            _hit = _target_for(_nm)
+            if _hit is not None:
+                targets[_hit[0]] = _hit[1]
         parsed = {}
         for arc, dst in targets.items():
             src = _pick(arc)
@@ -2160,6 +2295,12 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             else:
                 if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
                     raise HTTPException(status_code=400, detail=f"{arc} 结构不对（缺 entries）")
+                bad = _validate_tier_entries(data["entries"])
+                if bad:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{arc} 有非法条目：{bad}（已拒绝导入，未改动任何文件）",
+                    )
                 n = len(data["entries"])
             parsed[arc] = (raw, dst, n)
         if not parsed:

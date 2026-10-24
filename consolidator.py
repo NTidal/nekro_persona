@@ -24,6 +24,15 @@ logger = get_sub_logger("persona_consolidator")
 
 # ==================== 参数 ====================
 
+class ConsolidationFailed(RuntimeError):
+    """归纳最终失败（网络 / 超时 / 坏 JSON / 模型组不可用）。
+
+    ⚠️ 必须用异常而不是「返回空列表」来表达失败：调用方把空列表理解为
+    「模型判断这批没什么可记的」，于是不回填素材 —— 一批（最多几十条）
+    互动素材就此永久丢失，日志还撒谎说「素材保留待下轮」。
+    """
+
+
 BATCH_MIN_ITEMS = 20
 """攒够多少条素材才归纳（避免一轮一调）。"""
 
@@ -200,8 +209,10 @@ def pushes_back(chat_key: str, items: List[Dict[str, Any]],
         _buckets[chat_key] = b
     b.items = list(items) + b.items
     b.last_at = now
-    if b.first_at <= 0:
-        b.first_at = now
+    # ⚠️ 必须**无条件**重置：docstring 承诺「失败后不要立即重试」，
+    #    但旧实现只在 first_at<=0 时才设，已有桶的 first_at 保持很久以前，
+    #    于是 should_flush 立刻又判定超时 —— ≥门槛的失败桶每 60 秒重试一次。
+    b.first_at = now
     return len(b.items)
 
 
@@ -267,9 +278,16 @@ def build_prompt(items: List[Dict[str, Any]]) -> str:
 _RE_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.S)
 
 
-def parse_response(raw: str) -> List[Dict[str, Any]]:
-    """解析 LLM 返回的 JSON；容忍 markdown 围栏与前后废话。"""
+def parse_response(raw: str, *, strict: bool = False) -> List[Dict[str, Any]]:
+    """解析 LLM 返回的 JSON；容忍 markdown 围栏与前后废话。
+
+    strict=True（归纳流程用）时，**响应不可解析一律抛 ConsolidationFailed**，
+    而不是返回空列表 —— 空列表在调用方语义里是「模型说没有可记的内容」。
+    strict=False 保留旧的宽松行为，仅有测试/离线分析会用到。
+    """
     if not raw:
+        if strict:
+            raise ConsolidationFailed("模型返回空内容")
         return []
     text = _RE_FENCE.sub("", raw.strip())
     # 容错：从第一个 { 到最后一个 }
@@ -280,11 +298,17 @@ def parse_response(raw: str) -> List[Dict[str, Any]]:
         data = json.loads(text)
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[memory_log] 归纳结果不是合法 JSON：{exc}；原文前 200：{raw[:200]}")
+        if strict:
+            raise ConsolidationFailed(f"归纳结果不是合法 JSON：{exc}") from exc
         return []
     if not isinstance(data, dict):
+        if strict:
+            raise ConsolidationFailed("归纳结果根节点不是对象")
         return []
     mems = data.get("memories")
     if not isinstance(mems, list):
+        if strict:
+            raise ConsolidationFailed("归纳结果缺少 memories 数组")
         return []
     out: List[Dict[str, Any]] = []
     for m in mems:
@@ -318,8 +342,9 @@ async def consolidate_with_llm(items: List[Dict[str, Any]],
                                ) -> List[Dict[str, Any]]:
     """把一批素材交给 LLM 归纳，返回结构化记忆列表。
 
-    失败（网络/解析）会自动重试并降级；最终仍失败则返回空列表，
-    调用方应把素材放回桶里等下一轮（不丢数据）。
+    失败（网络/超时/坏 JSON/模型组不可用）会自动重试；**最终仍失败则抛
+    `ConsolidationFailed`**，由调用方把素材回填到桶里等下一轮。
+    只有「响应合法且模型确实没产出可用记忆」时才返回空列表。
     """
     if not items:
         return []
@@ -333,7 +358,7 @@ async def consolidate_with_llm(items: List[Dict[str, Any]],
         group = config.get_model_group_info(name)
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[memory_log] 模型组 {name!r} 不可用：{exc}")
-        return []
+        raise ConsolidationFailed(f"模型组 {name!r} 不可用：{exc}") from exc
 
     extra_body = parse_extra_body(
         group.EXTRA_BODY, source_hint=f"persona memory_log: {name}") or {}
@@ -361,7 +386,7 @@ async def consolidate_with_llm(items: List[Dict[str, Any]],
                 ),
                 timeout=LLM_TIMEOUT_SECONDS + 5,
             )
-            parsed = parse_response(resp.response_content)
+            parsed = parse_response(resp.response_content, strict=True)
             logger.info(
                 f"[memory_log] 归纳完成：素材 {len(items)} 条 → 记忆 {len(parsed)} 条"
                 f"（model={group.CHAT_MODEL}, attempt={attempt + 1}）")
@@ -383,5 +408,6 @@ async def consolidate_with_llm(items: List[Dict[str, Any]],
         if attempt < max_retries:
             await asyncio.sleep(min(8.0, 1.5 ** attempt))
 
-    logger.warning(f"[memory_log] 归纳最终失败，素材保留待下轮：{last_err}")
-    return []
+    # ⚠️ 这里必须抛，不能 return []：调用方见到空列表会当成「模型判断无内容」
+    #    而不回填素材，那批互动就永久丢了（旧实现的日志还写着「素材保留待下轮」）。
+    raise ConsolidationFailed(f"归纳最终失败：{last_err}")
