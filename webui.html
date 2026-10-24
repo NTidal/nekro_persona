@@ -2642,6 +2642,20 @@ body.is-scrolling .dialog-foot {
   <div class="dialog-foot" id="dialogFoot"></div>
 </dialog>
 
+<!-- 确认弹窗：必须是**独立**的 <dialog>。
+     复用 #dialog 会把正在编辑的弹窗内容顶掉（点「删除档案」再取消，档案弹窗就没了，
+     还得从列表重新打开）；独立元素让两层自然堆叠，取消后原弹窗原样还在。 -->
+<dialog id="confirmDlg">
+  <div class="dialog-head">
+    <div><h2 id="confirmTitle"></h2></div>
+    <button class="btn icon-only ghost" type="button" id="confirmClose" aria-label="关闭">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+    </button>
+  </div>
+  <div class="dialog-body" id="confirmBody"></div>
+  <div class="dialog-foot" id="confirmFoot"></div>
+</dialog>
+
 <div class="toast-region" id="toastRegion" aria-live="polite"></div>
 
 <!-- 幻墨 FX 层 -->
@@ -2742,32 +2756,37 @@ function closeDialog() { if (dlg.open) dlg.close(); }
 /* 统一的破坏性操作确认框：返回 Promise<boolean>。
    ⚠️ 之前全站只有「删背景记忆条目」有确认，而它恰好是唯一进回收站、可恢复的那种；
    其余五处（关系档案 / 锚点 / 频道笔记 / 关系记忆 / 回收站永久删除）都是**一点即删**。 */
+const confirmDlg = $('#confirmDlg');
+
 function confirmAction({ title, message, okText = '确认删除', cancelText = '取消', danger = true }) {
   return new Promise((resolve) => {
     let settled = false;
     const settle = (v) => { if (!settled) { settled = true; resolve(v); } };
-    openDialog({
-      title,
-      body: `<p class="confirm-msg">${esc(message)}</p>`,
-      foot: `<button class="btn" type="button" data-dlg="cf-no">${esc(cancelText)}</button>
-             <button class="btn ${danger ? 'danger' : 'primary'}" type="button" data-dlg="cf-yes">${esc(okText)}</button>`,
-    });
+    $('#confirmTitle').textContent = title;
+    $('#confirmBody').innerHTML = `<p class="confirm-msg">${esc(message)}</p>`;
+    $('#confirmFoot').innerHTML =
+      `<button class="btn" type="button" data-dlg="cf-no">${esc(cancelText)}</button>
+       <button class="btn ${danger ? 'danger' : 'primary'}" type="button" data-dlg="cf-yes">${esc(okText)}</button>`;
+    if (!confirmDlg.open) confirmDlg.showModal();
     const onFoot = (e) => {
       const b = e.target.closest('[data-dlg]');
       if (!b) return;
       const act = b.dataset.dlg;
-      if (act !== 'cf-yes' && act !== 'cf-no' && act !== 'cancel') return;
+      if (act !== 'cf-yes' && act !== 'cf-no') return;
       cleanup();
-      closeDialog();
       settle(act === 'cf-yes');
+      confirmDlg.close();
     };
-    const onClose = () => { cleanup(); settle(false); };   // Esc / 点遮罩 = 取消
+    const onClose = () => { cleanup(); settle(false); };   // Esc / 点遮罩 / 右上角关 = 取消
     function cleanup() {
-      $('#dialogFoot').removeEventListener('click', onFoot);
-      dlg.removeEventListener('close', onClose);
+      $('#confirmFoot').removeEventListener('click', onFoot);
+      $('#confirmClose').removeEventListener('click', onX);
+      confirmDlg.removeEventListener('close', onClose);
     }
-    $('#dialogFoot').addEventListener('click', onFoot);
-    dlg.addEventListener('close', onClose);
+    function onX() { cleanup(); settle(false); confirmDlg.close(); }
+    $('#confirmFoot').addEventListener('click', onFoot);
+    $('#confirmClose').addEventListener('click', onX);
+    confirmDlg.addEventListener('close', onClose);
   });
 }
 
@@ -2890,7 +2909,7 @@ function setDemo(on, reason = '') {
   // 回落路径，只显示"演示数据"极难排查。
   badge.title = on ? `后端不可用：${reason || '未知原因'}` : '';
   // 演示模式下导出按钮没有意义（下载不到真实文件），直接禁用并说明原因
-  ['#exportPersonaBtn', '#exportTier4Btn'].forEach((sel) => {
+  ['#exportGrowthBtn', '#exportPersonaBtn', '#exportTier4Btn'].forEach((sel) => {
     const b = document.querySelector(sel);
     if (!b) return;
     b.disabled = on;
@@ -4239,7 +4258,9 @@ $('#rulesSaveBtn').addEventListener('click', async () => {
     },
     okMsg: '规则已保存并重载',
   });
-  if (res) loadRules();
+  // 保存成功必须清脏，否则顶栏「未保存」一直亮着，切页还会质问
+  // 「还有未保存的修改」——刚保存完就被质疑，比不提示更让人怀疑自己。
+  if (res) { setDirty(false); loadRules(); }
 });
 
 /* ---------------- 注入预览 ---------------- */
@@ -4827,7 +4848,7 @@ $('#settingsSaveBtn').addEventListener('click', async () => {
     mockApply: () => { Object.assign(MOCK.raw.config, patch); },
     okMsg: '参数已保存并生效',
   });
-  if (res) { state.overview = null; loadSettings(); }
+  if (res) { setDirty(false); state.overview = null; loadSettings(); }
 });
 $('#settingsResetBtn').addEventListener('click', () => { renderSettings(); toast('已还原为当前生效值', 'info', 1600); });
 
@@ -4909,7 +4930,7 @@ $('#exportGrowthBtn').addEventListener('click', (e) => withBusy(e.currentTarget,
     const name = await downloadFile('growth/export', 'growth_bundle.zip');
     toast(`已导出生长包：${name}`, 'success', 4600);
   } catch (err) {
-    toast(`导出生长包失败：${err.message}`, 'error', 6000);
+    toast(`导出生长包失败：${err.message}${state.demo ? '（当前是演示数据模式，后端不可达时无法导出真实文件）' : ''}`, 'error', 6000);
   }
 }));
 
