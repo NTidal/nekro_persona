@@ -2055,6 +2055,7 @@ body.is-scrolling .dialog-foot {
   </div>
   <div class="top-actions">
     <span id="demoBadge" class="demo-badge" title="后端暂不可达，当前展示的是内置演示数据">演示数据</span>
+    <span id="dirtyBadge" class="badge warning" hidden title="当前页有未保存的修改">未保存</span>
     <span id="scopePill" class="scope-pill loading" role="status"><i></i><span>识别作用域…</span></span>
     <button id="keyBtn" class="btn icon-only" type="button" title="设置访问密钥（X-WebUI-Key）" aria-label="设置访问密钥">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 9.5a4 4 0 1 0-3.9 4L8 16.1V19H5v-2H3v-3l6.1-2.6"/><circle cx="15.5" cy="8.5" r="1" fill="currentColor" stroke="none"/></svg>
@@ -2731,6 +2732,45 @@ function openDialog({ title, subtitle = '', body = '', foot = '' }) {
   if (!dlg.open) dlg.showModal();
 }
 function closeDialog() { if (dlg.open) dlg.close(); }
+
+/* 统一的破坏性操作确认框：返回 Promise<boolean>。
+   ⚠️ 之前全站只有「删背景记忆条目」有确认，而它恰好是唯一进回收站、可恢复的那种；
+   其余五处（关系档案 / 锚点 / 频道笔记 / 关系记忆 / 回收站永久删除）都是**一点即删**。 */
+function confirmAction({ title, message, okText = '确认删除', cancelText = '取消', danger = true }) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (v) => { if (!settled) { settled = true; resolve(v); } };
+    openDialog({
+      title,
+      body: `<p class="confirm-msg">${esc(message)}</p>`,
+      foot: `<button class="btn" type="button" data-dlg="cf-no">${esc(cancelText)}</button>
+             <button class="btn ${danger ? 'danger' : 'primary'}" type="button" data-dlg="cf-yes">${esc(okText)}</button>`,
+    });
+    const onFoot = (e) => {
+      const b = e.target.closest('[data-dlg]');
+      if (!b) return;
+      const act = b.dataset.dlg;
+      if (act !== 'cf-yes' && act !== 'cf-no' && act !== 'cancel') return;
+      cleanup();
+      closeDialog();
+      settle(act === 'cf-yes');
+    };
+    const onClose = () => { cleanup(); settle(false); };   // Esc / 点遮罩 = 取消
+    function cleanup() {
+      $('#dialogFoot').removeEventListener('click', onFoot);
+      dlg.removeEventListener('close', onClose);
+    }
+    $('#dialogFoot').addEventListener('click', onFoot);
+    dlg.addEventListener('close', onClose);
+  });
+}
+
+/* 取某行列表项的标题，用于确认框文案（取不到返回空串） */
+function rowTitle(el) {
+  const item = el && el.closest ? el.closest('.list-item, tr') : null;
+  const strong = item ? item.querySelector('strong') : null;
+  return strong ? strong.textContent.trim() : '';
+}
 $('#dialogClose').addEventListener('click', closeDialog);
 dlg.addEventListener('click', (e) => { if (e.target === dlg) closeDialog(); });
 
@@ -3198,8 +3238,38 @@ const LOADERS = {
   preview: loadPreview, memo: loadMemo, anchor: loadAnchor, memlog: loadMemlog,
   trash: loadTrash, transfer: loadTransfer, settings: loadSettings,
 };
-function goto(tab) {
+/* 未保存表单跟踪：规则页 / 运行参数页改动会置脏，切页前确认。
+   README 曾宣称「脏值快照进前端 state、重绘后自动回写」——那个功能并不存在，
+   现在至少做到「不静默丢」：顶栏亮「未保存」+ 离开时确认。 */
+const DIRTY_PAGES = ['rules', 'settings'];
+state.dirty = false;
+
+function setDirty(on) {
+  state.dirty = !!on;
+  const b = document.getElementById('dirtyBadge');
+  if (b) b.hidden = !state.dirty;
+}
+
+['#page-rules', '#page-settings'].forEach((sel) => {
+  const page = document.querySelector(sel);
+  if (!page) return;
+  const mark = () => setDirty(true);
+  page.addEventListener('input', mark);
+  page.addEventListener('change', mark);
+});
+
+async function goto(tab) {
   if (!PAGES.includes(tab)) return;
+  if (state.dirty && DIRTY_PAGES.includes(state.tab) && tab !== state.tab) {
+    const ok = await confirmAction({
+      title: '有未保存的修改',
+      message: `「${state.tab === 'rules' ? '规则与门控' : '运行参数'}」页还有未保存的修改，离开将丢失。确定离开吗？`,
+      okText: '放弃修改并离开',
+      cancelText: '留下继续编辑',
+    });
+    if (!ok) return;
+  }
+  setDirty(false);
   state.tab = tab;
   $$('#sideNav .nav-item').forEach((b) => {
     const on = b.dataset.tab === tab;
@@ -3644,6 +3714,7 @@ $('#dialogFoot').addEventListener('click', async (e) => {
   if (tier === 'tier3') body.familiarity = $('#efFamiliarity').value;
   if (isNew) body.id = $('#efId').value.trim();
 
+  if (!body.title) { toast('标题不能为空', 'error'); return; }
   if (!body.content.trim()) { toast('记忆内容不能为空', 'error'); return; }
   closeDialog();
 
@@ -3868,6 +3939,11 @@ const onProfileDlgClick = async (e) => {
   }
   if (act === 'del-profile') {
     const chatKey = $('#pfChat').value, uid = $('#pfUid').value;
+    const who = ($('#dialogTitle') && $('#dialogTitle').textContent) || uid;
+    if (!(await confirmAction({
+      title: '删除关系档案',
+      message: `将永久删除「${who}」在 ${chatKey} 的整份档案（分数、标签、稳定印象、互动提示与变动记录），删除后无法恢复。`,
+    }))) return;
     const res = await mutate('profile', { chat_key: chatKey, user_id: uid, action: 'delete' }, {
       mockApply: () => {
         MOCK.raw.people = MOCK.raw.people.filter((x) => !(x.chat_key === chatKey && x.user_id === uid));
@@ -4267,6 +4343,11 @@ $('#memoList').addEventListener('click', async (e) => {
   const id = btn.dataset.id;
   // 搜索模式下结果来自不同频道，删除必须用条目自带的频道
   const chatKey = btn.dataset.chat || state.memoChannel;
+  const title = rowTitle(btn) || id;
+  if (!(await confirmAction({
+    title: '删除频道笔记',
+    message: `将永久删除笔记「${title}」（频道 ${chatKey}），删除后无法恢复。`,
+  }))) return;
   const res = await mutate('memo', { chat_key: chatKey, op: 'delete', id }, {
     mockApply: () => {
       // 演示模式下也要按条目自带频道删：跨频道搜索时 state.memoChannel 是旧值，
@@ -4349,6 +4430,11 @@ $('#anchorList').addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-act="del"]');
   if (!btn) return;
   const id = btn.dataset.id;
+  const title = rowTitle(btn) || id;
+  if (!(await confirmAction({
+    title: '删除身份锚点',
+    message: `将永久删除锚点「${title}」。锚点是全局生效的自我认知，删除后无法恢复。`,
+  }))) return;
   const res = await mutate('tier4', { op: 'delete', id }, {
     mockApply: () => { MOCK.raw.anchors = MOCK.raw.anchors.filter((a) => a.id !== id); },
     okMsg: '锚点已删除',
@@ -4437,6 +4523,11 @@ $('#memlogList').addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-act="del"]');
   if (!btn) return;
   const id = btn.dataset.id;
+  const title = rowTitle(btn) || id;
+  if (!(await confirmAction({
+    title: '删除关系记忆',
+    message: `将永久删除这条事件记忆「${title}」，删除后无法恢复。`,
+  }))) return;
   const res = await mutate('memory_log', { op: 'delete', id }, {
     mockApply: () => { MOCK.raw.memlog[state.memlogChannel] = (MOCK.raw.memlog[state.memlogChannel] || []).filter((m) => m.id !== id); },
     okMsg: '已删除',
@@ -4493,6 +4584,10 @@ $('#trashList').addEventListener('click', async (e) => {
       okMsg: '已恢复',
     });
   } else {
+    if (!(await confirmAction({
+      title: '永久删除',
+      message: '将从回收站彻底删除这条记忆，无法再恢复。',
+    }))) return;
     res = await mutate('trash/delete', { trash_id: id }, {
       mockApply: () => { MOCK.raw.trash = MOCK.raw.trash.filter((t) => t.trash_id !== id); },
       okMsg: '已永久删除',

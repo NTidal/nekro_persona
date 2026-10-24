@@ -936,6 +936,8 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             patch["familiarity"] = fam
         if "content" in patch and not str(patch["content"]).strip():
             raise HTTPException(status_code=400, detail="记忆内容不能为空")
+        if "title" in patch and not str(patch["title"]).strip():
+            raise HTTPException(status_code=400, detail="标题不能为空")
         if "min_favor" in patch and patch["min_favor"] < 0:
             raise HTTPException(status_code=400, detail="披露门槛不能小于 0")
         if not patch:
@@ -1744,6 +1746,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             raise HTTPException(status_code=400, detail="披露门槛不能小于 0")
         if not entry["content"].strip():
             raise HTTPException(status_code=400, detail="记忆内容不能为空")
+        # 标题是列表里唯一能认人的字段：空标题条目会变成「无名条目」，
+        # 只能靠手动翻找改回来 —— 与「内容为空」同等级校验。
+        if not entry["title"].strip():
+            raise HTTPException(status_code=400, detail="标题不能为空")
         if tier == "tier1":
             entry["trigger"] = str(body.get("trigger") or "")[:200]
         else:
