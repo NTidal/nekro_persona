@@ -147,11 +147,18 @@ class PendingBucket:
     items: List[Dict[str, Any]]
     first_at: float = 0.0     # 最早素材的入桶时间（用于超时判断）
     last_at: float = 0.0
+    # 失败退避：到这个时刻之前不许再 flush。
+    # ⚠️ 只重置 first_at 是不够的 —— should_flush 的第一条分支是「条数达标立即 True」，
+    #    完全不看时间，于是 ≥门槛的失败桶仍会每 60 秒（循环周期）重试一次，
+    #    每轮一次完整 LLM 归纳（含内部重试）= 每分钟烧一次 token。
+    next_flush_at: float = 0.0
 
     def should_flush(self, now: Optional[float] = None) -> bool:
         if not self.items:
             return False
         now = now if now is not None else time.time()
+        if now < self.next_flush_at:
+            return False
         if len(self.items) >= BATCH_MIN_ITEMS:
             return True
         return (self.first_at > 0
@@ -196,9 +203,10 @@ def pushes_back(chat_key: str, items: List[Dict[str, Any]],
 
     与 `push_materials` 的区别：
       · 插到头部而不是尾部 —— 保证重试时素材顺序不乱
-      · 重置 `first_at` 为当前时间 —— 失败后不要立即重试（否则会在
-        「失败 → 立即重试 → 再失败」之间空转烧 token），按正常的超时
-        节奏再等一轮
+      · 重置 `first_at` 并把 `next_flush_at` 推到 `BATCH_MAX_AGE_HOURS` 之后 ——
+        失败后不要立即重试，否则会在「失败 → 立即重试 → 再失败」之间空转烧 token。
+        注意两处都要设：`should_flush` 的「条数达标」分支不看时间，只重置 first_at
+        对 ≥门槛的桶无效。
     """
     if not chat_key or not items:
         return 0
@@ -209,10 +217,10 @@ def pushes_back(chat_key: str, items: List[Dict[str, Any]],
         _buckets[chat_key] = b
     b.items = list(items) + b.items
     b.last_at = now
-    # ⚠️ 必须**无条件**重置：docstring 承诺「失败后不要立即重试」，
-    #    但旧实现只在 first_at<=0 时才设，已有桶的 first_at 保持很久以前，
-    #    于是 should_flush 立刻又判定超时 —— ≥门槛的失败桶每 60 秒重试一次。
+    # 无条件重置 first_at（超时分支依据），**并且**设退避窗口（条数分支依据）：
+    # 只重置 first_at 治不了「≥门槛立即 flush」那条路径。
     b.first_at = now
+    b.next_flush_at = now + max(0.0, float(BATCH_MAX_AGE_HOURS)) * 3600
     return len(b.items)
 
 

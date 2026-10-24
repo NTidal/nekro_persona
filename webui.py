@@ -1766,6 +1766,29 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     # ---------------- 频道笔记（阶段 B：tier4 note，接替旧 memo）----------------
     # 端点路径 /api/memos、/api/memo 保持不变（前端无需改），底层数据源从
     # ChannelArchive.memos 换成 tier4.json 里 kind=note、scope=chat_key 的条目。
+    async def _tier4_writable_guard() -> None:
+        """tier4 处于损坏保护态时，写操作直接 409（fail-closed + 可读提示）。
+
+        tier4 的变更函数会抛 Tier4Corrupted；WebUI 若不拦，崩出来就是 500，
+        用户看到的只是一个「服务器错误」，不知道是文件损坏、也不知道备份在哪。
+
+        ⚠️ 先 `open_tier4()` 读一次：降级标记只由读路径设置，
+        不先读的话第一次点击仍会走到「找不到条目」的 404。
+        """
+        t4 = helpers["tier4"]
+        reason = ""
+        try:
+            await t4.open_tier4()
+            reason = str(t4.corruption_reason() or "")
+        except Exception:  # noqa: BLE001
+            reason = ""
+        if reason:
+            raise HTTPException(
+                status_code=409,
+                detail=f"tier4.json 处于损坏保护状态（{reason}），写入已被拒绝。"
+                       "同目录下已有 .corrupt_* 备份，修复或替换该文件后即可恢复写入。",
+            )
+
     def _search_hit(query: str, row: Dict[str, Any], fields) -> bool:
         """大小写不敏感的跨字段子串匹配（列表搜索用）。
 
@@ -1852,6 +1875,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     async def api_memo_update(request: Request) -> Dict[str, Any]:
         _check_key(request)
         body = await request.json()
+        await _tier4_writable_guard()
         chat_key = str(body.get("chat_key") or "")
         if not chat_key:
             raise HTTPException(status_code=400, detail="缺少 chat_key")
@@ -1956,6 +1980,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     async def api_tier4_update(request: Request) -> Dict[str, Any]:
         _check_key(request)
         body = await request.json()
+        await _tier4_writable_guard()
         t4 = helpers["tier4"]
         acfg = helpers["anchor_cfg"]()
         op = str(body.get("op") or "")

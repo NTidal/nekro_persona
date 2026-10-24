@@ -625,10 +625,6 @@ async def write_anchor(
     - refreshed → dedup_matcher 命中已有条目，就地刷新而非新增（不 bump 当日计数）
     - added     → 新增并 bump meta.day_count / last_anchor_at
     """
-    _reason = corruption_reason()
-    if _reason:
-        return {"action": "rejected", "gate": GATE_CORRUPT, "entry": None,
-                "total": 0, "day_count": 0, "corrupt": _reason}
     now = _ts_now() if now is None else int(now)
     hi = max(1, int(salience_max))
     clean_salience = max(1, min(hi, int(salience or 1)))
@@ -636,7 +632,12 @@ async def write_anchor(
     clean_tags = [str(x).strip()[:12] for x in (tags or []) if str(x).strip()][:6]
 
     async with _tier4_lock:
-        doc = _read_tier4_sync()
+        doc = _read_tier4_sync()          # 读一次：检测/解除降级的唯一入口
+        _reason = corruption_reason()
+        if _reason:
+            return {"action": "rejected", "gate": GATE_CORRUPT, "entry": None,
+                    "total": entry_count(doc, ANCHOR_KIND), "day_count": int(doc.meta.day_count),
+                    "corrupt": _reason}
         doc.meta.roll_day(now)
 
         gate = check_anchor_gates(doc, cfg, now)
@@ -700,7 +701,11 @@ async def delete_entry(entry_id: str) -> bool:
         doc.entries = [e for e in doc.entries if e.id != entry_id]
         if len(doc.entries) == before:
             return False
-        _write_tier4_sync(doc)
+        try:
+            _write_tier4_sync(doc)
+        except Tier4Corrupted as exc:
+            logger.warning(f"[tier4] 降级期间拒绝删除条目 {entry_id}: {exc}")
+            return False
         return True
 
 
@@ -714,7 +719,11 @@ async def set_salience(entry_id: str, value: int, salience_max: int = 3) -> bool
         hi = max(1, int(salience_max))
         target.salience = max(1, min(hi, int(value or 1)))
         target.updated_at = _ts_now()
-        _write_tier4_sync(doc)
+        try:
+            _write_tier4_sync(doc)
+        except Tier4Corrupted as exc:
+            logger.warning(f"[tier4] 降级期间拒绝调整核心度 {entry_id}: {exc}")
+            return False
         return True
 
 
@@ -956,10 +965,6 @@ async def add_or_update_note(
     """
     if not cfg.get("enabled", True):
         return {"action": "disabled", "note": None, "reason": "disabled"}
-    _reason = corruption_reason()
-    if _reason:
-        return {"action": "rejected", "note": None, "reason": "corrupt",
-                "corrupt": _reason}
     clean_title = _clip(title, 40)
     if not clean_title:
         return {"action": "rejected", "note": None, "reason": "empty_title"}
@@ -977,7 +982,11 @@ async def add_or_update_note(
     clean_tags = [str(x).strip()[:12] for x in (tags or []) if str(x).strip()][:6]
 
     async with _tier4_lock:
-        doc = _read_tier4_sync()
+        doc = _read_tier4_sync()          # 读一次：检测/解除降级的唯一入口
+        _reason = corruption_reason()
+        if _reason:
+            return {"action": "rejected", "note": None, "reason": "corrupt",
+                    "corrupt": _reason}
         existing = find_note(
             doc, chat_key, clean_title,
             dedup_min_len=int(cfg.get("dedup_min_len", 2) or 2),
@@ -1025,7 +1034,11 @@ async def forget_note(chat_key: str, title: str) -> Optional[str]:
         if target is None:
             return None
         doc.entries = [e for e in doc.entries if e.id != target.id]
-        _write_tier4_sync(doc)
+        try:
+            _write_tier4_sync(doc)
+        except Tier4Corrupted as exc:
+            logger.warning(f"[tier4] 降级期间拒绝删除笔记「{target.title}」: {exc}")
+            return None
         return target.title
 
 
@@ -1041,7 +1054,11 @@ async def clear_expired_notes(chat_key: str) -> int:
         ]
         removed = before - len(doc.entries)
         if removed:
-            _write_tier4_sync(doc)
+            try:
+                _write_tier4_sync(doc)
+            except Tier4Corrupted as exc:
+                logger.warning(f"[tier4] 降级期间拒绝清理过期笔记: {exc}")
+                return 0
         return removed
 
 

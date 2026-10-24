@@ -247,13 +247,19 @@ def _read_sync() -> Dict[str, Any]:
         if not isinstance(data, dict):
             raise ValueError("根节点不是对象")
         data.setdefault("version", MEMLOG_VERSION)
-        data.setdefault("entries", [])
-        if not isinstance(data["entries"], list):
+        # ⚠️ entries 存在但类型不对属于**文件损坏**，必须走降级：
+        #    早先这里静默 `= []`，既不标记降级、下一次写入又会把原文件覆盖掉。
+        if "entries" not in data:
             data["entries"] = []
+        elif not isinstance(data["entries"], list):
+            raise ValueError("entries 不是数组")
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[memory_log] 解析失败，按空处理：{exc}")
         _mark_degraded(fp, f"JSON 解析失败：{exc}")
         data = {"version": MEMLOG_VERSION, "entries": []}
+    else:
+        # 解析成功 → 对称解除降级（否则管理员修好文件后写入仍被永久跳过，直到重启）
+        _DEGRADED.pop(str(fp), None)
 
     _read_cache[fp.parent] = {"mtime": st.st_mtime, "size": st.st_size,
                               "doc": data}
@@ -307,13 +313,16 @@ async def add_entries(items: List[Dict[str, Any]], scope: str,
     """批量追加记忆（归纳结果），同一批内按 title 去重，并按热度淘汰超限。"""
     if not items:
         return {"added": 0, "skipped": 0, "evicted": 0}
-    _reason = corruption_reason()
-    if _reason:
-        # 文件损坏时不落盘：此时的 doc 是空文档，写回等于清空全部事件记忆
-        return {"added": 0, "skipped": 0, "evicted": 0, "corrupt": _reason}
     now = int(time.time())
     async with _lock:
+        # ⚠️ 守卫必须在**读之后**：_read_sync 才是检测/解除降级的唯一入口。
+        #    放在读之前会有两个后果：首次损坏时不报 corrupt（写盘被静默跳过，
+        #    调用方却以为写成功了）；文件修好后守卫先短路，降级永不解除。
         doc = _read_sync()
+        _reason = corruption_reason()
+        if _reason:
+            # 文件损坏时不落盘：此时的 doc 是空文档，写回等于清空全部事件记忆
+            return {"added": 0, "skipped": 0, "evicted": 0, "corrupt": _reason}
         existing = [MemEntry.from_raw(d) for d in doc.get("entries") or []]
         by_scope = [e for e in existing if e.scope == scope]
         existing_titles = {(e.title or "").strip()[:24] for e in by_scope}

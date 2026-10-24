@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -70,7 +71,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.1.1",
+    version="2.1.2",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -1633,6 +1634,11 @@ class ChannelArchive:
         )[:max(1, int(limit))]
 
 
+# 记录「哪些频道的坏 blob 已经备份过」（chat_key → 内容摘要）。
+# 衰减/回升循环每 30 分钟都会读到同一份坏档案，无脑备份会让 store 慢慢堆垃圾。
+_CORRUPT_BACKED: Dict[str, str] = {}
+
+
 async def _open_archive(chat_key: str) -> ChannelArchive:
     """读频道档案。解析失败时告警并返回空档案，不让一轮对话因此崩掉。"""
     blob = await store.get(chat_key=chat_key, store_key=STATE_KEY)
@@ -1643,12 +1649,19 @@ async def _open_archive(chat_key: str) -> ChannelArchive:
     except Exception as exc:  # noqa: BLE001
         # ⚠️ 返回空档案本身没问题（不让一轮对话因此崩），但**必须先把原始 blob 备份**：
         #    否则下一次 _store_archive 会用这份空档案把原始数据整块覆盖掉，且无备份。
-        bak_key = f"{STATE_KEY}.corrupt_{int(_ts_now())}"
-        try:
-            await store.set(chat_key=chat_key, store_key=bak_key, value=blob)
-            where = f"已备份到 store_key={bak_key}"
-        except Exception as bexc:  # noqa: BLE001
-            where = f"备份失败（{bexc}）"
+        # 同一份坏 blob 只备份一次：衰减/回升循环每 30 分钟都会读到它，
+        # 无脑备份会让 PluginStore 慢慢堆积重复的 corrupt blob。
+        digest = hashlib.sha256(blob.encode("utf-8", "ignore")).hexdigest()[:16]
+        if _CORRUPT_BACKED.get(chat_key) == digest:
+            where = "此前已备份过同一份损坏内容"
+        else:
+            bak_key = f"{STATE_KEY}.corrupt_{int(_ts_now())}"
+            try:
+                await store.set(chat_key=chat_key, store_key=bak_key, value=blob)
+                _CORRUPT_BACKED[chat_key] = digest
+                where = f"已备份到 store_key={bak_key}"
+            except Exception as bexc:  # noqa: BLE001
+                where = f"备份失败（{bexc}）"
         plugin.logger.error(
             f"[存档] 频道状态解析失败（{type(exc).__name__}: {exc}），"
             f"{where}；本次按空档案继续: {chat_key}")
@@ -2846,6 +2859,14 @@ async def forget_note(_ctx: schemas.AgentCtx, title: str) -> str:
     Args:
         title (str): 笔记标题（支持模糊匹配）
     """
+    _reason = tier4.corruption_reason()
+    if _reason:
+        # 降级期间 write 会抛 Tier4Corrupted；在工具层先拦下，给模型一句可读回执
+        # （异常逃逸会把失败变成沙盒错误，回到 2.0.9 之前「None 系统消息」的老路）。
+        return (
+            "本次未删除：笔记文件处于损坏保护状态（原件已备份），"
+            "写入被拒绝以免覆盖既有笔记。请联系管理员修复 tier4.json 后重试。"
+        )
     removed_title = await tier4.forget_note(_ctx.chat_key, title)
     if removed_title is None:
         notes = [
