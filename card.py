@@ -58,13 +58,20 @@ _BLOB_SPECS = [
 ]
 
 # 各阶段标签配色 (背景, 前景) —— 全部落在暖色系，靠明度/色相微差区分层级
+# v2.1.10：排序卡是「快速扫视」场景，标签承担关键信息，必须一眼能分。
+# 旧配色有两组撞色：①「排斥」浅底 + 深赤陶字与「特别亲密」赤陶实底同色相，
+# 只差明度；②「偏爱 / 保留 / 中立」三个浅暖底饱和度接近，并排要仔细看。
+# 现在按**色相家族**分开，明度也排成阶梯：
+#   排斥（冷灰蓝，呼应负分 _COOL，六个浅底里最暗）
+#   → 中立（无彩中性灰）→ 亲近（鼠尾草绿）→ 保留（暖沙黄）→ 偏爱（蜜桃橙，提饱和）
+#   → 特别亲密（唯一实底，保持最高层级）
 _STAGE_STYLES = {
-    "排斥": ((244, 216, 202), (170, 74, 44)),      # 深赤陶
-    "保留": ((245, 238, 222), (150, 118, 60)),      # 暖沙
-    "中立": ((240, 236, 230), (130, 112, 96)),      # 暖灰
-    "亲近": ((226, 238, 222), (86, 128, 84)),       # 鼠尾草绿（暖体系里的自然色）
-    "偏爱": ((252, 235, 220), (196, 106, 74)),      # 蜜桃
-    "特别亲密": ((196, 106, 74), (255, 255, 255)),  # 赤陶实底
+    "排斥": ((188, 210, 236), (36, 66, 102)),       # 冷蓝（与负分 _COOL 同族，色相与其余五档都不同）
+    "保留": ((252, 243, 196), (108, 84, 16)),       # 暖沙黄（纯黄相）
+    "中立": ((233, 232, 235), (80, 82, 90)),        # 中性灰（无彩色）
+    "亲近": ((212, 239, 204), (46, 98, 46)),        # 鼠尾草绿（暖体系里的自然色）
+    "偏爱": ((253, 208, 186), (146, 58, 24)),       # 蜜桃橙（降黄提红，与暖沙拉开）
+    "特别亲密": ((178, 92, 62), (255, 255, 255)),   # 赤陶实底（唯一实底，最高层级）
 }
 
 # 前三名名次徽章配色 (底色, 字色) —— 金 / 银 / 铜（统一暖金属调）
@@ -1067,6 +1074,12 @@ def _render_favorability_rank_impl(
 
         # ---------- 头像：昵称首字，按内接尺寸缩放 ----------
         uid_for_avatar = str(entry.get("user_id") or entry.get("display_name") or "")
+        # ⚠️ 昵称必须 strip 后判空：`" "` 在 Python 里是 truthy，
+        #    旧实现 `entry.get("display_name") or entry.get("user_id")` 对「两个空格」
+        #    的昵称直接渲染出空白名字 —— 整行看起来像个空洞（实测确认）。
+        _disp_name = str(entry.get("display_name") or "").strip()
+        _uid_clean = str(entry.get("user_id") or "").strip()
+        display_name = _disp_name or _uid_clean or "未知"
         ax = bx + BADGE // 2 + 12 + AV_R
         ay = by
         ar = AV_R
@@ -1095,7 +1108,8 @@ def _render_favorability_rank_impl(
         if av_img is None:
             av_fill, av_fg = _avatar_color(uid_for_avatar)
             draw.ellipse([ax - ar, ay - ar, ax + ar, ay + ar], fill=av_fill)
-            av_ch = _avatar_initial(entry.get("display_name") or entry.get("user_id"))
+            # 与昵称用同一个值，避免「名字回退成 ID、头像却是 ?」的不一致
+            av_ch = _avatar_initial(display_name)
             # 内接缩放：方形字顶到圆边会被裁掉一角
             f_av = _fit_font(draw, av_ch, f_avatar, ar * 2 - 8, ar * 2 - 10)
             _draw_centered(
@@ -1110,7 +1124,7 @@ def _render_favorability_rank_impl(
         # ---------- 左上：昵称 ----------
         # 分值 + 进度条的固定预留宽度；缩小它可让昵称更长、少留白
         name_max_w = max(60, right_edge - text_x - 104)
-        raw_name = entry.get("display_name") or entry.get("user_id") or "未知"
+        raw_name = display_name
         name = _truncate(draw, str(raw_name), f_name, name_max_w)
         nb = draw.textbbox((0, 0), name, font=f_name)
         draw.text((text_x, y + 11 - nb[1]), name, font=f_name, fill=_TEXT)
@@ -1181,7 +1195,10 @@ def _render_favorability_rank_impl(
             # 只有长数字 ID（如 QQ 号）才截后四位；短/非数字 ID 取后四位会切出
             # 无意义碎片（admin_1 → in_1），故原样显示。
             short = uid[-4:] if (uid.isdigit() and len(uid) > 4) else uid
-            pool.append(("ID", f"ID:{short}"))
+            # ⚠️ 昵称已经回退成这个 ID 时跳过：否则同一标识在同一行出现两次
+            #    （名字区 `123456789` + 胶囊 `ID:6789`），既冗余又难看。
+            if str(raw_name) != uid:
+                pool.append(("ID", f"ID:{short}"))
         if summ:
             pool.append(("SUM", summ))
         for t in sorted(rel, key=len):
