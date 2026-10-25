@@ -598,6 +598,17 @@ input[type="range"]::-webkit-slider-thumb {
   box-shadow: 0 0 0 1px var(--accent-border), 0 3px 10px rgba(0, 0, 0, 0.25);
   cursor: pointer;
 }
+input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 3px solid var(--surface);
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-border), 0 3px 10px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+}
+/* Firefox 的 range 轨道也要跟主题走，否则默认灰条在暗色面板里很扎眼 */
+input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; background: var(--surface-3); }
 
 /* ---------- 徽章 /  chips ---------- */
 .badge {
@@ -3053,7 +3064,14 @@ async function api(path, { method = 'GET', body } = {}) {
 /* 业务错误 = 后端确实返回了本插件 API 的 JSON（带 message/detail）；
    路由层 404（路径写错 / 插件没挂上）不会有这两个字段。 */
 function isBusinessError(e) {
-  return !!(e && e.status && e.payload && (e.payload.message || e.payload.detail));
+  if (!(e && e.status && e.payload)) return false;
+  const msg = e.payload.message || e.payload.detail;
+  if (typeof msg !== 'string' || !msg.trim()) return false;
+  // FastAPI 对未匹配路由的默认响应就是 {"detail":"Not Found"}（方法不符时是
+  // "Method Not Allowed"）。那不是业务原因 —— 按「路由不存在」处理，仍然回落演示，
+  // 这样「老版本后端缺新端点」时不会退化成一个 "Not Found" 的 toast。
+  if (/^(not\s+found|method\s+not\s+allowed)$/i.test(msg.trim())) return false;
+  return true;
 }
 
 /* GET：成功用真实数据，失败（网络/404 等）回落演示数据；401 弹密钥框 */
@@ -3681,16 +3699,31 @@ function fillChannelSelects() {
     el.innerHTML = withAll + (opts || '<option value="">（暂无频道）</option>');
     if (keep && state.channels.some((c) => c.chat_key === keep)) el.value = keep;
   });
-  // keep 已消失时 el.value 会落回第一项（或「全部频道」），而加载逻辑仍用旧 state →
-  // 界面显示 B、数据其实来自 A。这里把 state 拉回与界面一致。
-  const syncState = (sel, key, allowAll) => {
+  // 频道列表变了，必须先把「界面选中值」与 state 对齐，否则会出现
+  // 「界面显示全部频道、数据来自已消失的旧频道」：
+  //   · 选中了具体频道 → 以界面为准写回 state；
+  //   · keep 失效（那个频道没了）→ select 会回落到第一项「全部频道」(value='')，
+  //     ⚠️ 这种情况必须把下拉**拨到第一个真实频道**并同步 state。上一版写成
+  //     `if (v || !allowAll)`，而这里 v==='' 且 allowAll=true → 条件为假直接跳过，
+  //     等于整个函数在目标场景里是空操作（旧 state 原样保留）。
+  //   · 搜索态用户主动选「全部频道」且旧频道仍在 → 不动 state（非搜索态还要用它）。
+  const syncState = (sel, key) => {
     const el = $(sel);
     if (!el) return;
     const v = el.value || '';
-    if (v || !allowAll) state[key] = v;
+    if (v) { state[key] = v; return; }
+    if (state.channels.some((c) => c.chat_key === state[key])) return;
+    state[key] = state.channels[0] ? state.channels[0].chat_key : '';
+    if (state[key]) el.value = state[key];
   };
-  syncState('#memoChannel', 'memoChannel', true);
-  syncState('#memlogChannel', 'memlogChannel', true);
+  syncState('#memoChannel', 'memoChannel');
+  syncState('#memlogChannel', 'memlogChannel');
+  if ($('#previewChannel') && $('#previewChannel').value) {
+    state.previewChannel = $('#previewChannel').value;
+  }
+  // 首次进入时也要填「保存到：X」：以前只在 #memoChannel 的 change 里刷新，
+  // 进页面看到的是空白提示，得手动切一次频道才出现。
+  updateMemoTargetHint();
 
   if (!state.previewChannel && state.channels[0]) { state.previewChannel = state.channels[0].chat_key; $('#previewChannel').value = state.previewChannel; }
   if (!state.memoChannel && state.channels[0]) { state.memoChannel = state.channels[0].chat_key; $('#memoChannel').value = state.memoChannel; }
@@ -4602,6 +4635,7 @@ async function loadMemo() {
   const q = state.memoSearch;
   const searching = !!String(q || '').trim();
   syncChannelSelectMode('#memoChannel', searching);
+  updateMemoTargetHint();   // 进页面/切频道都刷新「保存到：X」
   const selVal = $('#memoChannel').value;    // '' = 全部频道（仅搜索态有意义）
   const chatKey = searching ? selVal : (selVal || state.memoChannel);
   if (!searching && !chatKey) {
