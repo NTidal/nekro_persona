@@ -293,7 +293,7 @@ _BG_FILES = ("favor.json", "tier1/core.json", "tier2/lore.json", "tier3/world.js
 #   向量原先只存内存 → 每次启动都要重嵌全部条目 → 必然撞 429，随机有条目拿不到向量。
 #   缓存放数据目录（不是包内），按「嵌入配置签名 + 条目文本」做 key。
 _VEC_CACHE_NAME = ".vec_cache.json"
-_VEC_CACHE_VERSION = 1
+_VEC_CACHE_VERSION = 2
 # 命中统计 sidecar（A4 访问强化）：与 .vec_cache.json 同款模式——独立文件、
 # 版本化、原子写、读失败按空处理。**绝不回写作者的 backgrounds/*.json**，
 # 否则会弄脏 curated 内容、触发热重载 mtime、并和 WebUI 编辑抢写。
@@ -660,7 +660,9 @@ def _embed_signature() -> str:
     相似度整体偏移、阈值失效——这种坏法很难从现象上看出来。
     ⚠️ v1.6.0：custom 后端的签名含 base_url+model+dimensions，切换嵌入模型时
     签名变化 → 旧向量缓存自动整体作废重建，杜绝新旧模型向量混算。
-    na 路径的签名格式保持与历史版本逐字一致，避免无谓地让既有缓存失效。
+    ⚠️ v2.2.5：na 路径同样纳入「模型组 + 模型名 + 端点」。此前只有维度 + 插件组名，
+    在 NA 侧换同维度的嵌入模型时签名不变、旧向量继续命中 → 新旧向量混算、阈值静默失效。
+    代价是升级到本版本后**一次性全量重嵌**（缓存版本也 +1，旧文件直接判废）。
     """
     cfg = _embed_cfg()
     if _embed_is_custom(cfg):
@@ -669,13 +671,31 @@ def _embed_signature() -> str:
             f"{cfg.get('model','')}|dim={int(cfg.get('dimensions', 0) or 0)}"
         )
     dim = ""
+    group = ""
+    model = ""
+    host = ""
     try:
         from nekro_agent.services.memory.embedding_service import embedding_service
 
         dim = str(getattr(embedding_service, "resolved_dimension", "") or "")
+        group = str(getattr(embedding_service, "resolved_model_group", "") or "")
+        # ⚠️ v2.2.5：na 路径原先只有「维度 + 插件自己的组名」，NA 侧换同维度的嵌入模型时
+        #    签名不变 → 旧缓存继续命中 → 新旧向量混算、阈值静默失效（这种坏法很难看出来）。
+        #    现在把 NA 实际生效的模型组、模型名和端点也纳入签名。
+        try:
+            _mc = embedding_service._get_model_config()
+            if isinstance(_mc, dict):
+                model = str(_mc.get("model") or "")
+                _base = str(_mc.get("base_url") or "").rstrip("/")
+                host = _base.split("//", 1)[-1] if _base else ""
+        except Exception:  # noqa: BLE001
+            pass
     except Exception:  # noqa: BLE001
         pass
-    return f"v{_VEC_CACHE_VERSION}|dim={dim}|groups={','.join(_EMBED_GROUPS)}"
+    return (
+        f"v{_VEC_CACHE_VERSION}|dim={dim}|group={group}|model={model}|host={host}"
+        f"|groups={','.join(_EMBED_GROUPS)}"
+    )
 
 
 def _vec_key(text: str, sig: str, scope: str = "") -> str:
@@ -943,6 +963,14 @@ def _order_by_heat(scored: List["ScoredEntry"], tier: int, now: float,
         key=lambda it: (round(float(it[0]), 2), effective_rank(it[2], tier, now, lc)),
         reverse=True,
     )
+
+
+# 嵌入失败冷却（monotonic 秒）。端点整段挂掉时，若不做冷却，每次加载都会把
+# 待嵌条目重新逐条重试一遍 —— 实测 NA4 端点 500 时单个 3 档轮次就打出了 842 次
+# 失败请求，而数据目录每变一次就会再来一轮。冷却期内直接跳过待嵌部分（缓存里
+# 已有的向量照用，检索靠关键字 + 部分向量兜底），避免无意义的自我 DoS。
+_EMBED_COOLDOWN_SECONDS = 600.0
+_EMBED_FAIL_UNTIL = 0.0
 
 
 def _embed_retry_after(resp, attempt: int) -> float:
@@ -1289,6 +1317,7 @@ async def _vectorize(items: List[Dict[str, Any]], label: str, dir_key: Path,
     `dir_key` **必须显式传入**（v2.0.2）：磁盘向量缓存落在该目录下，
     不再依赖「当前上下文」重新解析（与 `_save_hit_stats(st)` 一致）。
     """
+    global _EMBED_FAIL_UNTIL   # 必须在任何读取之前声明
     vecs: List[Optional[List[float]]] = [None] * len(items)
     if not items:
         return vecs
@@ -1309,6 +1338,13 @@ async def _vectorize(items: List[Dict[str, Any]], label: str, dir_key: Path,
         logger.info(f"[persona] {label} 缓存命中 {hit}/{len(items)}")
 
     pending = [i for i, v in enumerate(vecs) if not v]
+    if pending and time.monotonic() < _EMBED_FAIL_UNTIL:
+        _left = int(_EMBED_FAIL_UNTIL - time.monotonic())
+        logger.warning(
+            f"[persona] {label} 嵌入服务近期失败，冷却中（剩 {_left}s）："
+            f"跳过 {len(pending)} 条待嵌，先用缓存向量 + 关键字兜底"
+        )
+        pending = []
     if pending:
         pending_texts = [texts[i] for i in pending]
         try:
@@ -1338,10 +1374,28 @@ async def _vectorize(items: List[Dict[str, Any]], label: str, dir_key: Path,
         logger.warning(
             f"[persona] {label} {len(failed)} 条待重试: {[items[i].get('id') for i in failed]}",
         )
+        _consec_fail = 0
         for i in failed:
+            if time.monotonic() < _EMBED_FAIL_UNTIL:
+                logger.warning(f"[persona] {label} 逐条重试中止：嵌入服务冷却中")
+                break
             vecs[i] = await _embed_one(texts[i])
             if not vecs[i]:
                 logger.error(f"[persona] {label} 条目 {items[i].get('id')} 向量化失败，只能靠关键词命中")
+                _consec_fail += 1
+                if _consec_fail >= 3:
+                    # 端点整段不可用（如网关 5xx）时，逐条重试等于把请求数乘以条目数：
+                    # NA4 实测 322 条待嵌 → 一轮打出 842 次失败请求，而数据目录一变就再来一轮。
+                    # 连续 3 条全失败即判定不可用，中止本轮并进冷却。
+                    _EMBED_FAIL_UNTIL = time.monotonic() + _EMBED_COOLDOWN_SECONDS
+                    logger.warning(
+                        f"[persona] {label} 连续 {_consec_fail} 条逐条重试全失败，"
+                        f"判定嵌入服务不可用：中止本轮（已试 {failed.index(i) + 1}/{len(failed)} 条），"
+                        f"冷却 {int(_EMBED_COOLDOWN_SECONDS)}s"
+                    )
+                    break
+            else:
+                _consec_fail = 0
             await asyncio.sleep(0.3)
         logger.info(f"[persona] {label} 重试后向量数 {sum(1 for v in vecs if v)}/{len(items)}")
         # 逐条重试救回来的向量也要落盘：上面的写缓存发生在重试之前，
@@ -1352,6 +1406,13 @@ async def _vectorize(items: List[Dict[str, Any]], label: str, dir_key: Path,
             cache2.update(newly)
             _save_vec_cache(cache2, dir_key)
             logger.info(f"[persona] {label} 重试救回 {len(newly)} 条向量已写入磁盘缓存")
+
+    # 冷却判定放在**所有重试之后**：批量失败但逐条降级能救回来时不该冷却
+    #（429 突发正是这种情况，冷却反而会让检索白等十分钟）。
+    if any(not v for v in vecs):
+        _EMBED_FAIL_UNTIL = time.monotonic() + _EMBED_COOLDOWN_SECONDS
+    else:
+        _EMBED_FAIL_UNTIL = 0.0
     return vecs
 
 
