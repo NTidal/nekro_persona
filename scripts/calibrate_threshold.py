@@ -62,12 +62,23 @@ def _apply_embed_backend(bg_dir: str) -> str:
         "base_url": base_url,
         "api_key": str(raw.get("EMBED_API_KEY", "") or "").strip(),
         "model": model,
-        "dimensions": int(raw.get("EMBED_DIMENSIONS", 0) or 0),
-        "batch_size": max(1, int(raw.get("EMBED_BATCH_SIZE", 10) or 10)),
+        # 配置可能被手改成 "2048维"/空 —— 这里兜住，坏值回默认而不是抛 ValueError
+        "dimensions": max(0, _safe_int(raw.get("EMBED_DIMENSIONS"), 0)),
+        "batch_size": max(1, _safe_int(raw.get("EMBED_BATCH_SIZE"), 10)),
         "timeout": 30,
     }
     M.set_embed_config_provider(lambda: cfg)
     return f"custom（{model} @ {base_url}, dim={cfg['dimensions'] or '模型默认'}）"
+
+
+def _safe_int(value, default=0):
+    """任意值 → int；坏值回默认（标定脚本不该因为一个脏配置整段崩掉）。"""
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
 
 
 def pct(xs, p):
@@ -95,7 +106,8 @@ async def main():
     print("（标定与生产检索同空间；如与线上 EMBED_PROVIDER 不符，结论不可用）")
     S = M._state()      # ⚠️ v2.0.2 起 _state 是函数：漏掉括号会让下面 S["tier2"] 直接 TypeError
     qvecs = [(q, v) for q, v in zip(NEG, [await M._embed_query(q) for q in NEG]) if v]
-    random.seed(7)
+    # 用独立的 Random(7)：全局 random 被别的代码动过也不影响标定的可复现性
+    rng = random.Random(7)
 
     for label, items, vecs in (("TIER2", S["tier2"], S["tier2_vecs"]),
                                ("TIER3", S["tier3"], S["tier3_vecs"])):
@@ -111,11 +123,11 @@ async def main():
         cap = min(3000, n * (n - 1) // 2)
         while len(pairs) < cap and tries < 30000:
             tries += 1
-            i, j = random.randrange(n), random.randrange(n)
+            i, j = rng.randrange(n), rng.randrange(n)
             if i != j:
                 pairs.append(M._cos(valid[i][1], valid[j][1]))
         titled = [(e, v) for e, v in valid if str(e.get("title", "")).strip()]
-        sample = random.sample(titled, min(args.sample, len(titled))) if titled else []
+        sample = rng.sample(titled, min(args.sample, len(titled))) if titled else []
         own, other, rank1 = [], [], 0
         for e, _v in sample:
             qv = await M._embed_query(str(e.get("title", "")).strip())

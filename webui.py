@@ -588,6 +588,22 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             _write_trash(remaining)
             return True
 
+    def _public_detail(text: str) -> str:
+        """把宿主机绝对路径换成占位符。
+
+        这些 detail 会原样回给浏览器（前端直接 toast 出来）：一旦是 OSError
+        （权限/只读/磁盘满），消息里就是「宿主机插件数据目录 + 文件名」这种绝对路径，
+        既泄部署结构又对用户毫无意义。
+        """
+        out = str(text or "")
+        try:
+            _bases = {str(_bg_dir()), str(_bg_dir().parent), str(_bg_dir().parent.parent)}
+        except Exception:  # noqa: BLE001
+            _bases = set()
+        for _p in sorted((b for b in _bases if b and len(b) > 3), key=len, reverse=True):
+            out = out.replace(_p, "<数据目录>")
+        return out
+
     def _data_error(exc: Exception) -> HTTPException:
         """数据层异常 → 合适的 HTTP 状态码。
 
@@ -602,7 +618,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         else:
             # 其余都是「数据/参数不合法」（格式错、缺字段、越界）→ 400 更准确
             status = 400
-        return HTTPException(status_code=status, detail=message)
+        return HTTPException(status_code=status, detail=_public_detail(message))
 
     async def _reload_after_write() -> Dict[str, Any]:
         try:
@@ -2298,7 +2314,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         try:
             zf = _zipfile.ZipFile(_io.BytesIO(body))
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=400, detail=f"不是有效的 zip 包：{exc}") from exc
+            raise HTTPException(status_code=400, detail=_public_detail(f"不是有效的 zip 包：{exc}")) from exc
         names = set(zf.namelist())
         t4 = helpers["tier4"]
 
@@ -2342,7 +2358,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             try:
                 arch_obj = json.loads(zf.read(arch_src).decode("utf-8"))
             except Exception as exc:  # noqa: BLE001
-                raise HTTPException(status_code=400, detail=f"archives.json 不是合法 JSON：{exc}") from exc
+                raise HTTPException(status_code=400, detail=_public_detail(f"archives.json 不是合法 JSON：{exc}")) from exc
             if not isinstance(arch_obj, dict):
                 raise HTTPException(status_code=400, detail="archives.json 顶层必须是对象（chat_key → 档案）")
             for ck, blob in arch_obj.items():
@@ -2385,7 +2401,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             try:
                 data = json.loads(raw.decode("utf-8"))
             except Exception as exc:  # noqa: BLE001
-                raise HTTPException(status_code=400, detail=f"tier4.json 不是合法 JSON：{exc}") from exc
+                raise HTTPException(status_code=400, detail=_public_detail(f"tier4.json 不是合法 JSON：{exc}")) from exc
             if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
                 raise HTTPException(status_code=400, detail="tier4.json 结构不对（缺 entries）")
             # 条目级严格校验：运行期 from_raw 是**宽松**的（坏值回落默认），
@@ -2514,7 +2530,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         try:
             zf = _zipfile.ZipFile(_io.BytesIO(body))
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"不是有效的 zip 包：{exc}") from exc
+            raise HTTPException(status_code=400, detail=_public_detail(f"不是有效的 zip 包：{exc}")) from exc
         names = set(zf.namelist())
 
         def _pick(arc: str) -> str | None:
@@ -2554,7 +2570,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             try:
                 data = json.loads(raw.decode("utf-8"))
             except Exception as exc:
-                raise HTTPException(status_code=400, detail=f"{arc} 不是合法 JSON：{exc}")
+                raise HTTPException(status_code=400, detail=_public_detail(f"{arc} 不是合法 JSON：{exc}"))
             if arc == "favor.json":
                 _favor_bad = _validate_favor_cfg(data)
                 if _favor_bad:
@@ -2688,7 +2704,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         try:
             memory._save_hit_stats(st)
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=f"写入命中统计失败：{exc}") from exc
+            raise HTTPException(status_code=500, detail=_public_detail(f"写入命中统计失败：{exc}")) from exc
         plugin.logger.info(f"[persona] WebUI 重置热度：清空 {before} 条命中统计（{st.get('dir')}）")
         return {"ok": True, "cleared": before, "dir": str(st.get("dir") or "")}
 

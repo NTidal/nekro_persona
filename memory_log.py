@@ -354,9 +354,17 @@ async def add_entries(items: List[Dict[str, Any]], scope: str,
         existing = [MemEntry.from_raw(d) for d in (doc.get("entries") or [])
                     if isinstance(d, dict) and str(d.get("id") or "").strip()]
         by_scope = [e for e in existing if e.scope == scope]
-        existing_titles = {(e.title or "").strip()[:24] for e in by_scope}
+        # 标题 → 已有条目（就地更新用）。旧实现只用一个 set 判重：同标题的新事件**一律丢弃**，
+        # 于是「昨天吵架 → 今天和好」这种同一主题的演进，第二条永远进不来，
+        # 记忆停在最早的版本上。现在：同标题但**更新**的事件覆盖旧条目（保留 id）。
+        existing_by_title: Dict[str, MemEntry] = {}
+        for e in by_scope:
+            _k = (e.title or "").strip()[:24]
+            if _k and _k not in existing_by_title:
+                existing_by_title[_k] = e
 
         added = 0
+        updated = 0
         skipped = 0
         new_entries: List[MemEntry] = []
         for it in items:
@@ -365,15 +373,27 @@ async def add_entries(items: List[Dict[str, Any]], scope: str,
             if not title or not content:
                 skipped += 1
                 continue
-            if title[:24] in existing_titles:
-                skipped += 1
-                continue
-            existing_titles.add(title[:24])
             # event_at 钳制：LLM 可能给出未来时间（"2027-01-01"）或离谱的远古值。
             # 未来时间会让这条记忆**永久**排在最前面（排序按 event_at 降序），
             # 一直挤占注入名额；远古值则永远排在末尾。钳到 [now-10年, now]。
             _raw_ev = _safe_int(it.get("event_at"), 0) or now
             ev = min(now, max(now - 10 * 365 * 86400, _raw_ev))
+            _dup = existing_by_title.get(title[:24])
+            if _dup is not None:
+                # 同标题：只有更**新**的事件才覆盖，否则丢弃（不回退已有记忆）
+                if ev > int(_dup.event_at or 0):
+                    _dup.content = content
+                    _dup.tags = [str(x) for x in (it.get("tags") or [])][:8]
+                    _dup.event_at = ev
+                    _dup.updated_at = now
+                    _dup.source = source
+                    _ref = [str(x) for x in (it.get("ref_msg_ids") or [])][:20]
+                    if _ref:
+                        _dup.ref_msg_ids = _ref
+                    updated += 1
+                else:
+                    skipped += 1
+                continue
             new_entries.append(MemEntry(
                 id=_new_id(),
                 scope=scope,
@@ -403,7 +423,8 @@ async def add_entries(items: List[Dict[str, Any]], scope: str,
         doc["version"] = MEMLOG_VERSION
         _write_sync(doc)
 
-    return {"added": added, "skipped": skipped, "evicted": evicted}
+    return {"added": added, "updated": updated,
+            "skipped": skipped, "evicted": evicted}
 
 
 async def bump_hits(entries: List[MemEntry]) -> int:

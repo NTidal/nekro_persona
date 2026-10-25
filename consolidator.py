@@ -16,6 +16,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from nekro_agent.core.logger import get_sub_logger
@@ -40,6 +41,8 @@ BATCH_MAX_AGE_HOURS = 2.0
 """素材最久攒多久必须归纳（防止冷频道永远不触发）。"""
 
 MAX_ITEMS_PER_CALL = 60
+_BUCKET_STATE_NAME = ".memlog_buckets.json"
+_BUCKET_STATE_VERSION = 1
 """单次归纳最多喂多少条素材（控制 token）。"""
 
 MAX_CHARS_PER_ITEM = 300
@@ -72,11 +75,15 @@ DISABLE_THINKING = {"thinking": {"type": "disabled"}}
 # ==================== 素材提取 ====================
 
 # adjust_favorability 的 reason 参数（单双引号都要支持）
+# ⚠️ 旧实现带 re.S 且用 `.{4,}?`：`.` 能匹配换行，于是引号内的字符串一旦没在本行闭合
+#  （模型写了转义引号 \" 或跨行字符串），匹配会**越过语句边界**一路吞到下一个同种引号 ——
+#  抽出来的素材混进后面的代码，真正的 reason 反被切碎。
+#  现在：正文不跨行（[^\\\n]）、允许转义字符（\\.），既保住单行内完整内容，又不越界。
 _RE_REASON = re.compile(
-    r"""reason\s*=\s*(?:f?)(["'])(?P<v>.{4,}?)\1""", re.S)
+    r"""reason\s*=\s*f?(["'])(?P<v>(?:[^\\\n]|\\.){4,}?)\1""")
 # send_voice_clone 的第一个字符串参数
 _RE_VOICE = re.compile(
-    r"""send_voice_clone\s*\(\s*_?ck\s*,\s*(?:f?)(["'])(?P<v>.{4,}?)\1""", re.S)
+    r"""send_voice_clone\s*\(\s*_?ck\s*,\s*f?(["'])(?P<v>(?:[^\\\n]|\\.){4,}?)\1""")
 
 # 无信息量的 reason（纯氛围/无具体行为）—— 与 favor_scale 的 vague 判定同思路
 _NOISE_PATTERNS = [
@@ -167,6 +174,91 @@ class PendingBucket:
 
 _buckets: Dict[str, PendingBucket] = {}
 
+# ── 攒批队列持久化（v2.2.11）─────────────────────────────────────
+# ⚠️ 旧实现整个待归纳队列只在内存里：插件重启 / 热重载 → 素材**全部丢失**
+#    （这些素材还没写进 memory_log，别处没有任何副本，等于白采集）。
+_STATE_PATH_PROVIDER = None
+_STATE_LOADED = False
+_MAX_ITEMS_PER_BUCKET = 500      # 单频道队列上限（超出丢最旧的，避免文件无限长）
+
+
+def configure_state_path(provider) -> None:
+    """注入持久化目录提供者（plugin 初始化时调用一次；不注入则退化为纯内存）。"""
+    global _STATE_PATH_PROVIDER, _STATE_LOADED
+    _STATE_PATH_PROVIDER = provider
+    _STATE_LOADED = False
+
+
+def _state_file() -> Optional[Path]:
+    if _STATE_PATH_PROVIDER is None:
+        return None
+    try:
+        base = _STATE_PATH_PROVIDER()
+        return Path(base) / _BUCKET_STATE_NAME if base else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _ensure_state_loaded() -> None:
+    """首次访问时从磁盘恢复队列；坏文件按空处理，绝不影响运行。"""
+    global _STATE_LOADED
+    if _STATE_LOADED:
+        return
+    _STATE_LOADED = True
+    fp = _state_file()
+    if fp is None or not fp.is_file():
+        return
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        if int((data or {}).get("version") or 0) != _BUCKET_STATE_VERSION:
+            logger.warning("[memory_log] 攒批队列版本不符，忽略旧文件")
+            return
+        buckets = (data or {}).get("buckets") or {}
+        if not isinstance(buckets, dict):
+            return
+        now = time.time()
+        for ck, blob in buckets.items():
+            if not isinstance(blob, dict):
+                continue
+            items = [it for it in (blob.get("items") or []) if isinstance(it, dict)]
+            if not items:
+                continue
+            _buckets[str(ck)] = PendingBucket(
+                chat_key=str(ck),
+                items=items[-_MAX_ITEMS_PER_BUCKET:],
+                first_at=float(blob.get("first_at") or now),
+                last_at=float(blob.get("last_at") or now),
+                next_flush_at=float(blob.get("next_flush_at") or 0.0),
+            )
+        if _buckets:
+            _n = sum(len(b.items) for b in _buckets.values())
+            logger.info(f"[memory_log] 从磁盘恢复攒批队列：{len(_buckets)} 个频道 / {_n} 条素材")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[memory_log] 攒批队列恢复失败（按空处理）: {exc}")
+
+
+def _save_state() -> None:
+    """原子落盘；失败只记日志（攒批是尽力而为，不能反过来打断消息处理）。"""
+    fp = _state_file()
+    if fp is None:
+        return
+    try:
+        payload = {
+            "version": _BUCKET_STATE_VERSION,
+            "buckets": {
+                ck: {"items": b.items[-_MAX_ITEMS_PER_BUCKET:],
+                     "first_at": b.first_at, "last_at": b.last_at,
+                     "next_flush_at": b.next_flush_at}
+                for ck, b in _buckets.items() if b.items
+            },
+        }
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = fp.with_suffix(fp.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(fp)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[memory_log] 攒批队列落盘失败（忽略）: {exc}")
+
 
 def push_materials(chat_key: str, items: List[Dict[str, Any]],
                    now: Optional[float] = None) -> int:
@@ -174,6 +266,7 @@ def push_materials(chat_key: str, items: List[Dict[str, Any]],
     if not chat_key or not items:
         return len(_buckets.get(chat_key, PendingBucket(chat_key, [])).items)
     now = now if now is not None else time.time()
+    _ensure_state_loaded()
     b = _buckets.get(chat_key)
     if b is None:
         b = PendingBucket(chat_key=chat_key, items=[], first_at=now, last_at=now)
@@ -182,11 +275,13 @@ def push_materials(chat_key: str, items: List[Dict[str, Any]],
     b.last_at = now
     if b.first_at <= 0:
         b.first_at = now
+    _save_state()
     return len(b.items)
 
 
 def take_batch(chat_key: str, limit: int = MAX_ITEMS_PER_CALL) -> List[Dict[str, Any]]:
     """取出一批待归纳素材（最多 limit 条），剩余留在桶里。"""
+    _ensure_state_loaded()
     b = _buckets.get(chat_key)
     if not b or not b.items:
         return []
@@ -194,6 +289,12 @@ def take_batch(chat_key: str, limit: int = MAX_ITEMS_PER_CALL) -> List[Dict[str,
     b.items = b.items[limit:]
     if not b.items:
         b.first_at = b.last_at = 0.0
+    else:
+        # ⚠️ 剩下的条目是**更新**的素材，但 first_at 还停在被取走那批的最早时间 →
+        #    下一轮 tick 它们立刻被判定「已超时」，形成窗口重叠：同一段对话被连续归纳两次，
+        #    而第二次只看到后半段，容易产出重复/矛盾的记忆。取走一批后余量从「现在」重新计时。
+        b.first_at = time.time()
+    _save_state()
     return batch
 
 
@@ -211,6 +312,7 @@ def pushes_back(chat_key: str, items: List[Dict[str, Any]],
     if not chat_key or not items:
         return 0
     now = now if now is not None else time.time()
+    _ensure_state_loaded()          # 恢复必须先于取桶，否则会覆盖已持久化的队列
     b = _buckets.get(chat_key)
     if b is None:
         b = PendingBucket(chat_key=chat_key, items=[], first_at=now, last_at=now)
@@ -221,6 +323,7 @@ def pushes_back(chat_key: str, items: List[Dict[str, Any]],
     # 只重置 first_at 治不了「≥门槛立即 flush」那条路径。
     b.first_at = now
     b.next_flush_at = now + max(0.0, float(BATCH_MAX_AGE_HOURS)) * 3600
+    _save_state()
     return len(b.items)
 
 
@@ -241,7 +344,10 @@ def bucket_stats() -> Dict[str, Any]:
 
 
 def clear_buckets() -> None:
+    global _STATE_LOADED
     _buckets.clear()
+    _STATE_LOADED = True        # 清空后不要再去盘上捞回旧队列
+    _save_state()
 
 
 # ==================== Prompt ====================
@@ -368,8 +474,15 @@ async def consolidate_with_llm(items: List[Dict[str, Any]],
         logger.warning(f"[memory_log] 模型组 {name!r} 不可用：{exc}")
         raise ConsolidationFailed(f"模型组 {name!r} 不可用：{exc}") from exc
 
-    extra_body = parse_extra_body(
-        group.EXTRA_BODY, source_hint=f"persona memory_log: {name}") or {}
+    # ⚠️ 旧实现直接取 group.EXTRA_BODY：模型组配置没有这个属性时抛 AttributeError（在 try
+    #    之外），整轮归纳失败并按「失败」回填重跑 —— 而它只是个可选字段。
+    try:
+        extra_body = parse_extra_body(
+            getattr(group, "EXTRA_BODY", "") or "",
+            source_hint=f"persona memory_log: {name}") or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[memory_log] 模型组 {name!r} 的 EXTRA_BODY 解析失败，按空处理: {exc}")
+        extra_body = {}
     extra_body.setdefault("response_format", {"type": "json_object"})
     # 关闭思考模式（省时 + 避免思考 token 挤占输出预算导致正文为空）
     extra_body.update(DISABLE_THINKING)

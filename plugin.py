@@ -72,7 +72,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.2.10",
+    version="2.2.11",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -4067,8 +4067,8 @@ async def _memlog_loop() -> None:
                         continue
                     plugin.logger.info(
                         f"[memory_log] {chat_key}：{len(batch)} 条素材 → "
-                        f"{res['added']} 条记忆入库"
-                        f"（去重跳过 {res['skipped']}，淘汰 {res['evicted']}）")
+                        f"{res['added']} 条新入库 / {res.get('updated', 0)} 条同标题更新"
+                        f"（跳过 {res['skipped']}，淘汰 {res['evicted']}）")
                 except Exception as exc:  # noqa: BLE001
                     plugin.logger.warning(
                         f"[memory_log] 写入失败，素材回填: {chat_key}: {exc}")
@@ -4099,9 +4099,12 @@ async def _start_decay_loop() -> None:
         persona_consolidator.BATCH_MIN_ITEMS = max(1, int(config.MEMLOG_BATCH_MIN_ITEMS))
         persona_consolidator.BATCH_MAX_AGE_HOURS = max(
             0.0, float(config.MEMLOG_BATCH_MAX_AGE_HOURS))
+        # 攒批队列持久化：不注入就只能纯内存，重启即丢（素材还没进 memory_log，无副本）
+        persona_consolidator.configure_state_path(
+            lambda: plugin.get_plugin_data_dir() / "backgrounds")
         plugin.logger.info(
             f"[memory_log] 攒批参数已按配置注入：{persona_consolidator.BATCH_MIN_ITEMS} 条 / "
-            f"{persona_consolidator.BATCH_MAX_AGE_HOURS} 小时")
+            f"{persona_consolidator.BATCH_MAX_AGE_HOURS} 小时（队列持久化已启用）")
     except Exception as exc:  # noqa: BLE001
         plugin.logger.warning(f"[memory_log] 攒批参数注入失败，沿用模块默认值: {exc}")
 
