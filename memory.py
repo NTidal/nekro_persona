@@ -577,6 +577,28 @@ def _mtime_key() -> Tuple:
     return tuple(keys)
 
 
+def _normalize_triggers(value: Any) -> List[str]:
+    """triggers 归一化成字符串数组。
+
+    ⚠️ 手写成字符串时（`"triggers": "雨天"`），`for kw in e["triggers"]` 会**逐字符**迭代，
+    于是「雨」「天」各成一个触发词 —— 任何含这两个字的句子都会命中该条目。
+    逗号串按逗号拆，其它字符串整体当一个触发词。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        _s = value.strip()
+        if not _s:
+            return []
+        if "," in _s or "，" in _s:
+            return [x.strip() for x in re.split(r"[,，]", _s) if x.strip()]
+        return [_s]
+    if isinstance(value, (list, tuple, set)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    _one = str(value).strip()
+    return [_one] if _one else []
+
+
 def _read_dir(d: Path) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if not d.is_dir():
@@ -595,6 +617,7 @@ def _read_dir(d: Path) -> List[Dict[str, Any]]:
                 raise ValueError(f"背景文件存在非对象条目：{fp.name}")
             if item.get("enabled", True):
                 item["_file"] = fp.stem
+                item["triggers"] = _normalize_triggers(item.get("triggers"))
                 out.append(item)
     return out
 

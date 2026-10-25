@@ -2200,7 +2200,7 @@ body.is-scrolling .dialog-foot {
     </nav>
     <div class="side-foot">
       <strong>本地管理面板</strong>
-      所有修改保存后立即重载生效；未配置访问密钥时写操作会被后端拒绝。
+      所有修改保存后立即重载生效；未配置访问密钥时<b>所有接口</b>都会被后端拒绝（仅页面本身可打开）。
     </div>
   </aside>
 
@@ -2982,6 +2982,8 @@ const state = {
   previewSeq: 0,
   dirtyPage: '',
   favorSeq: 0,
+  memoSeg: 0,
+  memlogSeq: 0,
   maxAbs: 100,
 };
 
@@ -3046,7 +3048,7 @@ async function load(path, mockFn) {
     setDemo(false);
     return d;
   } catch (e) {
-    if (e.status === 401) { openKeyDialog(); return null; }
+    if (e.status === 401) { openKeyDialog(e.message); return null; }
     if (e.status === 403) { toast(e.message, 'warning', 5200); return null; }
     const why = `${path} → ${e.status || '网络不可达'} ${e.message || ''}`.trim();
     console.warn('[persona] GET 失败，回落演示数据:', path, e.status || '(网络)', e.message);
@@ -3062,8 +3064,8 @@ async function postAction(path, body) {
     return await api(path, { method: 'POST', body: body === undefined ? {} : body });
   } catch (e) {
     if (e.status === 401) {
-      openKeyDialog();
-      toast('需要访问密钥：请在右上角设置 X-WebUI-Key', 'warning', 5200);
+      openKeyDialog(e.message);
+      toast(e.message || '需要访问密钥：请在右上角设置 X-WebUI-Key', 'warning', 5200);
       return null;
     }
     throw e;
@@ -3078,7 +3080,7 @@ async function mutate(path, body, { mockApply, okMsg } = {}) {
     if (okMsg) toast(okMsg, 'success');
     return d;
   } catch (e) {
-    if (e.status === 401) { openKeyDialog(); return null; }
+    if (e.status === 401) { openKeyDialog(e.message); return null; }
     if (e.network || (e.status && e.status >= 500) || e.status === 404) {
       const why = `${path} → ${e.status || '网络不可达'} ${e.message || ''}`.trim();
       console.warn('[persona] POST 失败，已在本地模拟:', path, e.status || '(网络)', e.message);
@@ -3455,12 +3457,15 @@ $('#refreshBtn').addEventListener('click', async () => {
 });
 
 /* ---------------- 访问密钥 ---------------- */
-function openKeyDialog() {
+function openKeyDialog(reason) {
+  // reason = 后端 401 的原文（如「未配置 WEBUI_ACCESS_KEY：管理接口默认拒绝访问…」）。
+  // 以前只弹框、把后端的话丢掉 —— 用户只看到「请提供密钥」，不知道其实是服务端没配。
   openDialog({
     title: '访问密钥',
-    subtitle: '后端要求 X-WebUI-Key 请求头（插件配置 WEBUI_ACCESS_KEY）',
-    body: `<div class="field-label">密钥<input class="field" id="keyInput" type="password" placeholder="留空表示未配置" value="${esc(state.key)}"></div>
-           <p class="hint">密钥只保存在本机 localStorage，不会上传到任何第三方。</p>`,
+    subtitle: reason || '后端要求 X-WebUI-Key 请求头（插件配置 WEBUI_ACCESS_KEY）',
+    body: `<div class="field-label">密钥<input class="field" id="keyInput" type="password" placeholder="粘贴插件配置里的 WEBUI_ACCESS_KEY" value="${esc(state.key)}"></div>
+           <p class="hint">密钥只保存在本机 localStorage，不会上传到任何第三方。</p>
+           <p class="hint">若你就是管理员：请到 NA 插件配置里设置 WEBUI_ACCESS_KEY —— 未配置时所有接口都会返回 401，留空不能绕过。</p>`,
     foot: `<button class="btn" type="button" data-dlg="cancel">取消</button>
            <button class="btn primary" type="button" data-dlg="save-key">保存并重试</button>`,
   });
@@ -3787,6 +3792,9 @@ $('#memoryTbody').addEventListener('click', async (e) => {
   if (!tr) return;
   const id = tr.dataset.id;
   const tier = state.memoryTier;
+  // 删除后会把 state.entries 置 null（等下一次重载）：这个窗口期点列表会
+  // 直接 TypeError 打断整个 handler。先判空。
+  if (!state.entries) return;
   const entry = (state.entries[tier] || []).find((x) => String(x.id) === id);
   if (!entry) return;
   const act = e.target.closest('[data-act]') ? e.target.closest('[data-act]').dataset.act : null;
@@ -3827,6 +3835,7 @@ $('#dialogFoot').addEventListener('click', async (e) => {
   if (!btn) return;
   const id = btn.dataset.id;
   const tier = state.memoryTier;
+  if (!state.entries) { closeDialog(); return; }
   const entry = (state.entries[tier] || []).find((x) => String(x.id) === id);
   closeDialog();
   const res = await mutate('entry', { tier, id, op: 'delete' }, {
@@ -4551,7 +4560,10 @@ async function loadMemo() {
   const qs = searching
     ? `memos?q=${encodeURIComponent(q)}${selVal ? `&chat_key=${encodeURIComponent(selVal)}` : ''}`
     : `memos?chat_key=${encodeURIComponent(chatKey)}`;
+  // 搜索是防抖 + 网络时序不定：慢的旧响应回来时不能覆盖新结果（与 favorSeq 同款）
+  const seq = ++state.memoSeg;
   const data = await load(qs, () => (searching ? MOCK.memosAll() : MOCK.memos(chatKey)));
+  if (seq !== state.memoSeg) return;   // 已有更新的搜索发出去了，丢弃过期响应
   if (!data) return;
   renderMemo(data);
 }
@@ -4759,7 +4771,9 @@ async function loadMemlog() {
   const qs = searching
     ? `memory_log?q=${encodeURIComponent(q)}&limit=500${selVal ? `&chat_key=${encodeURIComponent(selVal)}` : ''}`
     : `memory_log?chat_key=${encodeURIComponent(chatKey)}`;
+  const seq = ++state.memlogSeq;
   const data = await load(qs, () => (searching ? MOCK.memlogAll() : MOCK.memlog(chatKey)));
+  if (seq !== state.memlogSeq) return;   // 丢弃过期响应
   if (!data) return;
   renderMemlog(data);
 }

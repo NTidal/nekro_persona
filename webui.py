@@ -321,6 +321,16 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(tmp_name, fp)
+                # rename 之后还要 fsync 目录才算真正落盘，否则掉电时可能出现
+                # 「数据已写、目录项仍指向旧 inode」。Windows 不支持目录 fsync，忽略即可。
+                try:
+                    _dfd = os.open(str(fp.parent), os.O_RDONLY)
+                    try:
+                        os.fsync(_dfd)
+                    finally:
+                        os.close(_dfd)
+                except OSError:
+                    pass
             finally:
                 try:
                     os.unlink(tmp_name)
@@ -1822,6 +1832,12 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     "name": name[:12],
                     "unlock_hint": str(stage.get("unlock_hint") or "")[:120],
                 })
+            if len(stages) > 20:
+                # 档位是给模型读的分层描述：几十档既用不上，又会让注入与 UI 双重膨胀
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"档位最多 20 个（当前 {len(stages)} 个）",
+                )
             stages.sort(key=lambda item: item["max"])
             if stages or bool(body.get("allow_empty_stages", False)):
                 patch["stages"] = stages

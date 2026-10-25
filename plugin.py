@@ -72,7 +72,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.2.11",
+    version="2.2.12",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -2715,9 +2715,12 @@ async def adjust_favorability(
         await _store_archive(_ctx.chat_key, state)
 
     _tail = "（档案里的禁写词已自动移除。）" if _blocked else ""
+    # ⚠️ 这是 BEHAVIOR 方法的返回值 —— 它会**直接作为一句话进聊天**。
+    #    早先带着「当前为 62/100」：等于把内部评分实时播报给用户，
+    #    用户会开始算分、试探边界，关系感就退化成刷分游戏。只保留阶段名。
     return (
-        f"已调整 {profile.display_name or profile.user_id} 的好感度：{_delta_text(delta)}，"
-        f"当前为 {profile.score}/{_score_cap()}（{_stage_of(profile.score)[0]}）。{_tail}"
+        f"已记下对{profile.display_name or profile.user_id}的这次互动"
+        f"（关系：{_stage_of(profile.score)[0]}）。{_tail}"
     )
 
 
@@ -2870,9 +2873,10 @@ async def set_favorability_profile(
         await _store_archive(_ctx.chat_key, state)
 
     _stail = "（档案里的禁写词已自动移除。）" if _sblocked else ""
+    # 同上：BEHAVIOR 回执会进聊天，不播报内部评分，只给阶段
     return (
-        f"已重设 {profile.display_name or profile.user_id} 的好感度档案，当前为 "
-        f"{profile.score}/{_score_cap()}（{_stage_of(profile.score)[0]}）。{_stail}"
+        f"已重设 {profile.display_name or profile.user_id} 的关系档案"
+        f"（当前阶段：{_stage_of(profile.score)[0]}）。{_stail}"
     )
 
 
@@ -3024,6 +3028,9 @@ async def save_note(
 async def forget_note(_ctx: schemas.AgentCtx, title: str) -> str:
     """删除一条功能笔记。
 
+    ⚠️ 本工具是 TOOL 类型：返回值**只给你看，不会出现在聊天里**。
+    所以「已忘掉笔记」这类回执绝不能当成对用户的答复 —— 同一回复里必须还有真正的说话内容。
+
     Args:
         title (str): 笔记标题（支持模糊匹配）
     """
@@ -3077,6 +3084,8 @@ async def anchor_memory(
     ⚠️ 锚点受**硬频率闸**（每日≤N、间隔≥M 小时、总量≤上限）：这是刻意设计——
     身份是慢慢长成的，不是每轮都改。触顶时会拒绝，这是让你珍视每一次沉淀。
     ⚠️ 与备忘一样，锚点是**你的内部自我认知**，不要把原文当消息发给用户。
+    ⚠️ 本工具是 TOOL 类型：返回值**只给你看，不会出现在聊天里**。
+    「已沉淀」这类回执不是对用户的答复 —— 同一回复里必须还有真正的说话内容。
 
     Args:
         content (str): 锚点正文，务必凝练（默认上限 200 字；写成一句能长期成立的话）
