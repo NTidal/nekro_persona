@@ -71,7 +71,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.2.5",
+    version="2.2.6",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -1532,6 +1532,7 @@ class UserArchive:
               tags: object = None, display_name: str = "") -> None:
         """按增量调整：分数加减，描述字段"写了才覆盖"。"""
         self.see(display_name)
+        _before = self.score
         self.score = _bound_score(self.score + int(delta))
         self.last_reason = _one_line(reason, 160)
         self.updated_at = _ts_now()
@@ -1541,7 +1542,9 @@ class UserArchive:
             self.interaction_hint = _one_line(hint, 200)
         if tags:
             self.tags = _tag_list(list(self.tags) + list(tags))  # type: ignore[arg-type]
-        self._remember(int(delta), self.last_reason or "未说明原因")
+        # 事件流口径与回执一致：记**实际生效**的增量。触顶时请求值与实际值不同，
+        # 记请求值会让事件史出现「+5」但分数没变，日后核对分账对不上。
+        self._remember(self.score - _before, self.last_reason or "未说明原因")
 
     def reset_to(self, score: int, reason: str, *, summary: str = "", hint: str = "",
                  tags: object = None, display_name: str = "") -> None:
@@ -2897,6 +2900,13 @@ async def save_note(
             )
         if reason == "max_items":
             return f"本次未记录：笔记已达上限 {cfg['max_items']} 条，先用 `forget_note` 清理不用的。"
+        if reason == "write_failed":
+            # 与 WebUI 端点同口径：磁盘写失败不是「被拒绝」，要明确说数据没落盘，
+            # 否则模型会以为只是内容不合规、改改写写再来一次。
+            return (
+                "本次未记录：写入磁盘失败（权限或空间问题），数据**没有**保存。"
+                "请让管理员检查插件数据目录的可写性。"
+            )
         return "本次未记录：笔记写入被拒绝。"
 
     ttl = max(0, int(ttl_hours or 0))

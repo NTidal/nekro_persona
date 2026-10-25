@@ -3603,6 +3603,21 @@ async function loadChannels() {
   fillChannelSelects();
 }
 
+/* 「全部频道」只在搜索态有意义：非搜索态选中它会被 loadMemo/loadMemlog 静默回退到
+   上一个频道，界面显示与实际数据来源不一致。这里统一处理：非搜索态禁用该选项，
+   并把停留在「全部频道」的选中值纠正回真实频道。 */
+function syncChannelSelectMode(sel, searching) {
+  const el = $(sel);
+  if (!el) return;
+  const all = el.querySelector('option[value=""]');
+  if (!all || all.textContent.trim() !== '全部频道') return;
+  all.disabled = !searching;
+  if (!searching && el.value === '') {
+    const back = sel === '#memoChannel' ? state.memoChannel : state.memlogChannel;
+    if (back) el.value = back;
+  }
+}
+
 function fillChannelSelects() {
   const opts = state.channels.map((c) => `<option value="${esc(c.chat_key)}">${esc(c.chat_key)}（${c.count} 人 · 最高 ${c.top}）</option>`).join('')
   // 备忘录 / 关系记忆两页加「全部频道」：搜索是跨频道的，而下拉原先在搜索态被完全忽略
@@ -3613,8 +3628,10 @@ function fillChannelSelects() {
     const el = $(sel);
     if (!el) return;
     const keep = el.value;
-    el.innerHTML = (sel === '#previewChannel' ? '' : ALL)
-      + (opts || '<option value="">（暂无频道）</option>');
+    // 没有频道时不要再塞「全部频道」：否则会出现两个 value="" 的选项
+    //（「全部频道」+「（暂无频道）」），选了哪个都没有实际含义。
+    const withAll = sel === '#previewChannel' || !opts ? '' : ALL;
+    el.innerHTML = withAll + (opts || '<option value="">（暂无频道）</option>');
     if (keep && state.channels.some((c) => c.chat_key === keep)) el.value = keep;
   });
   if (!state.previewChannel && state.channels[0]) { state.previewChannel = state.channels[0].chat_key; $('#previewChannel').value = state.previewChannel; }
@@ -3838,7 +3855,7 @@ function entryFormHTML(tier, e, isNew) {
     ${trig}
     <div class="field-label">内容<small>最多 2000 字</small><textarea class="textarea" id="efContent" style="min-height:130px">${esc(e ? e.content || '' : '')}</textarea></div>
     <div class="field-row">
-      <div class="field-label">披露门槛<input class="field" id="efMinFavor" type="number" min="0" value="${e ? e.min_favor || 0 : 0}"></div>
+      <div class="field-label">披露门槛<input class="field" id="efMinFavor" type="number" min="0" max="${maxAbsSafe()}" value="${e ? e.min_favor || 0 : 0}"></div>
       <div class="field-label">权重（1–999）<input class="field" id="efWeight" type="number" min="1" max="999" value="${e ? e.weight || 1 : 1}"></div>
     </div>
     ${fam}
@@ -3870,8 +3887,11 @@ $('#dialogFoot').addEventListener('click', async (e) => {
     tier,
     title: $('#efTitle').value.trim(),
     content: $('#efContent').value,
-      min_favor: clampInt($('#efMinFavor').value, 0, 100, 0),
-      weight: clampInt($('#efWeight').value, 1, 999, 1),
+    // ⚠️ 上限是 MAX_ABS_SCORE（可配置、无上限），不能写死 100：
+    //    在 MAX_ABS_SCORE=200 的部署里，写死 100 会让「编辑一条 min_favor=150 的条目、
+    //    什么都不改直接保存」被静默降到 100。
+    min_favor: clampInt($('#efMinFavor').value, 0, maxAbsSafe(), 0),
+    weight: clampInt($('#efWeight').value, 1, 999, 1),
     enabled: $('#efEnabled').checked,
   };
   if (tier === 'tier1') body.trigger = $('#efTrigger').value.trim();
@@ -4511,6 +4531,7 @@ async function loadMemo() {
   if (!state.channels.length) await loadChannels();
   const q = state.memoSearch;
   const searching = !!String(q || '').trim();
+  syncChannelSelectMode('#memoChannel', searching);
   const selVal = $('#memoChannel').value;    // '' = 全部频道（仅搜索态有意义）
   const chatKey = searching ? selVal : (selVal || state.memoChannel);
   if (!searching && !chatKey) {
@@ -4718,6 +4739,7 @@ async function loadMemlog() {
   if (!state.channels.length) await loadChannels();
   const q = state.memlogSearch;
   const searching = !!String(q || '').trim();
+  syncChannelSelectMode('#memlogChannel', searching);
   const selVal = $('#memlogChannel').value;   // '' = 全部频道（仅搜索态有意义）
   const chatKey = searching ? selVal : (selVal || state.memlogChannel);
   if (!searching && !chatKey) {

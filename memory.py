@@ -1216,6 +1216,11 @@ async def _embed_query(text: str) -> Optional[List[float]]:
     cached = _query_cache_get(key)
     if cached is not None:
         return cached
+    if time.monotonic() < _EMBED_FAIL_UNTIL:
+        # 查询侧也吃冷却：端点整段挂掉时，一轮检索要按「5 次重试 × 封顶 20s」
+        # 白等约 100s，而结果注定是 None（检索本来就得退回关键字）。
+        logger.debug("[persona] 嵌入服务冷却中，查询侧跳过（本轮只用关键字）")
+        return None
     vec = await _embed_query_uncached(text, sig)
     if vec:
         _query_cache_put(key, vec)
@@ -1411,7 +1416,10 @@ async def _vectorize(items: List[Dict[str, Any]], label: str, dir_key: Path,
     #（429 突发正是这种情况，冷却反而会让检索白等十分钟）。
     if any(not v for v in vecs):
         _EMBED_FAIL_UNTIL = time.monotonic() + _EMBED_COOLDOWN_SECONDS
-    else:
+    elif pending:
+        # 只有「这一轮确实试过端点、且全部成功」才清零。pending 为空（全缓存命中）
+        # 时，这次调用对端点健康状况一无所知，不能当作「服务已恢复」的证据 ——
+        # 否则 2 档刚设的冷却会被 3 档的全命中调用误清，下一次待嵌立刻又去撞墙。
         _EMBED_FAIL_UNTIL = 0.0
     return vecs
 
