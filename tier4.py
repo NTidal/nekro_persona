@@ -513,6 +513,15 @@ def _read_tier4_sync() -> Tier4Doc:
     return doc
 
 
+class Tier4WriteFailed(Exception):
+    """磁盘写入失败（权限/空间/IO）。
+
+    ⚠️ 旧实现在这里只 warning 然后正常返回，于是 write_anchor 照旧回「已记住」、
+    模型被告知成功，但重启后数据就没了 —— 与 Tier4Corrupted 的 fail-closed 不对称，
+    也让「工具说成功」变得不可信。现在一律抛出，由调用方转成可读的失败回执。
+    """
+
+
 def _write_tier4_sync(doc: Tier4Doc) -> None:
     # 降级期间绝不落盘：此时的 doc 是空文档，写回等于清空既有锚点/笔记
     _reason = corruption_reason()
@@ -532,7 +541,8 @@ def _write_tier4_sync(doc: Tier4Doc) -> None:
         cache["doc"] = doc
     except Exception as exc:  # noqa: BLE001
         _invalidate_read_cache(fp.parent)
-        logger.warning(f"[tier4] 写入失败（不影响本次运行）: {exc}")
+        logger.error(f"[tier4] 写入失败: {exc}")
+        raise Tier4WriteFailed(str(exc)) from exc
 
 
 async def open_tier4() -> Tier4Doc:
@@ -567,6 +577,7 @@ GATE_MAX_TOTAL = "max_total"
 GATE_MAX_PER_DAY = "max_per_day"
 GATE_INTERVAL = "interval"
 GATE_CORRUPT = "corrupt"
+GATE_WRITE_FAILED = "write_failed"   # 磁盘写失败：与 GATE_CORRUPT 同为 fail-closed
 
 
 def check_anchor_gates(doc: Tier4Doc, cfg: Dict[str, Any], now: int) -> str:
@@ -657,7 +668,13 @@ async def write_anchor(
                 if clean_tags:
                     match.tags = clean_tags
                 match.updated_at = now
-                _write_tier4_sync(doc)
+                try:
+                    _write_tier4_sync(doc)
+                except (Tier4Corrupted, Tier4WriteFailed) as exc:
+                    logger.warning(f"[tier4] 刷新锚点未落盘: {exc}")
+                    return {"action": "rejected", "gate": GATE_WRITE_FAILED, "entry": None,
+                            "total": entry_count(doc, ANCHOR_KIND),
+                            "day_count": int(doc.meta.day_count), "corrupt": str(exc)}
                 return {
                     "action": "refreshed", "gate": "", "entry": match.to_raw(),
                     "total": entry_count(doc, ANCHOR_KIND), "day_count": int(doc.meta.day_count),
@@ -678,7 +695,13 @@ async def write_anchor(
         doc.entries.append(entry)
         doc.meta.day_count = int(doc.meta.day_count) + 1
         doc.meta.last_anchor_at = now
-        _write_tier4_sync(doc)
+        try:
+            _write_tier4_sync(doc)
+        except (Tier4Corrupted, Tier4WriteFailed) as exc:
+            logger.warning(f"[tier4] 新增锚点未落盘: {exc}")
+            return {"action": "rejected", "gate": GATE_WRITE_FAILED, "entry": None,
+                    "total": entry_count(doc, ANCHOR_KIND),
+                    "day_count": int(doc.meta.day_count), "corrupt": str(exc)}
         return {
             "action": "added", "gate": "", "entry": entry.to_raw(),
             "total": entry_count(doc, ANCHOR_KIND), "day_count": int(doc.meta.day_count),
@@ -703,8 +726,8 @@ async def delete_entry(entry_id: str) -> bool:
             return False
         try:
             _write_tier4_sync(doc)
-        except Tier4Corrupted as exc:
-            logger.warning(f"[tier4] 降级期间拒绝删除条目 {entry_id}: {exc}")
+        except (Tier4Corrupted, Tier4WriteFailed) as exc:
+            logger.warning(f"[tier4] 拒绝删除条目 {entry_id}（未落盘）: {exc}")
             return False
         return True
 
@@ -721,8 +744,8 @@ async def set_salience(entry_id: str, value: int, salience_max: int = 3) -> bool
         target.updated_at = _ts_now()
         try:
             _write_tier4_sync(doc)
-        except Tier4Corrupted as exc:
-            logger.warning(f"[tier4] 降级期间拒绝调整核心度 {entry_id}: {exc}")
+        except (Tier4Corrupted, Tier4WriteFailed) as exc:
+            logger.warning(f"[tier4] 拒绝调整核心度 {entry_id}（未落盘）: {exc}")
             return False
         return True
 
@@ -999,7 +1022,12 @@ async def add_or_update_note(
             existing.min_favor = favor
             existing.expire_at = expire_at
             existing.updated_at = now
-            _write_tier4_sync(doc)
+            try:
+                _write_tier4_sync(doc)
+            except (Tier4Corrupted, Tier4WriteFailed) as exc:
+                logger.warning(f"[tier4] 更新笔记未落盘「{clean_title}」: {exc}")
+                return {"action": "rejected", "note": None, "reason": "write_failed",
+                        "corrupt": str(exc)}
             return {"action": "updated", "note": existing.to_raw(), "reason": ""}
         live_in_scope = [
             n for n in doc.entries if n.kind == NOTE_KIND and n.scope == chat_key
@@ -1022,7 +1050,12 @@ async def add_or_update_note(
             updated_at=now,
         )
         doc.entries.append(entry)
-        _write_tier4_sync(doc)
+        try:
+            _write_tier4_sync(doc)
+        except (Tier4Corrupted, Tier4WriteFailed) as exc:
+            logger.warning(f"[tier4] 新增笔记未落盘「{clean_title}」: {exc}")
+            return {"action": "rejected", "note": None, "reason": "write_failed",
+                    "corrupt": str(exc)}
         return {"action": "created", "note": entry.to_raw(), "reason": ""}
 
 
@@ -1036,8 +1069,8 @@ async def forget_note(chat_key: str, title: str) -> Optional[str]:
         doc.entries = [e for e in doc.entries if e.id != target.id]
         try:
             _write_tier4_sync(doc)
-        except Tier4Corrupted as exc:
-            logger.warning(f"[tier4] 降级期间拒绝删除笔记「{target.title}」: {exc}")
+        except (Tier4Corrupted, Tier4WriteFailed) as exc:
+            logger.warning(f"[tier4] 拒绝删除笔记「{target.title}」（未落盘）: {exc}")
             return None
         return target.title
 
@@ -1056,8 +1089,8 @@ async def clear_expired_notes(chat_key: str) -> int:
         if removed:
             try:
                 _write_tier4_sync(doc)
-            except Tier4Corrupted as exc:
-                logger.warning(f"[tier4] 降级期间拒绝清理过期笔记: {exc}")
+            except (Tier4Corrupted, Tier4WriteFailed) as exc:
+                logger.warning(f"[tier4] 拒绝清理过期笔记（未落盘）: {exc}")
                 return 0
         return removed
 

@@ -71,7 +71,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.2.3",
+    version="2.2.4",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -3033,6 +3033,11 @@ async def anchor_memory(
                 f"本次未沉淀锚点：距上一条不足 {cfg['min_interval_hours']} 小时。"
                 "锚点是稀少的沉淀，不是即时记录，再等等。"
             )
+        if gate == tier4.GATE_WRITE_FAILED:
+            return (
+                "本次未沉淀锚点：写入磁盘失败（权限或空间问题），数据**没有**保存。"
+                "请检查插件数据目录的可写性后重试；本次内容可以先改用 `save_note`。"
+            )
         if gate == tier4.GATE_CORRUPT:
             return (
                 "本次未沉淀锚点：锚点文件当前处于损坏保护状态（已备份原件），"
@@ -3216,12 +3221,16 @@ async def _cmd_shift(
         step = sign * delta
         _before = int(profile.score)
         profile.nudge(step, _mystery_reason(profile, verb))
+        _applied = int(profile.score) - _before
         # ⚠️ 手工命令同样要吃预算：README 明说「手工设定走同一套预算，不是绕过约束的后门」。
         #    早先只调 nudge，不占每日净额、不受最小间隔限制、也不动 last_adjust_at。
-        profile.record_adjust(int(profile.score) - _before, _ts_now())
+        profile.record_adjust(_applied, _ts_now())
         state.last_active_user_id = who
         word = "增加" if sign > 0 else "减少"
-        return _adjust_receipt(profile, f"{word} {_delta_text(step)}")
+        # 回执必须用**实际生效**的增量：触顶时请求值与实际值不同，
+        # 早先显示请求值会出现「增加 +5 … 当前 100/100」这种自相矛盾的文案。
+        _tail = "" if _applied == step else f"（已触顶，实际 {_delta_text(_applied)}）"
+        return _adjust_receipt(profile, f"{word} {_delta_text(_applied)}{_tail}")
 
     return await _favor_write_command(context, _apply)
 
@@ -3636,12 +3645,15 @@ async def _migrate_memos_on_load() -> None:
             memos = data.get("memos") or []
             if not memos or data.get("memos_migrated"):
                 continue
-            memos_by_chat[ck] = [m for m in memos if isinstance(m, dict)]
             try:  # 备份原始 blob（迁移失败可回滚）
                 pre_dir.mkdir(parents=True, exist_ok=True)
                 (pre_dir / f"{_safe_key_name(ck)}.json").write_text(raw, encoding="utf-8")
             except Exception as e:  # noqa: BLE001
+                # ⚠️ 备份失败就**跳过**这个频道：迁移完成后会清空原始 memos，
+                #    没有备份还继续迁移，等于把「可回滚」的承诺作废。
                 errors.append({"chat_key": ck, "error": f"backup:{e}"})
+                continue
+            memos_by_chat[ck] = [m for m in memos if isinstance(m, dict)]
 
     if not memos_by_chat:
         return

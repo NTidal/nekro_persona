@@ -521,11 +521,19 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             fp = _bg_dir() / tier / file_name
             data = _read_json_strict(fp)
             if data is None:
+                # ⚠️ 目标文件已不存在时，把整份 source_document 搬回来会把当时同文件里的
+                #    其他条目一起「复活」——那些条目可能后来被单独删除且没有回收站记录
+                #   （删 X、删 Y（文件清空被删）、再恢复 X → Y 静默回归）。
+                #    只保留文档头（character/tier 等元信息），entries 从空开始。
                 source_document = record.get("source_document")
-                if isinstance(source_document, dict):
-                    data = json.loads(json.dumps(source_document, ensure_ascii=False))
-                else:
-                    data = {"character": "restored", "tier": tier, "entries": []}
+                header = {
+                    k: json.loads(json.dumps(v, ensure_ascii=False))
+                    for k, v in (source_document or {}).items()
+                    if k != "entries"
+                } if isinstance(source_document, dict) else {}
+                header.setdefault("character", "restored")
+                header.setdefault("tier", tier)
+                data = {**header, "entries": []}
             entries = data.setdefault("entries", [])
             if not isinstance(entries, list):
                 raise ValueError("恢复目标文件的 entries 必须是数组")
@@ -1485,7 +1493,11 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         tier = "tier3" if str(body.get("tier") or "tier2") == "tier3" else "tier2"
         if not text:
             raise HTTPException(status_code=400, detail="请输入模拟对话文本")
-        score = helpers["clamp_score"](int(body.get("score") or 0))
+        try:
+            _raw_score = int(body.get("score") or 0)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="score 需为整数") from exc
+        score = helpers["clamp_score"](_raw_score)
         await memory.ensure_loaded()
         cfg_favor = memory.load_favor_cfg()
         gating = bool(body.get("gating", True)) and bool(cfg_favor.get("enabled", True))
@@ -1789,7 +1801,9 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             entry["trigger"] = str(body.get("trigger") or "")[:200]
         else:
             trg = body.get("triggers") or []
-            entry["triggers"] = [str(x)[:24] for x in trg][:30]
+            if isinstance(trg, str):       # 与 update 端同口径：逗号分隔的字符串
+                trg = [x.strip() for x in trg.replace("，", ",").split(",")]
+            entry["triggers"] = [str(x)[:24] for x in (trg or []) if str(x).strip()][:30]
         if tier == "tier3":
             fam = str(body.get("familiarity") or "")[:12]
             if fam and fam not in ("熟人", "听说", "仅传闻"):
@@ -1944,8 +1958,11 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         title = str(body.get("title") or "").strip()[:40]
         content = str(body.get("content") or "").strip()
         tags = [str(x).strip()[:12] for x in (body.get("tags") or []) if str(x).strip()][:6]
-        min_favor = max(0, min(100, int(body.get("min_favor") or 0)))
-        ttl_hours = max(0, int(body.get("ttl_hours") or 0))
+        try:
+            min_favor = max(0, min(100, int(body.get("min_favor") or 0)))
+            ttl_hours = max(0, int(body.get("ttl_hours") or 0))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="门槛与有效期需为整数") from exc
 
         res = await t4.add_or_update_note(
             chat_key, title, content,
@@ -1962,6 +1979,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "empty_content": "内容不能为空",
                 "too_long": f"内容超过上限 {ncfg['max_content']} 字",
                 "max_items": f"已达上限 {ncfg['max_items']} 条，请先清理",
+                "write_failed": "写入磁盘失败（权限或空间问题），本次没有保存",
             }.get(reason, "写入被拒绝")
             raise HTTPException(status_code=400, detail=detail)
         note = res.get("note") or {}
@@ -2210,6 +2228,29 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                         status_code=400,
                         detail=f"archives.json 里 {ck} 的结构不对（缺 profiles 对象），已拒绝导入",
                     )
+                # 再往下钻一层：profiles 里的每份档案自己也得是对象，且 score/day_net 之类
+                # 的数值字段不能是字符串 —— 结构性错误会让 _open_archive 解析失败，
+                # 之后按空档案继续、下一次写入就把原始数据覆盖成空的。
+                _bad_profile = ""
+                for _uid, _p in (blob.get("profiles") or {}).items():
+                    if not isinstance(_p, dict):
+                        _bad_profile = f"用户 {_uid} 的档案不是对象"
+                        break
+                    for _k in ("score", "day_net", "day_key", "last_adjust_at",
+                               "created_at", "updated_at"):
+                        _v = _p.get(_k)
+                        if _v is None:
+                            continue
+                        if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+                            _bad_profile = f"用户 {_uid} 的 {_k}={_v!r} 不是数字"
+                            break
+                    if _bad_profile:
+                        break
+                if _bad_profile:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"archives.json 里 {ck}：{_bad_profile}，已拒绝导入",
+                    )
                 arch_items.append((str(ck), blob))
 
         # 1) tier4.json —— 校验后覆盖（原子写：tmp + os.replace）
@@ -2423,7 +2464,19 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         applied = []
         for arc, (raw, dst, n) in parsed.items():
             dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(raw)
+            # 原子写：tmp + replace。原先直接 write_bytes，写到一半崩掉会留下半截
+            # JSON，整个记忆系统就拒绝加载了（_dump 早就是原子写，这里是漏网路径）。
+            _fd, _tmp = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
+            try:
+                with os.fdopen(_fd, "wb") as _fh:
+                    _fh.write(raw)
+                os.replace(_tmp, dst)
+            except Exception:
+                try:
+                    os.unlink(_tmp)
+                except OSError:
+                    pass
+                raise
             applied.append(f"{arc}（{n} 条）" if n >= 0 else f"{arc}")
         # 人设文件此时已经落盘：预设部分即便失败也不能再让整个请求 500
         #（否则用户会以为什么都没生效）。逐条记录成功/失败并如实返回。
