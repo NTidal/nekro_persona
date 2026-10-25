@@ -751,6 +751,10 @@ async def set_salience(entry_id: str, value: int, salience_max: int = 3) -> bool
 
 
 # ---------------- 注入选择 + 渲染（§5.1：预检 + salience 单调填充）----------------
+# 注入行 f"· {content}" + 换行的固定开销（"· " 两字符 + "\n" 一字符）
+_ANCHOR_LINE_OVERHEAD = 3
+
+
 def select_anchors(
     anchors: List[Tier4Entry],
     *,
@@ -766,8 +770,10 @@ def select_anchors(
 
     做法：
       · 预检剔除单条就超预算的（留着只会挡道）。
-      · 稳定排序 salience desc, created_at desc。
-      · 单调闸 min_salience_seen：一旦注入过某更低档，绝不再回填更高档（保序）。
+      · 稳定排序 salience desc, created_at desc —— 注入顺序的单调性由这个排序
+        + 只向后遍历保证（旧实现另有一个 min_salience_seen 比较闸，但在降序序列上
+        恒不成立，是死代码，已删除以免误以为多了一层保护）。
+      · 每条的实际占用是 len(content) + 3（"· " 前缀 + 换行），预算按这个口径算。
       · 放不下的先 continue（同/更低档更短时可补位）。
     """
     budget = max(0, int(budget))
@@ -775,24 +781,28 @@ def select_anchors(
     if budget <= 0 or cap == 0:
         return []
 
+    # ⚠️ 预算口径必须与**渲染出来的文本**一致：注入行是 f"· {content}"，逐行还要换行，
+    #    所以每条实际占 len(content) + 3（"· " 两字符 + 换行）。只算 content 会让
+    #    inject_chars=1200 实际注入到 1200 + 3×N（N=8 时多出 24 字符），预算失真。
+    overhead = _ANCHOR_LINE_OVERHEAD
+
     # ① 排序前预检：单条超总预算的直接剔除
-    pool = [a for a in anchors if 0 < len(a.content) <= budget]
+    pool = [a for a in anchors if 0 < len(a.content) + overhead <= budget]
     # ② 稳定排序
     pool.sort(key=lambda a: (-int(a.salience), -int(a.created_at)))
 
     out: List[Tier4Entry] = []
     used = 0
-    min_salience_seen = 10**9  # 单调闸：已注入过的最低 salience
     for a in pool:
-        # ③ 已允许过更低档 → 绝不再回填更高档（保证注入顺序单调、核心不被低档挤掉）
-        if int(a.salience) > min_salience_seen:
-            break
-        blk = len(a.content)
+        # ③ 注入顺序单调由「salience desc 排序 + 只往后走」保证，不需要额外的闸：
+        #    旧实现在这里有个 min_salience_seen 比较，但 pool 已按 salience 降序，
+        #    任何后续条目的 salience 都 ≤ 前面出现过的值，那个 break 永远不成立（死代码）。
+        #    真出错时的坏法也不是这条闸能拦的，所以删掉以免误以为有保护。
+        blk = len(a.content) + overhead
         if used + blk > budget:
             continue  # 放不下的先跳过，同/更低档更短者仍可补位
         out.append(a)
         used += blk
-        min_salience_seen = int(a.salience)
         if cap and len(out) >= cap:
             break
     return out

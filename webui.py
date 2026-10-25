@@ -53,7 +53,9 @@ def _as_int(value: Any, default: int = 0) -> int:
 
 
 # 种子包里合法的人设文件名：不含路径分隔符、不以点开头（挡 `../` 之类穿越）
-_SAFE_TIER_FILE = re.compile(r"^[A-Za-z0-9_.\-\u4e00-\u9fff]+[.]json$")
+# 点开头（.hidden.json）与 "..%2f" 之类都不该被当成正规档位文件：前者是隐藏/临时文件，
+# 后者是路径穿越的变形。显式用负向断言挡掉点开头。
+_SAFE_TIER_FILE = re.compile(r"^(?!\.)[A-Za-z0-9_.\-\u4e00-\u9fff]+[.]json$")
 
 
 def _validate_tier_entries(entries: List[Any]) -> str:
@@ -1478,7 +1480,11 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             if not eid:
                 raise HTTPException(status_code=400, detail="缺少 id")
             ok = await memlog.delete_entry(eid)
-            return {"ok": ok, "id": eid}
+            if not ok:
+                # 未命中是「找不到」，不是「删成功」：200 + ok:false 会让前端提示
+                # 「已删除」而列表刷新后条目还在（只有刷新才看得出矛盾）。
+                raise HTTPException(status_code=404, detail=f"找不到关系记忆 {eid}")
+            return {"ok": True, "id": eid}
         raise HTTPException(status_code=400, detail=f"未知操作: {op}")
 
     @router.post("/api/recall_test", summary="检索实验（A5：为什么命中/为什么落选）")
@@ -1957,7 +1963,11 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
 
         title = str(body.get("title") or "").strip()[:40]
         content = str(body.get("content") or "").strip()
-        tags = [str(x).strip()[:12] for x in (body.get("tags") or []) if str(x).strip()][:6]
+        _raw_tags = body.get("tags") or []
+        if isinstance(_raw_tags, str):
+            # 传字符串时旧代码 `for x in "天气"` 会得到 ['天','气'] 两个标签
+            _raw_tags = [x.strip() for x in _raw_tags.replace("，", ",").split(",")]
+        tags = [str(x).strip()[:12] for x in _raw_tags if str(x).strip()][:6]
         try:
             min_favor = max(0, min(100, int(body.get("min_favor") or 0)))
             ttl_hours = max(0, int(body.get("ttl_hours") or 0))
@@ -2442,9 +2452,21 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         # ⚠️ 预设文本必须**先解析完**再动盘：旧实现在人设 JSON 已写完之后才读 presets/*.md，
         #    文件名不是合法 id / DB 报错就直接 500 —— 用户以为整包没生效，实际人设已经被换掉了。
         preset_payloads = []
-        for _n in sorted(x for x in names if x.startswith("presets/") and x.endswith(".md")):
+        # Windows 打的 zip 用反斜杠，早先这些条目会被静默跳过（包里明明有预设却导不进来）
+        _preset_names = sorted(
+            x for x in names
+            if x.replace("\\", "/").startswith("presets/") and x.endswith(".md")
+        )
+        for _n in _preset_names:
+            _norm = _n.replace("\\", "/")
+            _base = _norm.split("/")[-1]
+            if _base.startswith("."):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"预设文件名不合法：{_n}（已拒绝导入，未改动任何文件）",
+                )
             try:
-                _pid = int(_n.split("/")[-1].split(".")[0])
+                _pid = int(_base.split(".")[0])
             except (ValueError, IndexError) as exc:
                 raise HTTPException(
                     status_code=400,
@@ -2452,7 +2474,11 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 ) from exc
             _ptext = zf.read(_n).decode("utf-8", "replace")
             if _ptext.strip():
-                preset_payloads.append((_pid, _ptext.replace('\\n', '\\\\n')))
+                # ⚠️ 必须与导出**同向**：导出是「字面 \n → 真换行」（webui.py 的导出段），
+                #    这里原来是反的（字面 \n → \\n），两者不互逆：md 里手写的字面 \n
+                #    往返一次会变成两个反斜杠。现在两边同向，往返幂等，
+                #    且对「库里存真换行」的现有预设完全无影响（本就不含字面 \n）。
+                preset_payloads.append((_pid, _ptext.replace('\\n', '\n')))
         # 导入前先备份当前文件
         stamp = _datetime.now().strftime("%Y%m%d_%H%M%S")
         bdir = _bg_dir().parent / "persona_import_backups" / stamp

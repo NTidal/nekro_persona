@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import hashlib
 import json
 import math
@@ -71,7 +72,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.2.6",
+    version="2.2.7",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -2038,6 +2039,49 @@ def _adjust_receipt(profile: UserArchive, action: str) -> str:
     return "\n".join(lines)
 
 
+def _rel_time_text(ts: object, now: Optional[int] = None) -> str:
+    """时间戳 → 给模型看的人话（"3 小时前" / "2 天前" / "无"）。
+
+    裸 UNIX 数字（1789…）模型基本读不出含义，还会被当成评分/ID 念出来。
+    """
+    try:
+        t = int(ts or 0)
+    except (TypeError, ValueError):
+        return "无"
+    if t <= 0:
+        return "无"
+    cur = int(now if now is not None else _ts_now())
+    diff = cur - t
+    if diff < 0:
+        return "刚刚"
+    if diff < 300:
+        return "刚刚"
+    if diff < 3600:
+        return f"{diff // 60} 分钟前"
+    if diff < 86400:
+        return f"{diff // 3600} 小时前"
+    if diff < 86400 * 30:
+        return f"{diff // 86400} 天前"
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(t).strftime("%Y-%m-%d")
+    except Exception:  # noqa: BLE001
+        return f"{diff // 86400} 天前"
+
+
+def _safe_int(value: object, default: int = 0) -> int | None:
+    """沙盒参数取整数：解析不了返回 None（调用方转成回执，绝不让异常穿出沙盒）。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        try:
+            return int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return None
+
+
 def _mystery_reason(profile: UserArchive, verb: str) -> str:
     """超级用户改分时写进事件的固定说法。"""
     return f"由于神秘原因，你对{profile.display_name or profile.user_id}的好感度{verb}了"
@@ -2672,6 +2716,10 @@ async def set_favorability_profile(
         target_user_id (str): 仅关键字。留空就用当前触发本轮的这位用户。
         display_name (str): 可选，显示名。
     """
+    _score_int = _safe_int(score, 0)
+    if _score_int is None:
+        return "本次未重设：score 必须是整数（例如 60）。"
+    score = _score_int
     resolved_user_id = await _resolve_target_user_id(_ctx, target_user_id)
     kept_summary = _one_line(summary, 240)
     if not kept_summary:
@@ -2877,9 +2925,15 @@ async def save_note(
         tags (List[str] | None): 额外检索关键词，聊到这些词时会被唤起
     """
     cfg = _note_cfg()
+    # ⚠️ 沙盒参数是模型给的，可能是 "3小时"/"三" 这类非数字；直接 int() 抛出的
+    #    ValueError 会穿出沙盒方法（NA 侧表现为工具调用报错），必须自己兜住。
+    _ttl = _safe_int(ttl_hours, 0)
+    _favor = _safe_int(min_favor, 0)
+    if _ttl is None or _favor is None:
+        return "本次未记录：ttl_hours 与 min_favor 必须是整数（ttl_hours 单位是小时，0 表示不过期）。"
     res = await tier4.add_or_update_note(
         _ctx.chat_key, title, content,
-        ttl_hours=int(ttl_hours or 0), min_favor=int(min_favor or 0),
+        ttl_hours=max(0, _ttl), min_favor=max(0, _favor),
         tags=list(tags or []), source_user_id=await _best_effort_user_id(_ctx),
         cfg=cfg,
     )
@@ -3125,7 +3179,7 @@ async def get_favorability_profile(
         lines.append("最近变动：" + "；".join(shown)[:200])
     lines.append(
         f"观察 {len(getattr(found, 'observations', []) or [])} 条 · "
-        f"最近互动 {data.get('last_interaction_at') or '无'}"
+        f"最近互动 {_rel_time_text(data.get('last_interaction_at'))}"
     )
     return "\n".join(lines)
 
@@ -3721,6 +3775,12 @@ def _memlog_state_fp():
     return plugin.get_plugin_data_dir() / "backgrounds" / _MEMLOG_STATE_NAME
 
 
+# 扫描状态的 read-modify-write 锁。prompt 热路径（记录频道）与后台扫描循环
+#（推进 cursor）会并发改同一份 JSON，无锁时后者读到旧 cursor 再整体写回，
+# 就会把刚记进去的频道覆盖掉 / cursor 回退，表现为「某些频道永远轮不到」。
+_MEMLOG_STATE_LOCK = threading.Lock()
+
+
 def _read_memlog_state() -> dict:
     """读取扫描状态。失败一律返回空结构，绝不抛。"""
     try:
@@ -3782,12 +3842,17 @@ def _memlog_touch_channel(chat_key: str) -> None:
     if cached is not None and ck in cached:
         return          # 热路径：命中最常见，直接返回，零 IO
 
-    state = _read_memlog_state()
-    chans = cached if cached is not None else set(state.get("channels") or [])
-    chans.add(ck)
-    _memlog_chan_cache[dir_key] = chans
-    state["channels"] = sorted(chans)[-500:]
-    _write_memlog_state(state)
+    # 锁内**重读**：这份状态是扫描循环与热路径共用的 read-modify-write，
+    # 拿函数开头的旧快照整体写回会把对方刚写的 cursor / channels 抹掉
+    #（症状：某些频道永远轮不到扫描，或 cursor 回退导致重复采集）。
+    with _MEMLOG_STATE_LOCK:
+        state = _read_memlog_state()
+        chans = cached if cached is not None else set(state.get("channels") or [])
+        chans.add(ck)
+        chans |= set(state.get("channels") or [])
+        _memlog_chan_cache[dir_key] = chans
+        state["channels"] = sorted(chans)[-500:]
+        _write_memlog_state(state)
 
 
 async def _memlog_scan_once() -> int:
@@ -3801,17 +3866,20 @@ async def _memlog_scan_once() -> int:
     """
     from nekro_agent.models.db_exec_code import DBExecCode
 
-    state = _read_memlog_state()
-    cursor = int(state.get("cursor") or 0)
-    known = set(state.get("channels") or [])
+    with _MEMLOG_STATE_LOCK:
+        state = _read_memlog_state()
+        cursor = int(state.get("cursor") or 0)
+        known = set(state.get("channels") or [])
 
     if not known:
         # 还没见过任何频道：把游标推到当前最大 id，避免把历史一次性灌进来
         try:
             latest = await DBExecCode.all().order_by("-id").first()
             if latest is not None and int(cursor) < int(latest.id):
-                state["cursor"] = int(latest.id)
-                _write_memlog_state(state)
+                with _MEMLOG_STATE_LOCK:
+                    _st = _read_memlog_state()
+                    _st["cursor"] = max(int(_st.get("cursor") or 0), int(latest.id))
+                    _write_memlog_state(_st)
         except Exception:  # noqa: BLE001
             pass
         return 0
@@ -3846,8 +3914,12 @@ async def _memlog_scan_once() -> int:
             added += len(mats)
 
     if max_id > cursor:
-        state["cursor"] = max_id
-        _write_memlog_state(state)
+        with _MEMLOG_STATE_LOCK:
+            fresh = _read_memlog_state()
+            fresh["cursor"] = max(int(fresh.get("cursor") or 0), int(max_id))
+            # 保留扫描期间热路径新登记的频道（不能用扫描开始时的快照覆盖）
+            fresh["channels"] = sorted(set(fresh.get("channels") or []) | known)[-500:]
+            _write_memlog_state(fresh)
     return added
 
 
@@ -4018,4 +4090,12 @@ async def clean_up():
     pending = _decay_task
     if pending is not None and not pending.done():
         pending.cancel()
+        # 与上面的 memlog 任务一致：不 await 就会留下「Task was destroyed but it is
+        # pending」告警，且卸载期间任务可能仍在写盘（衰减结算落库）。
+        try:
+            await pending
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
         plugin.logger.info("[favorability] 好感度衰减任务已停止")

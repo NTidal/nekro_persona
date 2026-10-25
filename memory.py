@@ -515,13 +515,26 @@ def tier1_settings(override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     }
 
 
+def _sim_threshold(value: Any, default: float) -> float:
+    """相似度阈值归一化：None / 空串 / 非法值才回默认，**0 是合法值**（= 不过滤）。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return float(default)
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return max(0.0, min(1.0, v))
+
+
 def tier2_settings(override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """2 档运行参数（配置可覆盖模块默认值）。"""
     o = override or {}
     return {
         "max_entries": max(1, int(o.get("max_entries", MAX_TIER2_ENTRIES) or MAX_TIER2_ENTRIES)),
         "max_chars": max(50, int(o.get("max_chars", MAX_TIER2_CHARS) or MAX_TIER2_CHARS)),
-        "threshold": float(o.get("threshold", TIER2_SIM_THRESHOLD) or TIER2_SIM_THRESHOLD),
+        # ⚠️ 不能写 `float(x or DEFAULT)`：0 是合法配置（=不过滤，全收），
+        # 而 `0 or 0.35` 会把它悄悄变成 0.35，用户设的「阈值 0」永远不生效。
+        "threshold": _sim_threshold(o.get("threshold"), TIER2_SIM_THRESHOLD),
         "scan_msgs": max(1, int(o.get("scan_msgs", TIER2_SCAN_MSGS) or TIER2_SCAN_MSGS)),
         "lifecycle": o.get("lifecycle"),   # A2/A3：透传生命周期配置给检索核心
     }
@@ -534,7 +547,7 @@ def tier3_settings(override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "enabled": bool(o.get("enabled", TIER3_ENABLED)),
         "max_entries": max(1, int(o.get("max_entries", MAX_TIER3_ENTRIES) or MAX_TIER3_ENTRIES)),
         "max_chars": max(50, int(o.get("max_chars", MAX_TIER3_CHARS) or MAX_TIER3_CHARS)),
-        "threshold": float(o.get("threshold", TIER3_SIM_THRESHOLD) or TIER3_SIM_THRESHOLD),
+        "threshold": _sim_threshold(o.get("threshold"), TIER3_SIM_THRESHOLD),
         "scan_msgs": max(1, int(o.get("scan_msgs", TIER3_SCAN_MSGS) or TIER3_SCAN_MSGS)),
         "lifecycle": o.get("lifecycle"),   # A2/A3：透传生命周期配置给检索核心
     }
@@ -786,8 +799,31 @@ def _load_hit_stats(dir_key: Optional[Path] = None) -> Dict[str, Dict[str, Any]]
         data = json.loads(fp.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or data.get("version") != _HIT_STATS_VERSION:
             return {}
-        stats = data.get("stats")
-        return stats if isinstance(stats, dict) else {}
+        raw_stats = data.get("stats")
+        if not isinstance(raw_stats, dict):
+            return {}
+        # 逐条校验：手改或旧版本写坏一个条目（hits 变成字符串/负数、值不是对象）
+        # 会让 _bump_hits / 排序在渲染热路径上抛异常。坏的跳过，不影响其余。
+        stats: Dict[str, Dict[str, Any]] = {}
+        dropped = 0
+        for _k, _v in raw_stats.items():
+            if not isinstance(_v, dict):
+                dropped += 1
+                continue
+            try:
+                _hits = int(_v.get("hits") or 0)
+                _last = max(0, int(_v.get("last") or 0))
+            except (TypeError, ValueError):
+                dropped += 1
+                continue
+            if _hits < 0:
+                # 负数命中数是明确写坏了（不该 clamp 成 0 留着 —— 那会掩盖数据被改过）
+                dropped += 1
+                continue
+            stats[str(_k)] = {**_v, "hits": _hits, "last": _last}
+        if dropped:
+            logger.warning(f"[persona] 命中统计里有 {dropped} 条脏数据，已跳过（其余照用）")
+        return stats
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[persona] 命中统计读取失败，按空处理: {exc}")
         return {}
@@ -1424,6 +1460,9 @@ async def _vectorize(items: List[Dict[str, Any]], label: str, dir_key: Path,
     return vecs
 
 
+_LOAD_LOCK = asyncio.Lock()
+
+
 async def ensure_loaded(force: bool = False) -> None:
     """加载背景数据；文件 mtime 变化时自动重载，条目在此一次性向量化（2/3 档）。
 
@@ -1436,7 +1475,12 @@ async def ensure_loaded(force: bool = False) -> None:
     目录状态，绝不能被 LRU 淘汰（淘汰后 `_state()` 会拿到新建的空状态）。
     """
     with _pin_state():
-        await _ensure_loaded_impl(force)
+        # 串行化加载：并发调用（prompt 热路径 + WebUI 重载 + 后台任务）时，
+        # 同一目录会被两路同时判断成「需要重载」，进而**两路都去重嵌整库** ——
+        # 那是最贵的一次浪费（几百条 × 每批 3 条）。第二个调用进来时第一个已把
+        # state 填好，指纹命中就直接返回。
+        async with _LOAD_LOCK:
+            await _ensure_loaded_impl(force)
 
 
 def _entry_weight(item: Dict[str, Any]) -> int:
@@ -1839,10 +1883,27 @@ def _keyword_hits(
     for e in (items if items is not None else _state()["tier2"]):
         for kw in e.get("triggers") or []:
             k = str(kw).strip().lower()
-            if k and k in low:
+            if k and _kw_hit(k, low):
                 hits.append(e)
                 break
     return hits
+
+
+_ASCII_WORD_KW = re.compile(r"^[a-z0-9][a-z0-9 _\-]*$")
+
+
+def _kw_hit(k: str, low: str) -> bool:
+    """单个触发词是否命中。
+
+    纯 ASCII 的短触发词必须加词边界：子串匹配下 "ai" 会命中 said/wait/again、
+    "oc" 会命中 stock/block、数字 "5" 会命中 15/50 —— 英文群里的短词几乎必误命中。
+    中文触发词没有词边界概念，保持子串匹配（"雨天" 命中 "下雨天" 是想要的）。
+    """
+    if not k:
+        return False
+    if k.isascii() and _ASCII_WORD_KW.match(k):
+        return re.search(r"(?<![a-z0-9])" + re.escape(k) + r"(?![a-z0-9])", low) is not None
+    return k in low
 
 
 def _cos(a: List[float], b: List[float]) -> float:

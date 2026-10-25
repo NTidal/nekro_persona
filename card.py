@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib
 import io
 import math
+import threading
 import random
 import time
 import urllib.request
@@ -139,7 +140,19 @@ def _load_pil() -> Any | None:
     return None
 
 
+# 字体查找缓存的锁：卡片渲染可能在线程池里并发执行（图像生成），而
+# _font_cache / _font_key / _font_checked 是模块级可变状态 —— 无锁时两个线程
+# 可能同时走完查找并写入不一致的三元组（key 与 cache 不配对 → 换配置后命中错字体）。
+_FONT_LOCK = threading.RLock()
+
+
 def _find_font(font_path: str = "", font_dir: str = "") -> str | None:
+    """线程安全入口（实现见 _find_font_impl）。"""
+    with _FONT_LOCK:
+        return _find_font_impl(font_path, font_dir)
+
+
+def _find_font_impl(font_path: str = "", font_dir: str = "") -> str | None:
     """查找可用的中文字体文件路径，找不到返回 None。
 
     ⚠️ 缓存按 (font_path, font_dir) 做 key，且**只缓存成功结果**。
@@ -152,9 +165,19 @@ def _find_font(font_path: str = "", font_dir: str = "") -> str | None:
     if _font_checked and _font_key == _key:
         return _font_cache
 
+    # 显式指定的字体文件：只要存在就用，**不再按后缀过滤** ——
+    # 旧实现把显式路径和自动扫描混在一个循环里，`/path/MyFont`（无扩展名）
+    # 或 `.TTF` 之外的扩展名会被静默跳过，用户会以为自己配置没生效。
+    # 真打不开 PIL 会在加载阶段报错，比「静默忽略」好定位。
+    _explicit = font_path.strip()
+    if _explicit:
+        _ep = Path(_explicit)
+        if _ep.is_file():
+            _font_cache, _font_key, _font_checked = str(_ep), _key, True
+            return _font_cache
+        logger.warning(f"指定的字体文件不存在，继续自动查找：{_explicit}")
+
     candidates: list[str] = []
-    if font_path.strip():
-        candidates.append(font_path.strip())
     if font_dir.strip():
         candidates.append(font_dir.strip())
     candidates.extend(_FONT_CANDIDATES)
