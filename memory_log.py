@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -314,7 +315,10 @@ def _write_sync(doc: Dict[str, Any]) -> None:
 
 
 def _new_id() -> str:
-    return f"mem_{int(time.time() * 1000):x}_{int(time.time_ns() % 100000):05d}"
+    """毫秒时间 + 6 位随机：旧实现用 `time_ns() % 100000`，同一毫秒内多次调用
+    会撞（后台批量写入时确实会），而删除/强化都按 id 定位 —— 撞了就误删别人的条目。
+    """
+    return f"mem_{int(time.time() * 1000):x}_{uuid.uuid4().hex[:8]}"
 
 
 # ==================== 对外 API ====================
@@ -365,7 +369,11 @@ async def add_entries(items: List[Dict[str, Any]], scope: str,
                 skipped += 1
                 continue
             existing_titles.add(title[:24])
-            ev = int(it.get("event_at") or 0) or now
+            # event_at 钳制：LLM 可能给出未来时间（"2027-01-01"）或离谱的远古值。
+            # 未来时间会让这条记忆**永久**排在最前面（排序按 event_at 降序），
+            # 一直挤占注入名额；远古值则永远排在末尾。钳到 [now-10年, now]。
+            _raw_ev = _safe_int(it.get("event_at"), 0) or now
+            ev = min(now, max(now - 10 * 365 * 86400, _raw_ev))
             new_entries.append(MemEntry(
                 id=_new_id(),
                 scope=scope,

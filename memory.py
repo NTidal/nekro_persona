@@ -605,12 +605,75 @@ def load_favor_cfg() -> Dict[str, Any]:
         return {}
     try:
         data = json.loads(favor.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("根节点不是对象")
     except Exception as exc:  # noqa: BLE001
-        logger.error(f"[persona] favor.json 解析失败，已阻止加载: {exc}")
-        raise ValueError("favor.json 损坏，已阻止加载") from exc
-    if not isinstance(data, dict):
-        raise ValueError("favor.json 根节点必须是对象")
+        # ⚠️ 这里原来 raise：调用方（render_memory_block / 门控 / recall_test）没有全部兜住，
+        #    后果是**三档记忆一条都不注入**、整个检索降级，而注释写的是「门控降级」。
+        #    现在改成返回一份**保守**配置：只有一个档位、门槛极高 → 只解锁最低档
+        #    （注入最少、不会把高档位内容提前泄出去），其余记忆链路照常工作。
+        logger.error(f"[persona] favor.json 解析失败，门控降级为「只解锁最低档」: {exc}")
+        return {
+            "enabled": True,
+            "stages": [{"name": "降级", "max": 10 ** 9, "unlock_hint": ""}],
+            "rubric": {"items": [], "rules": []},
+            "avoid": {},
+            "stage_guides": {},
+            "_degraded": f"favor.json 解析失败: {str(exc)[:120]}",
+        }
     return data
+
+
+_STAGE_TABLE_CACHE: Dict[str, Any] = {"at": 0.0, "rows": []}
+
+
+def favor_stage_table() -> List[tuple]:
+    """(max, name, hint) 按 max 升序，供命令回执 / 排行榜 / 档案页共用。
+
+    为什么要一个统一入口：`plugin._stage_of()` 用的是**硬编码**档位表，而 WebUI 的
+    entries 页读 favor.json —— 用户在 WebUI 改了档位名或阈值后，两处显示就打架
+    （排行榜写「偏爱」，档案页写「亲近」）。这里把 favor.json 的 stages 收敛成表格，
+    带 5 秒 TTL 缓存（回执这类路径会频繁调用，不能每次都读盘）。
+    """
+    now = time.monotonic()
+    if now - float(_STAGE_TABLE_CACHE.get("at") or 0.0) < 5.0:
+        return list(_STAGE_TABLE_CACHE.get("rows") or [])
+    rows: List[tuple] = []
+    try:
+        cfg = load_favor_cfg()
+        guides = cfg.get("stage_guides") or {}
+        for st in (cfg.get("stages") or []):
+            if not isinstance(st, dict):
+                continue
+            name = str(st.get("name") or "").strip()
+            if not name:
+                continue
+            mx = _as_stage_max(st.get("max"))
+            if mx is None:
+                continue
+            hint = str(st.get("unlock_hint") or guides.get(name) or "").strip()
+            rows.append((mx, name, hint))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[persona] 档位表读取失败，回落内置: {exc}")
+        rows = []
+    rows.sort(key=lambda r: r[0])
+    _STAGE_TABLE_CACHE.update({"at": now, "rows": rows})
+    return list(rows)
+
+
+def _as_stage_max(value: Any) -> Optional[int]:
+    """档位 max 解析：坏值返回 None（跳过该档），绝不抛。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return None
 
 
 def _embed_source(e: Dict[str, Any]) -> str:

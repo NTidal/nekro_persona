@@ -38,6 +38,24 @@ _TIERS = ("tier1", "tier2", "tier3")
 _NO_KEY_WARNED = False
 
 
+async def _json_body(request: "Request") -> Dict[str, Any]:
+    """解析 JSON 请求体；非 JSON / 非法 JSON 统一转 400。
+
+    ⚠️ 12 个 POST 端点原先各自 `await request.json()`：客户端发空 body、表单编码或截断的
+    JSON 时 Starlette 抛 JSONDecodeError → 整个请求 500，前端只能看到「服务器错误」。
+    """
+    try:
+        data = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400,
+            detail=f"请求体必须是合法 JSON：{str(exc)[:120]}",
+        ) from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+    return data
+
+
 def _as_int(value: Any, default: int = 0) -> int:
     """把任意来源的值转成 int，坏值回落到 default（**绝不抛**）。
 
@@ -571,8 +589,19 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             return True
 
     def _data_error(exc: Exception) -> HTTPException:
+        """数据层异常 → 合适的 HTTP 状态码。
+
+        ⚠️ 旧实现用 `"ID" in message` 猜状态码：回收站的「记录不存在」等错误既不含 ID
+        也不含档位 → 一律 500，前端把「找不到」当成「服务器炸了」，用户只会反复重试。
+        """
         message = str(exc)
-        status = 409 if "ID" in message or "档位" in message else 500
+        if any(k in message for k in ("不存在", "找不到")):
+            status = 404
+        elif any(k in message for k in ("已存在", "重复", "ID", "档位")):
+            status = 409
+        else:
+            # 其余都是「数据/参数不合法」（格式错、缺字段、越界）→ 400 更准确
+            status = 400
         return HTTPException(status_code=status, detail=message)
 
     async def _reload_after_write() -> Dict[str, Any]:
@@ -935,7 +964,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     @router.post("/api/entry", summary="修改条目（门槛/启停/权重）")
     async def api_entry_update(request: Request) -> Dict[str, Any]:
         _check_key(request)
-        body = await request.json()
+        body = await _json_body(request)
         tier = str(body.get("tier") or "")
         eid = str(body.get("id") or "")
         if tier not in _TIERS or not eid:
@@ -1024,7 +1053,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     @router.post("/api/trash/restore", summary="恢复回收站条目")
     async def api_trash_restore(request: Request) -> Dict[str, Any]:
         _check_key(request)
-        body = await request.json()
+        body = await _json_body(request)
         trash_id = str(body.get("trash_id") or "")
         if not trash_id:
             raise HTTPException(status_code=400, detail="缺少 trash_id")
@@ -1038,7 +1067,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     @router.post("/api/trash/delete", summary="永久删除回收站条目")
     async def api_trash_delete(request: Request) -> Dict[str, Any]:
         _check_key(request)
-        body = await request.json()
+        body = await _json_body(request)
         trash_id = str(body.get("trash_id") or "")
         if not trash_id:
             raise HTTPException(status_code=400, detail="缺少 trash_id")
@@ -1172,7 +1201,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     @router.post("/api/score", summary="设置某用户好感度")
     async def api_score(request: Request) -> Dict[str, Any]:
         _check_key(request)
-        body = await request.json()
+        body = await _json_body(request)
         ck = str(body.get("chat_key") or "")
         uid = str(body.get("user_id") or "")
         if not ck or not uid:
@@ -1216,7 +1245,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                summary?, tags?, interaction_hint?, score?, reason?}
         """
         _check_key(request)
-        body = await request.json()
+        body = await _json_body(request)
         ck = str(body.get("chat_key") or "")
         uid = str(body.get("user_id") or "")
         if not ck or not uid:
@@ -1230,9 +1259,9 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         lock = await helpers["state_lock"](ck)
         async with lock:
             state = await helpers["load_state"](ck)
-            prof = state.profile_for(uid, "")
-            _before_score = int(prof.score)
-
+            # ⚠️ 不能在这里 profile_for：它会**现建**一份档案，
+            #    于是下面的「uid in profiles」永远为真 → 删一个不存在的用户也返回 ok，
+            #    而 404 分支成了死代码。建档挪到 update 分支里。
             if action == "delete":
                 profiles = getattr(state, "profiles", None)
                 if isinstance(profiles, dict) and uid in profiles:
@@ -1242,6 +1271,8 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     return {"ok": True, "action": "delete", "user_id": uid}
                 raise HTTPException(status_code=404, detail="该频道没有这个用户的档案")
 
+            prof = state.profile_for(uid, "")
+            _before_score = int(prof.score)
             changed: List[str] = []
             if "summary" in body:
                 prof.summary = " ".join(str(body["summary"] or "").split())[:200]
@@ -1492,7 +1523,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     @router.post("/api/memory_log", summary="关系记忆操作（delete）")
     async def api_memory_log_op(request: Request) -> Dict[str, Any]:
         _check_key(request)
-        body = await request.json()
+        body = await _json_body(request)
         op = str(body.get("op") or "").strip()
         memlog = helpers["memory_log"]
         if op == "delete":
@@ -1514,7 +1545,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         只读，不改任何数据。直接用 _match_tierN_text 纯文本核心（A7 解耦后无需 ctx）。
         """
         _check_key(request)
-        body = await request.json()
+        body = await _json_body(request)
         text = str(body.get("text") or "").strip()
         tier = "tier3" if str(body.get("tier") or "tier2") == "tier3" else "tier2"
         if not text:
@@ -1609,7 +1640,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     @router.post("/api/config", summary="修改插件配置（好感度衰减等）")
     async def api_config(request: Request) -> Dict[str, Any]:
         _check_key(request)
-        body = await request.json()
+        body = await _json_body(request)
         patch: Dict[str, Any] = {}
         limits = {
             "FAVOR_SCALE_MODE": (int, 1, 3),
@@ -1724,13 +1755,28 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         for k, v in patch.items():
             setattr(cfg, k, v)
         plugin.save_config(cfg)
-        plugin.logger.info(f"[persona] WebUI 修改配置: {patch}")
+        def _redact(d: Dict[str, Any]) -> Dict[str, Any]:
+            """日志脱敏：键名里带 KEY/TOKEN/SECRET/PASSWORD 的值一律打码。
+
+            ⚠️ 之前这里直接打整个 patch：用户改一次嵌入设置，
+            EMBED_API_KEY 就以明文进操作日志（日志常被导出、贴进 issue）。
+            """
+            out: Dict[str, Any] = {}
+            for _k, _v in d.items():
+                _ku = str(_k).upper()
+                if any(t in _ku for t in ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD")):
+                    out[_k] = "***" if _v else ""
+                else:
+                    out[_k] = _v
+            return out
+
+        plugin.logger.info(f"[persona] WebUI 修改配置: {_redact(patch)}")
         return {"ok": True, "patch": patch}
 
     @router.post("/api/gating", summary="修改好感度门控规则（档位/回避块/rubric）")
     async def api_gating(request: Request) -> Dict[str, Any]:
         _check_key(request)
-        body = await request.json()
+        body = await _json_body(request)
         patch: Dict[str, Any] = {}
         if "enabled" in body:
             patch["enabled"] = bool(body["enabled"])
@@ -1841,7 +1887,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     @router.post("/api/entry/new", summary="新建背景记忆条目")
     async def api_entry_new(request: Request) -> Dict[str, Any]:
         _check_key(request)
-        body = await request.json()
+        body = await _json_body(request)
         tier = str(body.get("tier") or "")
         if tier not in _TIERS:
             raise HTTPException(status_code=400, detail="tier 无效")
@@ -1998,7 +2044,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     @router.post("/api/memo", summary="新建 / 修改 / 删除频道笔记")
     async def api_memo_update(request: Request) -> Dict[str, Any]:
         _check_key(request)
-        body = await request.json()
+        body = await _json_body(request)
         await _tier4_writable_guard()
         chat_key = str(body.get("chat_key") or "")
         if not chat_key:
@@ -2111,7 +2157,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     @router.post("/api/tier4", summary="tier4 条目操作（delete / salience）")
     async def api_tier4_update(request: Request) -> Dict[str, Any]:
         _check_key(request)
-        body = await request.json()
+        body = await _json_body(request)
         await _tier4_writable_guard()
         t4 = helpers["tier4"]
         acfg = helpers["anchor_cfg"]()
@@ -2237,6 +2283,12 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     async def api_growth_import(request: Request) -> Dict[str, Any]:
         _check_key(request)
         body = await request.body()
+        _MAX_ZIP_BYTES = 32 * 1024 * 1024
+        if len(body) > _MAX_ZIP_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"导入包过大（{len(body) // 1024 // 1024} MB），上限 32 MB",
+            )
         if not body:
             raise HTTPException(status_code=400, detail="没有收到文件内容")
         import io as _io
@@ -2447,6 +2499,12 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     async def api_backup_import(request: Request) -> Dict[str, Any]:
         _check_key(request)
         body = await request.body()
+        _MAX_ZIP_BYTES = 32 * 1024 * 1024
+        if len(body) > _MAX_ZIP_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"导入包过大（{len(body) // 1024 // 1024} MB），上限 32 MB",
+            )
         if not body:
             raise HTTPException(status_code=400, detail="没有收到文件内容")
         import io as _io

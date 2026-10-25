@@ -72,7 +72,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.2.8",
+    version="2.2.9",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -685,6 +685,17 @@ def _ago_text(timestamp: int) -> str:
     return f"{span // 86400}d ago"
 
 
+# 内置档位的默认语气（favor.json 没配 unlock_hint / stage_guides 时兜底）
+_DEFAULT_STAGE_HINT = {
+    "特别亲密": "可使用显著亲密与偏爱语气，但仍需遵守角色边界。",
+    "偏爱": "可明显更热情，主动照顾对方体验并记住其偏好。",
+    "亲近": "可以更自然、更积极地回应，适度体现熟悉感。",
+    "中立": "正常友好互动，不主动施加亲密语气。",
+    "保留": "维持礼貌但克制，先观察，不要过度投入。",
+    "排斥": "保持距离，谨慎回应，必要时明确边界。",
+}
+
+
 def _stage_of(score: int) -> tuple[str, str]:
     """分数 → (档位名, 该档位的默认语气)。
 
@@ -693,10 +704,21 @@ def _stage_of(score: int) -> tuple[str, str]:
     注意 -20 属于「保留」、-60 属于「排斥」——判定写成降序级联，
     与配置里的 max 语义（`max=-20` 表示 ≤-20 是保留档）对齐。
 
-    这是**内置兜底**：注入用的档位指引来自 favor.json（WebUI 可改），
-    此处只服务于命令回执、排行榜等不读配置的场景。
+    ⚠️ 口径统一（v2.2.9）：优先用 favor.json 里配置的 stages（WebUI 可改名/改阈值），
+    这样命令回执、排行榜、档案页、注入预览四处显示一致；配置缺失或损坏时才回落到
+    下面的内置表。缓存由 memory.favor_stage_table() 负责（5s TTL）。
     """
     value = int(score)
+    try:
+        rows = persona_memory.favor_stage_table()
+    except Exception:  # noqa: BLE001
+        rows = []
+    if rows:
+        for _mx, _name, _hint in rows:
+            if value <= _mx:
+                return _name, (_hint or _DEFAULT_STAGE_HINT.get(_name, "正常友好互动。"))
+        _mx, _name, _hint = rows[-1]
+        return _name, (_hint or _DEFAULT_STAGE_HINT.get(_name, "正常友好互动。"))
     if value >= 85:
         return "特别亲密", "可使用显著亲密与偏爱语气，但仍需遵守角色边界。"
     if value >= 60:
@@ -2360,13 +2382,19 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
         pass
 
     # ① 关系卡（原好感度插件逻辑，保持原样）
-    state = await _open_archive(_ctx.chat_key)
-    current_user_id = (_ctx.from_platform_userid or state.last_active_user_id or "").strip()
-    profile = state.profiles.get(current_user_id) if current_user_id else None
-    if profile is not None:
-        parts.append(_compose_archive_card(profile, current=True))
-    else:
-        parts.append(_compose_overview_card(state))
+    # ⚠️ 第 ②③ 段都有 try/except，唯独这段没有：档案读取或渲染抛一次异常，
+    #    整块注入（含后面两段）全部丢掉。这里补上同款兜底，坏一段不影响其余。
+    profile = None
+    try:
+        state = await _open_archive(_ctx.chat_key)
+        current_user_id = (_ctx.from_platform_userid or state.last_active_user_id or "").strip()
+        profile = state.profiles.get(current_user_id) if current_user_id else None
+        if profile is not None:
+            parts.append(_compose_archive_card(profile, current=True))
+        else:
+            parts.append(_compose_overview_card(state))
+    except Exception as exc:  # noqa: BLE001
+        plugin.logger.warning(f"[persona] 关系卡渲染失败，本轮跳过第①段: {exc}")
 
     # ② 阶梯记忆（按好感度门控披露深度）
     # favor.json 损坏时 load_favor_cfg 会 raise（fail-closed 是对的：不能拿坏配置
@@ -2916,6 +2944,9 @@ async def save_note(
 
     ⚠️ 笔记是**你自己的内部记录**，不是聊天内容。
     记完后请在同一次回复里用 `send_msg_text` 正常回应对方，并且**绝不要把笔记原文发出去**。
+
+    ⚠️ 本工具是 TOOL 类型：它的返回值**只给你看，不会出现在聊天里**。
+    所以「已记下」这类回执绝不能当成对用户的答复 —— 同一回复里必须还有真正的说话内容。
 
     Args:
         title (str): 简短标题，同时作为检索关键词，建议 4~12 字
@@ -3949,6 +3980,16 @@ async def _memlog_loop() -> None:
                     plugin.logger.info(f"[memory_log] 新采集素材 {scanned} 条")
             except Exception as exc:  # noqa: BLE001
                 plugin.logger.warning(f"[memory_log] 素材扫描异常（已隔离）: {exc}")
+
+            # 顺手清过期笔记：TTL 到期的 note 以前没有任何清理入口，
+            # 只会越堆越多（每条都在注入候选里被过滤，但文件无限增长）。
+            # 每轮问一次，内部有「没有过期条目就秒返回」的快路径。
+            try:
+                _cleared = await tier4.clear_expired_notes()
+                if _cleared:
+                    plugin.logger.info(f"[memory_log] 顺带清理过期笔记 {_cleared} 条")
+            except Exception as exc:  # noqa: BLE001
+                plugin.logger.debug(f"[memory_log] 过期笔记清理跳过: {exc}")
 
             now = time.time()
             ready = persona_consolidator.buckets_ready(now)
