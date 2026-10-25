@@ -4138,6 +4138,10 @@ async function loadRules() {
   if (state.dirty && state.dirtyPage === 'rules') return;
   const data = await load('overview', () => MOCK.overview());
   if (!data) return;
+  // ⚠️ 必须回写：阶段行的分档互动指引由 g_stageGuide() 从 state.overview 取，
+  //    不回写就只能拿到空串（真实实例里 MOCK 也不参与）→ textarea 显示为空 →
+  //    用户点「保存规则」时把后端真实的 stage_guides 覆盖成空串。
+  state.overview = data;
   const g = data.gating || {};
   $('#gatingEnabled').checked = !!g.enabled;
   renderStages(g.stages || []);
@@ -4197,11 +4201,13 @@ function g_stageGuide(name) {
 
 $('#stageList').addEventListener('click', (e) => {
   if (!e.target.closest('[data-act="del"]')) return;
+  setDirty(true, 'rules');          // click 驱动的结构变更：不置脏就会静默丢失
   e.target.closest('.stage-row').remove();
   if (!$('#stageList').children.length) $('#stageList').innerHTML = '<div class="empty-inline">暂无阶段</div>';
   updateRulesPreview();
 });
 $('#stageAddBtn').addEventListener('click', () => {
+  setDirty(true, 'rules');
   const list = $('#stageList');
   const rows = $$('#stageList .stage-row');
   const maxes = rows.map((r) => Number(r.querySelector('[data-k="max"]').value || 0));
@@ -4259,12 +4265,14 @@ function renderRubric(rubric) {
 }
 $('#rubricList').addEventListener('click', (e) => {
   if (!e.target.closest('[data-act="del"]')) return;
+  setDirty(true, 'rules');
   const row = e.target.closest('.rubric-item');
   if (row) row.remove();
   if (!$$('#rubricList .rubric-item').length) $('#rubricList').innerHTML = RUBRIC_EMPTY;
   updateRulesPreview();
 });
 $('#rubricAddBtn').addEventListener('click', () => {
+  setDirty(true, 'rules');
   const list = $('#rubricList');
   if (!$$('#rubricList .rubric-item').length) list.innerHTML = '';
   const wrap = document.createElement('div');
@@ -5587,10 +5595,14 @@ const FX = (() => {
 
 /* 包装：翻页转场 + 撒花 */
 const _goto = goto;
-goto = function (tab) {
+goto = function (tab, opts) {
   FX.veil();
-  _goto(tab);
+  // ⚠️ 必须透传 opts 并**返回** Promise：顶栏「刷新当前页」依赖
+  //    `await goto(state.tab, { fresh: true })` —— 漏了参数则缓存永不失效（刷出旧数据），
+  //    不返回则 proceeded 恒为 undefined（「已刷新」提示永不出现、取消也无法生效）。
+  const done = _goto(tab, opts);
   FX.replay();
+  return done;
 };
 const _mutate = mutate;
 mutate = async function (...args) {

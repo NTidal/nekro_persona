@@ -82,6 +82,38 @@ def _validate_tier_entries(entries: List[Any]) -> str:
             if not isinstance(v, list) or any(not isinstance(t, str) for t in v):
                 return f"第 {i} 条 triggers 必须是字符串数组"
     return ""
+def _validate_favor_cfg(data: Any) -> str:
+    # 校验 favor.json 的形状，返回第一处问题（空串 = 通过）。
+    # 原先只检查 `"stages" in data`，于是 {"stages": "abc"} 也能通过并写盘；之后概览页
+    # 与门控渲染都会对字符串调 .get() 抛 AttributeError，那两处不在 try 内 →
+    # 整条 persona_prompt 处理链路挂掉，只能重写 gating 才能解锁。
+    if not isinstance(data, dict):
+        return "顶层必须是对象"
+    stages = data.get("stages")
+    if not isinstance(stages, list) or not stages:
+        return "stages 必须是非空数组"
+    for i, st in enumerate(stages, 1):
+        if not isinstance(st, dict):
+            return f"stages 第 {i} 项不是对象"
+        if not isinstance(st.get("name", ""), str):
+            return f"stages 第 {i} 项 name 不是字符串"
+        mx = st.get("max")
+        if mx is not None:
+            ok_num = isinstance(mx, (int, float)) and not isinstance(mx, bool)
+            if not ok_num:
+                try:
+                    int(float(str(mx)))
+                except (TypeError, ValueError):
+                    return f"stages 第 {i} 项 max 不是数字：{mx!r}"
+        for key in ("unlock_hint", "guide", "desc"):
+            if key in st and st[key] is not None and not isinstance(st[key], str):
+                return f"stages 第 {i} 项 {key} 不是字符串"
+    for key in ("rubric", "avoid", "scale", "decay", "lifecycle", "memo", "stage_guides"):
+        if key in data and data[key] is not None and not isinstance(data[key], dict):
+            return f"{key} 必须是对象"
+    return ""
+
+
 _TIER_LABEL = {"tier1": "1 档·身份", "tier2": "2 档·往事", "tier3": "3 档·世界知识"}
 
 
@@ -233,7 +265,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         return len(f"· {trigger}\n  {content}") if trigger else len(f"· {content}")
 
     # 可写字段（扩展：上游只允许 min_favor/enabled/weight）
-    _WRITABLE = ("min_favor", "enabled", "weight", "title", "trigger", "triggers", "content")
+    # ⚠️ 必须与 api_entry_update 里接受的字段一一对应：漏一个就会出现
+    #    「接口接受 + 回显成功 + 磁盘从未写入」的假成功（familiarity 就是这么丢的）。
+    _WRITABLE = ("min_favor", "enabled", "weight", "title", "trigger", "triggers",
+                 "content", "familiarity")
 
     def _dump(fp: Path, data: Dict[str, Any]) -> None:
         """带备份的原子 JSON 写入。"""
@@ -2156,7 +2191,28 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
 
         applied: List[str] = []
 
-        # 1) tier4.json —— 校验后覆盖
+        # 0) archives.json **先解析校验**：早先是「tier4 先覆盖写盘，再解析 archives」，
+        #    后者坏 JSON 时返回 400「整体拒绝」，但 tier4 已经换血了。
+        arch_src = next((n for n in names if n == "archives.json"), None)
+        arch_items: List[tuple] = []
+        if arch_src:
+            try:
+                arch_obj = json.loads(zf.read(arch_src).decode("utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=400, detail=f"archives.json 不是合法 JSON：{exc}") from exc
+            if not isinstance(arch_obj, dict):
+                raise HTTPException(status_code=400, detail="archives.json 顶层必须是对象（chat_key → 档案）")
+            for ck, blob in arch_obj.items():
+                # 结构校验：缺 profiles 的 blob 会让 _open_archive 解析失败 → 按空档案继续
+                # → 下一次 _store_archive 用空档案覆盖原始数据，等于清空该频道的档案。
+                if not isinstance(blob, dict) or not isinstance(blob.get("profiles"), dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"archives.json 里 {ck} 的结构不对（缺 profiles 对象），已拒绝导入",
+                    )
+                arch_items.append((str(ck), blob))
+
+        # 1) tier4.json —— 校验后覆盖（原子写：tmp + os.replace）
         t4_src = next((n for n in names if n.endswith("tier4.json")), None)
         if t4_src:
             raw = zf.read(t4_src)
@@ -2166,23 +2222,21 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 raise HTTPException(status_code=400, detail=f"tier4.json 不是合法 JSON：{exc}") from exc
             if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
                 raise HTTPException(status_code=400, detail="tier4.json 结构不对（缺 entries）")
-            t4.tier4_path().write_bytes(raw)
+            _t4p = t4.tier4_path()
+            _tmp = _t4p.with_suffix(_t4p.suffix + ".tmp")
+            _tmp.write_bytes(raw)
+            os.replace(_tmp, _t4p)      # 原子替换：写一半崩掉也不会毁掉既有 tier4
             applied.append(f"tier4.json（{len(data['entries'])} 条）")
 
-        # 2) archives.json —— 原样回填各频道关系档案（仅 store 档案键，不碰种子/文件）
-        arch_src = next((n for n in names if n == "archives.json"), None)
-        if arch_src:
-            try:
-                arch_obj = json.loads(zf.read(arch_src).decode("utf-8"))
-            except Exception as exc:  # noqa: BLE001
-                raise HTTPException(status_code=400, detail=f"archives.json 不是合法 JSON：{exc}") from exc
-            n_arch = 0
-            if isinstance(arch_obj, dict):
-                for ck, blob in arch_obj.items():
-                    if not isinstance(blob, dict):
-                        continue
-                    await helpers["write_archive"](str(ck), json.dumps(blob, ensure_ascii=False))
-                    n_arch += 1
+        # 2) archives.json —— 回填各频道关系档案（只写 store 档案键，不碰种子/文件）
+        #    ⚠️ 必须逐频道取 per-chat 锁：导入期间该频道可能正在收消息（sync_user_profile
+        #    在锁内 read-modify-write）或被衰减循环结算，裸写就是 last-writer-wins 丢分。
+        n_arch = 0
+        for _ck, _blob in arch_items:
+            async with await helpers["state_lock"](_ck):
+                await helpers["write_archive"](_ck, json.dumps(_blob, ensure_ascii=False))
+            n_arch += 1
+        if arch_items:
             applied.append(f"关系档案（{n_arch} 频道）")
 
         # 3) 热度（.hit_stats.json）**不迁移** —— 见 api_growth_export 的说明。
@@ -2320,8 +2374,12 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=f"{arc} 不是合法 JSON：{exc}")
             if arc == "favor.json":
-                if not isinstance(data, dict) or "stages" not in data:
-                    raise HTTPException(status_code=400, detail=f"{arc} 缺少 stages，拒绝导入")
+                _favor_bad = _validate_favor_cfg(data)
+                if _favor_bad:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{arc} 校验失败：{_favor_bad}（已拒绝导入，未改动任何文件）",
+                    )
                 n = -1
             else:
                 if not isinstance(data, dict) or not isinstance(data.get("entries"), list):

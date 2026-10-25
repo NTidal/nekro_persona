@@ -916,7 +916,13 @@ def effective_rank(entry: Dict[str, Any], tier: int, now: float, lc: Dict[str, A
     # ⚠️ 只对 None 回落：`or 1` 会把合法的 weight=0 吞成 1
     _wv = entry.get("weight", 1)
     w = float(1 if _wv is None else _wv)
-    if not lc.get("enabled") or w >= float(lc["protect_weight"]):
+    if not lc.get("enabled"):
+        return w
+    # ⚠️ protect_weight=0 在 README 里是「不豁免任何条目」的合法值；
+    #    直接写 `w >= 0` 会让所有非负 weight 恒真 → 全部豁免，
+    #    热度排序整体退化成纯 weight 序（正好是文档承诺的反面）。
+    _protect = float(lc["protect_weight"])
+    if _protect > 0 and w >= _protect:
         return w
     stat = _state()["hit_stats"].get(_hit_key(tier, str(entry.get("id", ""))))
     return w * heat_factor(stat, now, lc)
@@ -950,7 +956,14 @@ def _embed_retry_after(resp, attempt: int) -> float:
         ra = 0.0
     exp = min(20.0, 0.8 * (2 ** attempt))
     jitter = random.uniform(0.0, 0.25 * exp) if exp else 0.0
-    return max(ra, exp) + jitter
+    # ⚠️ 必须**先合再封顶**：`max(ra, exp)` 会让服务端返回的 `Retry-After: 3600`
+    #    绕过 docstring 承诺的 20s 封顶，5 次重试能把检索协程挂住近 5 小时，
+    #    而且因为一直不返回，降级告警也不会触发。服务端要更长的等待就记一笔日志。
+    wait = max(ra, exp) + jitter
+    if wait > 20.0:
+        logger.warning(f"[persona] 服务端要求 {ra:.0f}s 后重试，按 20s 封顶（避免挂住检索）")
+        wait = 20.0
+    return wait
 
 
 async def _embed_post(client, url: str, headers: Dict[str, str],
@@ -1357,6 +1370,22 @@ async def ensure_loaded(force: bool = False) -> None:
         await _ensure_loaded_impl(force)
 
 
+def _entry_weight(item: Dict[str, Any]) -> int:
+    """安全取条目权重。
+
+    ⚠️ 旧实现在**加载期**直接 `int(x.get("weight", 1))`：`weight: null` 抛 TypeError、
+    `"0.5"` 抛 ValueError，而异常发生在 `loaded` 置位之前 → 每轮渲染都重跑、每轮都炸，
+    外层兜底之后 1/2/3 档**全部失效**。与 effective_rank 同口径：只对 None 回落。
+    """
+    v = item.get("weight", 1)
+    if v is None:
+        return 1
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 1
+
+
 async def _ensure_loaded_impl(force: bool = False) -> None:
     st = _state()
     mk = _mtime_key()
@@ -1364,11 +1393,11 @@ async def _ensure_loaded_impl(force: bool = False) -> None:
         return
 
     t1 = _read_dir(_tier1_dir())
-    t1.sort(key=lambda x: -int(x.get("weight", 1)))
+    t1.sort(key=lambda x: -_entry_weight(x))
     t2 = _read_dir(_tier2_dir())
-    t2.sort(key=lambda x: -int(x.get("weight", 1)))
+    t2.sort(key=lambda x: -_entry_weight(x))
     t3 = _read_dir(_tier3_dir())
-    t3.sort(key=lambda x: -int(x.get("weight", 1)))
+    t3.sort(key=lambda x: -_entry_weight(x))
     # 先验证门控配置，避免坏 favor.json 被当成空配置继续运行。
     load_favor_cfg()
 
@@ -1877,12 +1906,31 @@ async def _match_tier3_text(
         text, items, _state()["tier3_vecs"], cfg.get("threshold", TIER3_SIM_THRESHOLD),
     )
     merged: Dict[str, ScoredEntry] = {}
+    # ⚠️ 与 2 档同款防护（2 档那侧为实测踩坑补的，这里原先漏了）：
+    #    `str(e.get("id"))` 会把缺 id 的条目全压成 "None"、只留最后一条；
+    #    重复 id 也会互相覆盖 —— 3 档会静默少几条候选。
+    def _k3(entry: Dict[str, Any]) -> str:
+        rid = str(entry.get("id") or "").strip()
+        return rid or f"__noid_{id(entry)}"
+
+    def _uniq3(base: str) -> str:
+        if base not in merged:
+            return base
+        n = 2
+        while f"{base}#{n}" in merged:
+            n += 1
+        return f"{base}#{n}"
+
+    def _seen3(base: str) -> bool:
+        return any(k == base or k.startswith(base + "#") for k in merged)
+
     for e in kw:
-        merged[str(e.get("id"))] = (1.0, "keyword", e)
+        merged[_uniq3(_k3(e))] = (1.0, "keyword", e)
     for sc, e in vh:
-        k = str(e.get("id"))
-        if k not in merged:
-            merged[k] = (float(sc), "vector", e)
+        base = _k3(e)
+        if _seen3(base):
+            continue
+        merged[_uniq3(base)] = (float(sc), "vector", e)
     if not merged:
         return [], ""
     src = "mixed" if (kw and vh) else ("keyword" if kw else "vector")

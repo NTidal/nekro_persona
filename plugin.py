@@ -71,7 +71,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.2.1",
+    version="2.2.2",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -1590,6 +1590,14 @@ class ChannelArchive:
     archives: Dict[str, UserArchive] = field(default_factory=dict)
     last_active_user_id: str = ""
     memos_migrated: bool = False
+    # 删除墓碑：uid → {at, score, day_net, day_key, last_adjust_at}
+    # ⚠️ 存在的理由：`set_favorability_profile` 对「新档案」豁免全部防刷约束，
+    #    于是「先删掉、再重建」就能把分数直接写到上限。墓碑让删除后 24h 内的重建
+    #    仍按「对已有档案改分」处理，并沿用被删档案的当日预算与间隔锚点。
+    purged: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # 删除操作的时间戳日志（限流用）。不能只靠 purged 计次：它按 uid 建键，
+    # 同一个用户反复「删了重建」只会覆盖同一条，限流形同虚设。
+    purge_log: List[int] = field(default_factory=list)
 
     @staticmethod
     def from_raw(raw: object) -> "ChannelArchive":
@@ -1599,6 +1607,14 @@ class ChannelArchive:
             state.archives[str(uid)] = UserArchive.from_raw(str(uid), item)
         state.last_active_user_id = str(data.get("last_active_user_id") or "")
         state.memos_migrated = bool(data.get("memos_migrated") or False)
+        _purged = data.get("purged")
+        if isinstance(_purged, dict):
+            state.purged = {
+                str(k): dict(v) for k, v in _purged.items() if isinstance(v, dict)
+            }
+        _log = data.get("purge_log")
+        if isinstance(_log, list):
+            state.purge_log = [int(x) for x in _log if isinstance(x, (int, float))]
         return state
 
     def to_raw(self) -> Dict[str, object]:
@@ -1608,6 +1624,10 @@ class ChannelArchive:
         }
         if self.memos_migrated:
             out["memos_migrated"] = True
+        if self.purged:
+            out["purged"] = {k: dict(v) for k, v in self.purged.items()}
+        if self.purge_log:
+            out["purge_log"] = list(self.purge_log)
         return out
 
     @property
@@ -2669,6 +2689,19 @@ async def set_favorability_profile(
         state = await _open_archive(_ctx.chat_key)
         is_new = resolved_user_id not in state.profiles
         profile = state.profile_for(resolved_user_id, display_name=display_name)
+        # ⚠️ 「删档案再重建」不能算初始化：is_new 会豁免全部约束（索要拦截 / 最小间隔 /
+        #    每日净上限），于是「删掉再建一个 100 分」就能绕过整套防刷。
+        #    删除时留了墓碑，24h 内重建沿用被删档案的预算与间隔锚点。
+        _purge = (getattr(state, "purged", None) or {}).get(resolved_user_id) or {}
+        if is_new and _purge and (_ts_now() - int(_purge.get("at") or 0)) <= 86400:
+            is_new = False
+            profile.day_key = int(_purge.get("day_key") or 0)
+            profile.day_net = int(_purge.get("day_net") or 0)
+            profile.last_adjust_at = int(_purge.get("last_adjust_at") or 0)
+            plugin.logger.info(
+                f"[favorability] 删档后重建，沿用被删档案的预算: user={resolved_user_id} "
+                f"day_net={profile.day_net} 距删除 {_ts_now() - int(_purge.get('at') or 0)}s",
+            )
 
         # ---- 约束层（v1.4.1）：堵住 set_profile 绕过 adjust 防刷体系的旁路 ----
         # 原先本工具直接 reset_to，无间隔 / 日限 / 索要检测，模型可反复重设刷分，
@@ -2775,7 +2808,33 @@ async def remove_favorability_profile(
         state = await _open_archive(_ctx.chat_key)
         if resolved_user_id not in state.profiles:
             return f"本频道没有 `{resolved_user_id}` 的关系档案。"
+        # 删除是模型可调的方法，且「删了重建」曾是绕过防刷的旁路：
+        #   ① 限流：一小时内最多删 3 份，避免「删→建→删→建」高频试探；
+        #   ② 墓碑：留下被删档案的分数与当日预算，供重建时沿用（见 set_favorability_profile）。
+        _now = _ts_now()
+        if not isinstance(getattr(state, "purged", None), dict):
+            state.purged = {}
+        _purged = state.purged
+        if not isinstance(getattr(state, "purge_log", None), list):
+            state.purge_log = []
+        _log = state.purge_log
+        _log[:] = [int(t) for t in _log if _now - int(t) <= 172800]
+        _recent = sum(1 for t in _log if _now - int(t) < 3600)
+        if _recent >= 3:
+            return "本次未删除：一小时内已删除 3 份档案，操作过于频繁，请稍后再试。"
         gone = state.profiles.pop(resolved_user_id)
+        state.purge_log.append(int(_now))
+        _purged[resolved_user_id] = {
+            "at": _now,
+            "score": int(gone.score),
+            "day_key": int(getattr(gone, "day_key", 0) or 0),
+            "day_net": int(getattr(gone, "day_net", 0) or 0),
+            "last_adjust_at": int(getattr(gone, "last_adjust_at", 0) or 0),
+        }
+        # 墓碑只保留 48h，避免无限增长
+        for _uid in [k for k, v in _purged.items()
+                     if not isinstance(v, dict) or _now - int(v.get("at") or 0) > 172800]:
+            _purged.pop(_uid, None)
         if state.last_active_user_id == resolved_user_id:
             state.last_active_user_id = ""
         await _store_archive(_ctx.chat_key, state)
