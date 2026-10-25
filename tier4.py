@@ -1026,7 +1026,9 @@ def render_note_block(
         used += len(blk)
     if not lines:
         return guide_text if guide_always else ""
-    return guide_text + "\n" + "\n".join(lines)
+    # 与 render_anchor_block 统一：有 guide 才拼接，避免 guide 为空时文本以 "\n" 开头
+    body = "\n".join(lines)
+    return f"{guide_text}\n{body}" if guide_text else body
 
 
 async def add_or_update_note(

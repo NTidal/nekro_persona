@@ -803,9 +803,22 @@ def _load_avatar_image(PIL: Any, user_id: str, avatar_dir: str):
                 data = resp.read()
             if len(data) < 100:
                 continue
+            # 先解析再落盘：下载到半张图/错误页时直接当失败（旧实现先 write_bytes，
+            # 坏文件会一直留在缓存里，之后 7 天内每次打开都失败）。
+            img = PIL.Image.open(io.BytesIO(data)).convert("RGB")
             Path(avatar_dir).mkdir(parents=True, exist_ok=True)
-            fp.write_bytes(data)
-            return PIL.Image.open(io.BytesIO(data)).convert("RGB")
+            # 原子写：并发渲染同一用户时不会互相截断
+            tmp = fp.with_suffix(".jpg.tmp")
+            try:
+                tmp.write_bytes(data)
+                tmp.replace(fp)
+            except Exception:  # noqa: BLE001
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+            return img
         except Exception:  # noqa: BLE001
             continue
     return None

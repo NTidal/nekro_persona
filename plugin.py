@@ -72,7 +72,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.2.9",
+    version="2.2.10",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -1766,6 +1766,14 @@ async def _best_effort_user_id(_ctx: schemas.AgentCtx) -> str:
         return ""
 
 
+# 无法确定目标用户时的统一回执（不抛异常、不推 SYSTEM 消息）
+_NO_TARGET_HINT = (
+    "这次没法确定要记在谁头上：本轮不是由某位用户的消息触发（可能是定时提醒或系统消息），"
+    "当前频道也没有可参考的最近互动用户。"
+    "如果你确实要操作某人的档案，请显式传 target_user_id；否则直接正常回应用户即可，不要重试。"
+)
+
+
 async def _resolve_target_user_id(_ctx: schemas.AgentCtx, target_user_id: str) -> str:
     """解析目标用户 ID。
 
@@ -1799,11 +1807,11 @@ async def _resolve_target_user_id(_ctx: schemas.AgentCtx, target_user_id: str) -
     except Exception as e:  # noqa: BLE001
         plugin.logger.warning(f"[favorability] 读取最近活跃用户失败: {e}")
 
-    raise ValueError(
-        "无法确定要调整好感度的对象：本次对话不是由某位用户的消息触发"
-        "（可能来自定时提醒或系统消息），且当前频道没有可参考的最近互动用户。"
-        "请显式传入 target_user_id，或改用 send_msg_text 回应，不要重试本工具。",
-    )
+    # ⚠️ 不抛异常：这几个是 AGENT 类沙盒方法，抛出的异常会被 NA 渲染成一条
+    #    "SYSTEM] None" 消息推给用户（实测很难看），而且整轮脚本还会重跑一次。
+    #    改为返回空串，由调用方转成一句可读回执。
+    plugin.logger.info("[favorability] 无法确定目标用户，已回空（由调用方给可读回执）")
+    return ""
 
 
 def _pick_explicit_target(context: CommandExecutionContext, target_user_id: str) -> str:
@@ -2558,6 +2566,8 @@ async def adjust_favorability(
     #    target_user_id，会把它绑成 int，随后 .strip() 抛 AttributeError，
     #    这次加分静默丢失。调整顺序后位置调用天然正确。
     resolved_user_id = await _resolve_target_user_id(_ctx, target_user_id)
+    if not resolved_user_id:
+        return _NO_TARGET_HINT
     cleaned_reason = _one_line(reason, 160)
     # 校验失败一律 return 字符串：raise 会让 NA 把失败时的 None 当系统消息发到聊天里
     if len(cleaned_reason) == 0:
@@ -2749,6 +2759,8 @@ async def set_favorability_profile(
         return "本次未重设：score 必须是整数（例如 60）。"
     score = _score_int
     resolved_user_id = await _resolve_target_user_id(_ctx, target_user_id)
+    if not resolved_user_id:
+        return _NO_TARGET_HINT
     kept_summary = _one_line(summary, 240)
     if not kept_summary:
         return "本次未重设：必须提供 summary。"
@@ -2883,6 +2895,8 @@ async def remove_favorability_profile(
     if args and not target_user_id:
         target_user_id = str(args[0])
     resolved_user_id = await _resolve_target_user_id(_ctx, target_user_id)
+    if not resolved_user_id:
+        return _NO_TARGET_HINT
     async with await _archive_lock(_ctx.chat_key):
         state = await _open_archive(_ctx.chat_key)
         if resolved_user_id not in state.profiles:
@@ -3182,6 +3196,8 @@ async def get_favorability_profile(
     if args and not target_user_id:
         target_user_id = str(args[0])
     resolved_user_id = await _resolve_target_user_id(_ctx, target_user_id)
+    if not resolved_user_id:
+        return _NO_TARGET_HINT
     state = await _open_archive(_ctx.chat_key)
     found = state.profiles.get(resolved_user_id)
     if found is None:
