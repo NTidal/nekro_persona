@@ -2110,7 +2110,9 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             _raw_tags = [x.strip() for x in _raw_tags.replace("，", ",").split(",")]
         tags = [str(x).strip()[:12] for x in _raw_tags if str(x).strip()][:6]
         try:
-            min_favor = max(0, min(100, int(body.get("min_favor") or 0)))
+            # ⚠️ 别再硬编码 100：MAX_ABS_SCORE 可配置（条目编辑器早就跟着 maxAbsSafe()
+            #    走了）。夹到 100 会让配成 200 的部署里笔记门槛最高只能填 100。
+            min_favor = max(0, min(helpers["max_abs_score"](), int(body.get("min_favor") or 0)))
             ttl_hours = max(0, int(body.get("ttl_hours") or 0))
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="门槛与有效期需为整数") from exc
