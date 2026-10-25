@@ -201,6 +201,9 @@ html.theming dialog {
 }
 .brand { display: flex; align-items: center; gap: 13px; min-width: 0; }
 .brand-mark {
+  /* ::after 高光是 position:absolute; inset:-3px —— 父级没有定位就锚到最近的有定位
+     祖先（通常就是文档），表现为「悬停时整页泛一层拦环」+ 3px 溢出。 */
+  position: relative;
   display: grid;
   flex: 0 0 auto;
   width: 40px;
@@ -4481,7 +4484,12 @@ $('#previewPresets').addEventListener('click', (e) => {
   $('#previewScoreOut').textContent = state.previewScore;
   _schedulePreview();
 });
-$('#previewChannel').addEventListener('change', (e) => { state.previewChannel = e.target.value; });
+$('#previewChannel').addEventListener('change', (e) => {
+  state.previewChannel = e.target.value;
+  // 换频道必须重渲：否则页面上留着上一个频道的注入预览，
+  // 用户以为在看新频道的内容（只有已渲染过才会重跑，见 _schedulePreview）。
+  _schedulePreview();
+});
 
 async function runPreview() {
   const chatKey = $('#previewChannel').value;

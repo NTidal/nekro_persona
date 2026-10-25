@@ -234,6 +234,22 @@ def _norm_content(content: str) -> str:
     return " ".join(str(content or "").lower().split())
 
 
+# salience 的硬上限（配置上限是 5；这里再兜一层，防止手改/导入写出离谱值）
+_SALIENCE_HARD_MAX = 5
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """任意值 → int，坏值回落 default（绝不抛）。与 webui._as_int 同款语义。"""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------------- 数据模型 ----------------
 @dataclass
 class Tier4Entry:
@@ -258,6 +274,13 @@ class Tier4Entry:
 
     @classmethod
     def from_raw(cls, data: Dict[str, Any]) -> "Tier4Entry":
+        """宽松解析（运行期用）：坏字段回落默认值，但**排序不变量必须钳住**。
+
+        ⚠️ 旧实现八处裸 `int()`：`salience: "3"` 之外的任何坏值（"高"/null/对象）
+        都会抛 ValueError，而调用点在 `_read_tier4_sync` 顶层 —— 一个字段坏掉整份
+        tier4 判为损坏、所有锚点与笔记都读不出来；反过来 `salience: 0` 或 `99` 又能
+        通过，把「核心度单调填充」的前提破坏掉。
+        """
         d = data or {}
         return cls(
             id=str(d.get("id") or ""),
@@ -266,14 +289,40 @@ class Tier4Entry:
             content=str(d.get("content") or ""),
             title=str(d.get("title") or ""),
             tags=[str(x) for x in (d.get("tags") or []) if str(x).strip()],
-            min_favor=int(d.get("min_favor") or 0),
-            expire_at=int(d.get("expire_at") or 0),
-            salience=int(d.get("salience") or 1),
+            min_favor=max(0, _safe_int(d.get("min_favor"), 0)),
+            expire_at=max(0, _safe_int(d.get("expire_at"), 0)),
+            salience=max(1, min(_SALIENCE_HARD_MAX, _safe_int(d.get("salience"), 1))),
             source_user_id=str(d.get("source_user_id") or ""),
             source_chat_key=str(d.get("source_chat_key") or ""),
-            created_at=int(d.get("created_at") or 0),
-            updated_at=int(d.get("updated_at") or 0),
+            created_at=max(0, _safe_int(d.get("created_at"), 0)),
+            updated_at=max(0, _safe_int(d.get("updated_at"), 0)),
         )
+
+    @classmethod
+    def validate_raw(cls, data: Any) -> str:
+        """严格校验（**导入**用）：返回空串表示合法，否则返回可读原因。
+
+        与 from_raw 的分工：运行期宁可降级也要把能读的读出来；导入是「整包接受或
+        整包拒绝」，坏字段必须当场拒绝，否则会静默写进一条数值被掰弯的锚点。
+        """
+        if not isinstance(data, dict):
+            return "条目不是对象"
+        for _f in ("min_favor", "expire_at", "salience", "created_at", "updated_at"):
+            if _f not in data or data.get(_f) in (None, ""):
+                continue
+            _v = data.get(_f)
+            if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+                return f"字段 {_f}={_v!r} 不是数字"
+        _sal = data.get("salience")
+        if isinstance(_sal, (int, float)) and not (1 <= int(_sal) <= _SALIENCE_HARD_MAX):
+            return f"salience={_sal} 超出 1~{_SALIENCE_HARD_MAX}"
+        _mf = data.get("min_favor")
+        if isinstance(_mf, (int, float)) and int(_mf) < 0:
+            return f"min_favor={_mf} 不能为负"
+        _tags = data.get("tags")
+        if _tags is not None and not isinstance(_tags, list):
+            return "tags 必须是数组"
+        return ""
 
     def to_raw(self) -> Dict[str, Any]:
         return {

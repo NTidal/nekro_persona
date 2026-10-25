@@ -35,6 +35,9 @@ BG_DIR = Path(__file__).parent / "backgrounds"   # ⚠️ 已废弃：仅为兼�
 _TIERS = ("tier1", "tier2", "tier3")
 
 
+_NO_KEY_WARNED = False
+
+
 def _as_int(value: Any, default: int = 0) -> int:
     """把任意来源的值转成 int，坏值回落到 default（**绝不抛**）。
 
@@ -209,12 +212,21 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         expect = str(getattr(config, "WEBUI_ACCESS_KEY", "") or "").strip()
         got = str(request.headers.get("X-WebUI-Key") or "").strip()
         if not expect:
-            if request.method.upper() != "GET":
-                raise HTTPException(
-                    status_code=403,
-                    detail="未配置 WEBUI_ACCESS_KEY，写操作已禁用；请在插件配置中设置访问密钥后再试",
+            # ⚠️ 未配置密钥时**不再只读放行**：插件路由挂在 NA 全局鉴权之外，
+            #    放行 GET 等于任何能打开 NA WebUI 的人都能把全部人设记忆、关系档案、
+            #    事件史整份拉走。现在默认拒绝并给出可操作的提示；
+            #    页面壳（GET /）仍然公开，否则首次打开就是死页、连设密钥的入口都没有。
+            global _NO_KEY_WARNED
+            if not _NO_KEY_WARNED:
+                _NO_KEY_WARNED = True
+                plugin.logger.warning(
+                    "[persona] 未配置 WEBUI_ACCESS_KEY：管理页的所有 /api 请求都会被拒绝（401）。"
+                    "请在插件配置里设置访问密钥。"
                 )
-            return
+            raise HTTPException(
+                status_code=401,
+                detail="未配置 WEBUI_ACCESS_KEY：管理接口默认拒绝访问，请先在插件配置里设置访问密钥",
+            )
         # ⚠️ hmac.compare_digest 对含非 ASCII 的两个 str 会抛
         #    TypeError: comparing strings with non-ASCII characters ...
         #    密钥里带汉字很常见，那会让**每个请求（含只读）**都 500。统一按 bytes 比。
@@ -854,7 +866,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             eid = str(e.get("id", "") or "").strip()
             stat = _heat_snap.get(memory._hit_key(num, eid)) or {}
             try:
-                hits = int(stat.get("hits", 0) or 0)
+                hits = _as_int(stat.get("hits"), 0)
             except (TypeError, ValueError):
                 hits = 0
             try:
@@ -911,9 +923,12 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "familiarity_options": ["熟人", "听说", "仅传闻"],
             },
             # 带上阈值，前端用来做「门槛对照」提示（扩展）
+            # favor.json 被手改坏时（max 写成 "20分"、档位不是对象）这里会直接 500，
+            # 而这一页正是用户改档位的地方 —— 于是「打不开 → 改不了」死锁。
             "stages": [
-                {"name": str(st.get("name") or ""), "max": int(st.get("max", 0) or 0)}
-                for st in stages if st.get("name") != "排斥"
+                {"name": str(st.get("name") or ""), "max": _as_int(st.get("max"), 0)}
+                for st in stages
+                if isinstance(st, dict) and st.get("name") != "排斥"
             ],
         }
 
@@ -1295,7 +1310,12 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         requested_score = int(score)
         effective_score = helpers["clamp_score"](requested_score)
         stage, _ = helpers["stage_info"](effective_score)
-        ctx = await AgentCtx.create_by_chat_key(chat_key=chat_key)
+        try:
+            ctx = await AgentCtx.create_by_chat_key(chat_key=chat_key)
+        except ValueError as exc:
+            # 频道不存在时这里抛 ValueError：旧实现未捕获 → 500 + 前端把失败当成功、
+            # 渲染出一份「看起来正常」的空预览，用户以为频道内容就是空的。
+            raise HTTPException(status_code=404, detail=f"频道不存在：{chat_key}") from exc
         cfg = memory.load_favor_cfg()
         gating = bool(cfg) and bool(cfg.get("enabled", True))
         # ⚠️ dry_run=True：预览绝不能在真实数据上留副作用。
@@ -1577,7 +1597,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "gating_passed": gated_ok,
                 "kept": kept,
                 "heat": round(memory.heat_factor(stat, now, lc), 3),
-                "hits": int(stat.get("hits", 0)),
+                "hits": _as_int(stat.get("hits"), 0),
                 "reason": reason,
             })
         return {
@@ -1645,10 +1665,53 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "ANCHOR_INJECT_CHARS": (int, 0, 8000),
             "ANCHOR_SALIENCE_MAX": (int, 1, 5),
         }
+        def _cfg_value(field: str, conv, raw):
+            """配置项类型转换：bool 只认显式白名单，int/float 拒布尔与非数字。
+
+            ⚠️ 旧实现直接 `conv(body[k])`：`bool("false")` 是 **True**（非空字符串），
+            于是前端把开关「关闭」时反而写成开启（实测 6 个开关全中）；
+            `int("abc")` 则抛 ValueError 直接 500，用户不知道是哪个字段错了。
+            """
+            if conv is bool:
+                if isinstance(raw, bool):
+                    return raw
+                if isinstance(raw, (int, float)):
+                    return bool(raw)
+                s = str(raw).strip().lower()
+                if s in ("true", "1", "yes", "on"):
+                    return True
+                if s in ("false", "0", "no", "off", ""):
+                    return False
+                raise HTTPException(
+                    status_code=400, detail=f"{field} 必须是 true/false，收到 {raw!r}",
+                )
+            if conv is int:
+                if isinstance(raw, bool):
+                    raise HTTPException(status_code=400, detail=f"{field} 必须是整数，收到布尔值")
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    try:
+                        return int(float(str(raw).strip()))
+                    except (TypeError, ValueError) as exc:
+                        raise HTTPException(
+                            status_code=400, detail=f"{field} 必须是整数，收到 {raw!r}",
+                        ) from exc
+            if conv is float:
+                if isinstance(raw, bool):
+                    raise HTTPException(status_code=400, detail=f"{field} 必须是数字，收到布尔值")
+                try:
+                    return float(raw)
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=400, detail=f"{field} 必须是数字，收到 {raw!r}",
+                    ) from exc
+            return str(raw)
+
         for k, (conv, lo, hi) in limits.items():
             if k not in body:
                 continue
-            v = conv(body[k])
+            v = _cfg_value(k, conv, body[k])
             if lo is not None:
                 if conv is float:
                     v = max(float(lo), min(float(hi), float(v)))
@@ -2273,6 +2336,16 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 raise HTTPException(status_code=400, detail=f"tier4.json 不是合法 JSON：{exc}") from exc
             if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
                 raise HTTPException(status_code=400, detail="tier4.json 结构不对（缺 entries）")
+            # 条目级严格校验：运行期 from_raw 是**宽松**的（坏值回落默认），
+            # 导入则必须整包拒绝 —— 否则一条 salience=99 / min_favor="高" 的坏条目
+            # 会被静默掰成默认值写进库，事后无从发现。
+            for _idx, _item in enumerate(data["entries"], 1):
+                _bad = t4.Tier4Entry.validate_raw(_item)
+                if _bad:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"tier4.json 第 {_idx} 条不合法：{_bad}（已拒绝导入，未改动任何文件）",
+                    )
             _t4p = t4.tier4_path()
             _tmp = _t4p.with_suffix(_t4p.suffix + ".tmp")
             _tmp.write_bytes(raw)

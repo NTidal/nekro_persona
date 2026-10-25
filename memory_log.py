@@ -30,6 +30,18 @@ logger = get_sub_logger("persona_memory_log")
 MEMLOG_FILE = "memory_log.json"
 MEMLOG_VERSION = 1
 
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """任意值 → int，坏值回落 default（绝不抛）。"""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
 # 热度参数（与 memory.py 的 lifecycle 同口径，但独立配置）
 HEAT_HALF_LIFE_DAYS = 30.0
 HEAT_FLOOR = 0.55
@@ -111,6 +123,11 @@ class MemEntry:
 
     @classmethod
     def from_raw(cls, d: Dict[str, Any]) -> "MemEntry":
+        """宽松解析：坏字段回落默认值。
+
+        ⚠️ 旧实现六处裸 `int()`：一个事件条目的 `hits` 被写坏（"2"/null/对象）
+        就让 `/api/memory_log` 直接 500，而且归纳循环每 2 小时重试一次、永远失败。
+        """
         d = d or {}
         return cls(
             id=str(d.get("id") or ""),
@@ -118,11 +135,11 @@ class MemEntry:
             content=str(d.get("content") or ""),
             title=str(d.get("title") or ""),
             tags=[str(x) for x in (d.get("tags") or [])],
-            event_at=int(d.get("event_at") or 0),
-            created_at=int(d.get("created_at") or 0),
-            updated_at=int(d.get("updated_at") or 0),
-            hits=int(d.get("hits") or 0),
-            last_hit=int(d.get("last_hit") or 0),
+            event_at=max(0, _safe_int(d.get("event_at"), 0)),
+            created_at=max(0, _safe_int(d.get("created_at"), 0)),
+            updated_at=max(0, _safe_int(d.get("updated_at"), 0)),
+            hits=max(0, _safe_int(d.get("hits"), 0)),
+            last_hit=max(0, _safe_int(d.get("last_hit"), 0)),
             source=str(d.get("source") or "auto"),
             ref_msg_ids=[str(x) for x in (d.get("ref_msg_ids") or [])],
         )
@@ -246,7 +263,13 @@ def _read_sync() -> Dict[str, Any]:
         data = json.loads(fp.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("根节点不是对象")
-        data.setdefault("version", MEMLOG_VERSION)
+        # 版本不符一律按损坏处理（降级、拒绝写入）：新版本可能换了字段语义，
+        # 用旧代码读+写回就是静默改坏数据。缺失（老文件）则补上当前版本。
+        _ver = data.get("version")
+        if _ver is None:
+            data["version"] = MEMLOG_VERSION
+        elif _safe_int(_ver, -1) != MEMLOG_VERSION:
+            raise ValueError(f"版本不符（文件 {_ver!r}，当前 {MEMLOG_VERSION}）")
         # ⚠️ entries 存在但类型不对属于**文件损坏**，必须走降级：
         #    早先这里静默 `= []`，既不标记降级、下一次写入又会把原文件覆盖掉。
         if "entries" not in data:
@@ -301,7 +324,8 @@ async def list_entries(scope: Optional[str] = None) -> List[MemEntry]:
     """列出记忆（可按频道过滤），按 event_at 降序。"""
     async with _lock:
         doc = _read_sync()
-    items = [MemEntry.from_raw(d) for d in doc.get("entries") or []]
+    items = [MemEntry.from_raw(d) for d in (doc.get("entries") or [])
+             if isinstance(d, dict) and str(d.get("id") or "").strip()]
     if scope:
         items = [e for e in items if e.scope == scope]
     items.sort(key=lambda e: e.event_at or e.created_at, reverse=True)
@@ -323,7 +347,8 @@ async def add_entries(items: List[Dict[str, Any]], scope: str,
         if _reason:
             # 文件损坏时不落盘：此时的 doc 是空文档，写回等于清空全部事件记忆
             return {"added": 0, "skipped": 0, "evicted": 0, "corrupt": _reason}
-        existing = [MemEntry.from_raw(d) for d in doc.get("entries") or []]
+        existing = [MemEntry.from_raw(d) for d in (doc.get("entries") or [])
+                    if isinstance(d, dict) and str(d.get("id") or "").strip()]
         by_scope = [e for e in existing if e.scope == scope]
         existing_titles = {(e.title or "").strip()[:24] for e in by_scope}
 
