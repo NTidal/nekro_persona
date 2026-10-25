@@ -430,6 +430,11 @@ main { min-width: 0; padding: 32px 34px 70px; }
 
 /* ---------- 卡片 ---------- */
 .card {
+  /* ::before 是 position:absolute; inset:0 —— 父级没有 position 时会锚到
+     最近的有定位祖先（通常就是文档），于是每张卡都往页面顶部叠一整页大小的
+     白色渐变（亮色主题单层约 0.25 不透明度，概览页 6+ 张就明显冲淡页首文字），
+     border-radius: inherit 也失效。.metric 一直有 position: relative。 */
+  position: relative;
   margin-bottom: 16px;
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
@@ -685,6 +690,7 @@ input[type="range"]::-webkit-slider-thumb {
 /* ---------- 列表卡片（笔记 / 锚点 / 关系记忆 / 回收站） ---------- */
 .list-stack { display: grid; gap: 10px; }
 .list-item {
+  position: relative;      /* 同上：.list-item::before 需要定位父级 */
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -1021,10 +1027,12 @@ dialog::backdrop { background: rgba(20, 18, 14, 0.55); }
   .debug-grid { grid-template-columns: 1fr 1fr; }
   .field-row, .field-grid-3, .profile-grid { grid-template-columns: 1fr; }
   .preview-control { grid-template-columns: 1fr; }
-  .stage-row { grid-template-columns: 1fr 1fr 34px; }
-  .stage-row .field:nth-child(3) { grid-column: 1 / -1; }
-  .rubric-row { grid-template-columns: 1fr 34px; }
-  .rubric-row .field:nth-child(2) { grid-column: 1 / -1; }
+  /* 原先这四条是死代码：.stage-row 是 block（内部 .stage-row-head 用 flex+wrap
+     自己就能自适应），.rubric-row 这个类在标记里已经不存在了。
+     真正需要移动端布局的是 .rubric-item（label / desc / 删除按钮）。 */
+  .rubric-item { grid-template-columns: minmax(0, 1fr) 34px; }
+  .rubric-item > :nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
+  .rubric-item > :nth-child(3) { grid-column: 2 / 3; grid-row: 1; }
   .code-output, .code-output.placeholder { min-height: 340px; }
   .table-wrap { overflow: visible; padding: 10px; }
   .data-table, .data-table tbody, .data-table tr, .data-table td { display: block; width: 100%; }
@@ -2089,6 +2097,21 @@ body.is-scrolling .dialog-foot {
   vertical-align: bottom;
 }
 
+/* ── v2.2.3 布局修补 ─────────────────────────────────────────── */
+
+/* 侧栏激活指示条原先 left:-23px，而 .side-nav 有 overflow-y:auto（另一轴随之变成
+   auto）、.nav-item 又有 overflow:hidden —— 双重裁剪，桌面端激活项只剩文字变色。
+   改成贴在条目内侧左缘的竖条（不越界就不会被裁），并补一层很淡的激活底色。 */
+.nav-item.active::before {
+  left: 0;
+  width: 3px;
+  height: 22px;
+  border-radius: 3px;
+}
+.nav-item.active {
+  background-color: color-mix(in srgb, var(--accent-soft) 62%, transparent);
+}
+
 </style>
 </head>
 <body>
@@ -2678,7 +2701,9 @@ body.is-scrolling .dialog-foot {
 </div>
 
 <!-- 通用弹窗 -->
-<dialog id="dialog">
+<!-- ⚠️ class="dialog" 不能省：整套磨砂 / 玻璃描边 / 高光 / 底色都在 .dialog 选择器里，
+     没有这个类，弹窗就只剩元素选择器给的 44% 半透明底，背后内容直接透出来。 -->
+<dialog id="dialog" class="dialog">
   <div class="dialog-head">
     <div><h2 id="dialogTitle"></h2><p id="dialogSubtitle"></p></div>
     <button class="btn icon-only ghost" type="button" id="dialogClose" aria-label="关闭">
@@ -2692,7 +2717,7 @@ body.is-scrolling .dialog-foot {
 <!-- 确认弹窗：必须是**独立**的 <dialog>。
      复用 #dialog 会把正在编辑的弹窗内容顶掉（点「删除档案」再取消，档案弹窗就没了，
      还得从列表重新打开）；独立元素让两层自然堆叠，取消后原弹窗原样还在。 -->
-<dialog id="confirmDlg">
+<dialog id="confirmDlg" class="dialog">
   <div class="dialog-head">
     <div><h2 id="confirmTitle"></h2></div>
     <button class="btn icon-only ghost" type="button" id="confirmClose" aria-label="关闭">
@@ -2951,6 +2976,7 @@ const state = {
   previewChannel: '',
   previewScore: 0,
   previewRendered: false,
+  previewSeq: 0,
   dirtyPage: '',
   favorSeq: 0,
   maxAbs: 100,
@@ -2979,6 +3005,14 @@ function setDemo(on, reason = '') {
 }
 
 /* ---------------- API 层 ---------------- */
+/* 数字输入钳制：HTML 的 min/max 只约束步进按钮，手输的负数/越界值会原样提交
+   （负 ttl_hours 会造出「保存即过期」的笔记）。统一在提交前夹一次。 */
+function clampInt(raw, lo, hi, dflt = 0) {
+  const n = parseInt(String(raw == null ? '' : raw).trim(), 10);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.max(lo, Math.min(hi, n));
+}
+
 async function api(path, { method = 'GET', body } = {}) {
   const headers = { Accept: 'application/json' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -3015,6 +3049,21 @@ async function load(path, mockFn) {
     console.warn('[persona] GET 失败，回落演示数据:', path, e.status || '(网络)', e.message);
     setDemo(true, why);
     return mockFn();
+  }
+}
+
+/* 维护 / 实验类 POST：不做演示模式本地模拟，但 401 时同样给密钥引导。
+   原先这三处直接调 api()，未配密钥的用户只会看到一句「HTTP 401」。 */
+async function postAction(path, body) {
+  try {
+    return await api(path, { method: 'POST', body: body === undefined ? {} : body });
+  } catch (e) {
+    if (e.status === 401) {
+      openKeyDialog();
+      toast('需要访问密钥：请在右上角设置 X-WebUI-Key', 'warning', 5200);
+      return null;
+    }
+    throw e;
   }
 }
 
@@ -3555,12 +3604,17 @@ async function loadChannels() {
 }
 
 function fillChannelSelects() {
-  const opts = state.channels.map((c) => `<option value="${esc(c.chat_key)}">${esc(c.chat_key)}（${c.count} 人 · 最高 ${c.top}）</option>`).join('');
+  const opts = state.channels.map((c) => `<option value="${esc(c.chat_key)}">${esc(c.chat_key)}（${c.count} 人 · 最高 ${c.top}）</option>`).join('')
+  // 备忘录 / 关系记忆两页加「全部频道」：搜索是跨频道的，而下拉原先在搜索态被完全忽略
+  //（能选但列表与选择无关）。有了空值选项，搜索也能按频道收窄。
+  // 注入预览必须有具体频道，所以不加。
+  const ALL = '<option value="">全部频道</option>';
   ['#previewChannel', '#memoChannel', '#memlogChannel'].forEach((sel) => {
     const el = $(sel);
     if (!el) return;
     const keep = el.value;
-    el.innerHTML = opts || '<option value="">（暂无频道）</option>';
+    el.innerHTML = (sel === '#previewChannel' ? '' : ALL)
+      + (opts || '<option value="">（暂无频道）</option>');
     if (keep && state.channels.some((c) => c.chat_key === keep)) el.value = keep;
   });
   if (!state.previewChannel && state.channels[0]) { state.previewChannel = state.channels[0].chat_key; $('#previewChannel').value = state.previewChannel; }
@@ -3725,7 +3779,13 @@ $('#memoryTbody').addEventListener('click', async (e) => {
     });
     // ⚠️ loadMemory 现在走缓存：服务端已改但本地缓存还是旧值，
     //    不同步的话切走再回来会看到旧的勾选状态。
-    if (res) entry.enabled = enabled;
+    if (res) {
+      entry.enabled = enabled;
+    } else {
+      // 失败必须回滚勾选状态：checkbox 是点击时就被浏览器改掉的，
+      // 不回滚会留下「界面已开启、数据没变」的假象（下次渲染又跳回去）。
+      e.target.checked = !enabled;
+    }
     return;
   }
   if (act === 'del') {
@@ -3810,8 +3870,8 @@ $('#dialogFoot').addEventListener('click', async (e) => {
     tier,
     title: $('#efTitle').value.trim(),
     content: $('#efContent').value,
-    min_favor: parseInt($('#efMinFavor').value || '0', 10) || 0,
-    weight: parseInt($('#efWeight').value || '1', 10) || 1,
+      min_favor: clampInt($('#efMinFavor').value, 0, 100, 0),
+      weight: clampInt($('#efWeight').value, 1, 999, 1),
     enabled: $('#efEnabled').checked,
   };
   if (tier === 'tier1') body.trigger = $('#efTrigger').value.trim();
@@ -4406,10 +4466,13 @@ $('#previewChannel').addEventListener('change', (e) => { state.previewChannel = 
 async function runPreview() {
   const chatKey = $('#previewChannel').value;
   if (!chatKey) { toast('请先选择频道', 'warning'); return; }
+  // 滑块防抖 + 网络时序不定：慢的旧响应回来时不能覆盖新结果（同 loadFavor 的做法）
+  const seq = ++state.previewSeq;
   const btn = $('#previewRunBtn');
   btn.classList.add('is-loading');
   const score = state.previewScore;
   const data = await load(`preview?chat_key=${encodeURIComponent(chatKey)}&score=${score}`, () => MOCK.preview(chatKey, score));
+  if (seq !== state.previewSeq) return;      // 已有更新的预览请求，丢弃这次结果
   btn.classList.remove('is-loading');
   if (!data) return;
   const out = $('#previewOutput');
@@ -4448,15 +4511,16 @@ async function loadMemo() {
   if (!state.channels.length) await loadChannels();
   const q = state.memoSearch;
   const searching = !!String(q || '').trim();
-  const chatKey = $('#memoChannel').value || state.memoChannel;
+  const selVal = $('#memoChannel').value;    // '' = 全部频道（仅搜索态有意义）
+  const chatKey = searching ? selVal : (selVal || state.memoChannel);
   if (!searching && !chatKey) {
     $('#memoList').innerHTML = '<div class="empty-inline">暂无频道</div>';
     return;
   }
   if (!searching) state.memoChannel = chatKey;
-  // 有搜索词时跨全部频道查（chat_key 留空），否则维持单频道视图
+  // 搜索时若选了具体频道就按它收窄；选「全部频道」才是跨频道查
   const qs = searching
-    ? `memos?q=${encodeURIComponent(q)}`
+    ? `memos?q=${encodeURIComponent(q)}${selVal ? `&chat_key=${encodeURIComponent(selVal)}` : ''}`
     : `memos?chat_key=${encodeURIComponent(chatKey)}`;
   const data = await load(qs, () => (searching ? MOCK.memosAll() : MOCK.memos(chatKey)));
   if (!data) return;
@@ -4530,7 +4594,9 @@ $('#memoList').addEventListener('click', async (e) => {
   if (res) loadMemo();
 });
 $('#memoClearExpired').addEventListener('click', async () => {
-  const res = await mutate('memo', { chat_key: state.memoChannel, op: 'clear_expired' }, {
+  const _ck = $('#memoChannel').value || state.memoChannel;
+  if (!_ck) { toast('「清理过期」只作用于单个频道：请先在上方选一个具体频道', 'warning', 5200); return; }
+  const res = await mutate('memo', { chat_key: _ck, op: 'clear_expired' }, {
     mockApply: () => { MOCK.raw.memos[state.memoChannel] = (MOCK.raw.memos[state.memoChannel] || []).filter((n) => !n.expired); },
     okMsg: '已清理过期笔记',
   });
@@ -4545,7 +4611,7 @@ $('#memoSaveBtn').addEventListener('click', async () => {
     title, content,
     tags: $('#memoTags').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
     min_favor: parseInt($('#memoMinFavor').value || '0', 10) || 0,
-    ttl_hours: parseInt($('#memoTtl').value || '0', 10) || 0,
+    ttl_hours: clampInt($('#memoTtl').value, 0, 8760, 0),   // 0=不过期；上限一年
   }, {
     mockApply: () => {
       const arr = MOCK.raw.memos[state.memoChannel] = MOCK.raw.memos[state.memoChannel] || [];
@@ -4553,7 +4619,10 @@ $('#memoSaveBtn').addEventListener('click', async () => {
         id: 'note_' + Date.now(), title, content,
         tags: $('#memoTags').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
         min_favor: parseInt($('#memoMinFavor').value || '0', 10) || 0,
-        expire_at: (parseInt($('#memoTtl').value || '0', 10) || 0) ? Math.floor(Date.now() / 1000) + parseInt($('#memoTtl').value, 10) * 3600 : 0,
+        expire_at: (() => {
+          const ttl = clampInt($('#memoTtl').value, 0, 8760, 0);
+          return ttl ? Math.floor(Date.now() / 1000) + ttl * 3600 : 0;
+        })(),
         expired: false, updated_at: Math.floor(Date.now() / 1000),
       });
     },
@@ -4589,7 +4658,7 @@ function renderAnchor(data) {
         </div>
       </div>
       <div class="list-actions">
-        <select class="select" style="min-width:86px" data-act="salience" data-id="${esc(a.id)}">
+        <select class="select" style="min-width:86px" data-act="salience" data-id="${esc(a.id)}" data-cur="${esc(a.salience)}">
           ${Array.from({ length: max }, (_, i) => i + 1).map((v) => `<option value="${v}" ${v === a.salience ? 'selected' : ''}>权重 ${v}</option>`).join('')}
         </select>
         <button class="mini-btn danger" type="button" data-act="del" data-id="${esc(a.id)}">删除</button>
@@ -4637,7 +4706,11 @@ $('#anchorList').addEventListener('change', async (e) => {
     mockApply: () => { const a = MOCK.raw.anchors.find((x) => x.id === id); if (a) a.salience = salience; },
     okMsg: '权重已调整',
   });
-  if (res) loadAnchor();
+  if (res) {
+    loadAnchor();
+  } else if (sel.dataset.cur != null) {
+    sel.value = sel.dataset.cur;   // 失败回滚到渲染时的值
+  }
 });
 
 /* ---------------- 关系记忆 ---------------- */
@@ -4645,15 +4718,16 @@ async function loadMemlog() {
   if (!state.channels.length) await loadChannels();
   const q = state.memlogSearch;
   const searching = !!String(q || '').trim();
-  const chatKey = $('#memlogChannel').value || state.memlogChannel;
+  const selVal = $('#memlogChannel').value;   // '' = 全部频道（仅搜索态有意义）
+  const chatKey = searching ? selVal : (selVal || state.memlogChannel);
   if (!searching && !chatKey) {
     $('#memlogList').innerHTML = '<div class="empty-inline">暂无频道</div>';
     return;
   }
   if (!searching) state.memlogChannel = chatKey;
-  // 有搜索词时跨全部频道查
+  // 搜索时若选了具体频道就按它收窄；选「全部频道」才是跨频道查
   const qs = searching
-    ? `memory_log?q=${encodeURIComponent(q)}&limit=500`
+    ? `memory_log?q=${encodeURIComponent(q)}&limit=500${selVal ? `&chat_key=${encodeURIComponent(selVal)}` : ''}`
     : `memory_log?chat_key=${encodeURIComponent(chatKey)}`;
   const data = await load(qs, () => (searching ? MOCK.memlogAll() : MOCK.memlog(chatKey)));
   if (!data) return;
@@ -4696,7 +4770,7 @@ function renderMemlog(data) {
           <span class="muted" style="font-size:10px">${fmtTs(m.event_at)}</span>
         </div>
       </div>
-      <div class="list-actions"><button class="mini-btn danger" type="button" data-act="del" data-id="${esc(m.id)}">删除</button></div>
+      <div class="list-actions"><button class="mini-btn danger" type="button" data-act="del" data-id="${esc(m.id)}" data-chat="${esc(m.scope)}">删除</button></div>
     </div>`).join('');
 }
 
@@ -4716,7 +4790,12 @@ $('#memlogList').addEventListener('click', async (e) => {
     message: `将永久删除这条事件记忆「${title}」，删除后无法恢复。`,
   }))) return;
   const res = await mutate('memory_log', { op: 'delete', id }, {
-    mockApply: () => { MOCK.raw.memlog[state.memlogChannel] = (MOCK.raw.memlog[state.memlogChannel] || []).filter((m) => m.id !== id); },
+    // 搜索态下结果来自不同频道：必须用行自带的 scope，不能用当前下拉选的频道
+    //（备忘录页同类 bug 已修，这里原先没跟进）
+    mockApply: () => {
+      const ck = btn.dataset.chat || state.memlogChannel;
+      MOCK.raw.memlog[ck] = (MOCK.raw.memlog[ck] || []).filter((m) => m.id !== id);
+    },
     okMsg: '已删除',
   });
   if (res) loadMemlog();
@@ -5185,7 +5264,8 @@ $('#recallRunBtn').addEventListener('click', (e) => withBusy(e.currentTarget, as
     gating: $('#recallGating').checked,
   };
   try {
-    const d = await api('recall_test', { method: 'POST', body });
+    const d = await postAction('recall_test', body);
+    if (!d) { $('#recallMeta').textContent = '需要访问密钥'; return; }
     renderRecall(d);
   } catch (err) {
     $('#recallMeta').textContent = '测试失败';
@@ -5197,7 +5277,8 @@ $('#recallRunBtn').addEventListener('click', (e) => withBusy(e.currentTarget, as
 /* ---------------- 维护（运行参数页） ---------------- */
 $('#reloadBtn').addEventListener('click', (e) => withBusy(e.currentTarget, async () => {
   try {
-    await api('reload', { method: 'POST' });
+    const r = await postAction('reload');
+    if (!r) return;
     toast('背景记忆已重载', 'success');
     state.overview = null;
     loadSettings();
@@ -5223,7 +5304,8 @@ $('#dialogFoot').addEventListener('click', async (e) => {
   if (!btn) return;
   btn.disabled = true;
   try {
-    const res = await api('heat/reset', { method: 'POST', body: {} });
+    const res = await postAction('heat/reset');
+    if (!res) { btn.disabled = false; return; }
     toast(`已重置热度：清空 ${Number(res.cleared || 0)} 条命中统计`, 'success', 4600);
     closeDialog();
     state.overview = null;
