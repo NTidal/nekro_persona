@@ -27,6 +27,7 @@ import os
 import random
 import re
 import shutil
+import threading
 import time
 from array import array as _float_array
 from pathlib import Path
@@ -298,6 +299,9 @@ _VEC_CACHE_VERSION = 2
 # 版本化、原子写、读失败按空处理。**绝不回写作者的 backgrounds/*.json**，
 # 否则会弄脏 curated 内容、触发热重载 mtime、并和 WebUI 编辑抢写。
 _HIT_STATS_NAME = ".hit_stats.json"
+# 命中统计是「读-改-写」：检索路径的 _bump_hits（同步）与 WebUI 的重置/落盘会交叉。
+# 用 RLock（reset_hit_stats 持锁时会再进 _save_hit_stats，同线程重入不能死锁）。
+_HIT_LOCK = threading.RLock()
 _HIT_STATS_VERSION = 1
 
 
@@ -942,25 +946,47 @@ def _bump_hits(entries: List[Dict[str, Any]], tier: int, now: float,
                min_interval: float = 30.0) -> None:
     """命中即强化：内存计数 +1、刷新 last；去抖落盘。fire-and-forget，绝不抛。"""
     try:
-        st = _state()
-        stats = st["hit_stats"]
-        for e in entries:
-            eid = str(e.get("id", "")).strip()
-            if not eid:
-                continue
-            k = _hit_key(tier, eid)
-            s = stats.get(k)
-            if not isinstance(s, dict):
-                s = {"hits": 0, "last": 0}
-                stats[k] = s
-            s["hits"] = int(s.get("hits", 0)) + 1
-            s["last"] = int(now)
-        st["hit_dirty"] = True
-        if now - float(st.get("hit_last_save", 0.0)) >= min_interval:
-            _save_hit_stats(st)
-            st["hit_last_save"] = float(now)
+        with _HIT_LOCK:
+            _bump_hits_locked(entries, tier, now, min_interval)
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"[persona] 命中强化失败（忽略）: {exc}")
+
+
+def _bump_hits_locked(entries: List[Dict[str, Any]], tier: int, now: float,
+                      min_interval: float) -> None:
+    st = _state()
+    stats = st["hit_stats"]
+    for e in entries:
+        eid = str(e.get("id", "")).strip()
+        if not eid:
+            continue
+        k = _hit_key(tier, eid)
+        s = stats.get(k)
+        if not isinstance(s, dict):
+            s = {"hits": 0, "last": 0}
+            stats[k] = s
+        s["hits"] = int(s.get("hits", 0)) + 1
+        s["last"] = int(now)
+    st["hit_dirty"] = True
+    if now - float(st.get("hit_last_save", 0.0)) >= min_interval:
+        _save_hit_stats(st)
+        st["hit_last_save"] = float(now)
+
+
+def reset_hit_stats() -> int:
+    """清空命中统计并立即落盘，返回被清掉的条数。
+
+    ⚠️ WebUI 的「重置热度」必须走这里：直接改 `_state()["hit_stats"]` 再落盘，会与
+    检索路径的 `_bump_hits` 打架（一方刚累加的计数被另一方的空字典覆盖）。
+    """
+    with _HIT_LOCK:
+        st = _state()
+        before = len(st.get("hit_stats") or {})
+        st["hit_stats"] = {}
+        st["hit_dirty"] = False
+        st["query_cache"] = {}
+        _save_hit_stats(st)
+        return before
 
 
 def _prune_hit_stats(st: Optional[Dict[str, Any]] = None) -> None:

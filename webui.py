@@ -1019,7 +1019,9 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 min_favor = int(body["min_favor"])
             except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail="披露门槛必须是整数") from exc
-            patch["min_favor"] = max(0, min_favor)
+            # ⚠️ 上界也要钳：只钳 ≥0 时，直接调 API 能写入超过 MAX_ABS_SCORE 的门槛，
+            #    而好感度上限就是 MAX_ABS_SCORE —— 这种条目**永远不可能解锁**。
+            patch["min_favor"] = max(0, min(helpers["max_abs_score"](), min_favor))
         if "enabled" in body:
             patch["enabled"] = bool(body["enabled"])
         if "weight" in body:
@@ -1929,15 +1931,15 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "title": str(body.get("title") or "")[:80],
                 "content": str(body.get("content") or "")[:2000],
                 "weight": int(body.get("weight") or 1),
-                "min_favor": max(0, int(body.get("min_favor") or 0)),
+                # 同上（update 端）：上界也得钳，否则能建出「永远解锁不了」的条目
+                "min_favor": min(max(0, int(body.get("min_favor") or 0)),
+                                 helpers["max_abs_score"]()),
                 "enabled": bool(body.get("enabled", True)),
             }
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="权重和门槛必须是整数") from exc
         if entry["weight"] < 1 or entry["weight"] > 999:
             raise HTTPException(status_code=400, detail="权重必须在 1 到 999 之间")
-        if entry["min_favor"] < 0:
-            raise HTTPException(status_code=400, detail="披露门槛不能小于 0")
         if not entry["content"].strip():
             raise HTTPException(status_code=400, detail="记忆内容不能为空")
         # 标题是列表里唯一能认人的字段：空标题条目会变成「无名条目」，
@@ -2714,15 +2716,13 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         重置后所有条目 heat 回到 1.0，等下一次命中重新累积。
         """
         _check_key(request)
-        st = memory._state()
-        before = len(st.get("hit_stats") or {})
-        st["hit_stats"] = {}
-        st["hit_dirty"] = False
-        st["query_cache"] = {}
+        # 走 memory.reset_hit_stats()：它持 _HIT_LOCK，不会与检索路径的 _bump_hits 交叉
+        # （以前这里直接改 _state() 再落盘，与「刚累加的计数」存在理论竞态）。
         try:
-            memory._save_hit_stats(st)
+            before = memory.reset_hit_stats()
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=_public_detail(f"写入命中统计失败：{exc}")) from exc
+        st = memory._state()
         plugin.logger.info(f"[persona] WebUI 重置热度：清空 {before} 条命中统计（{st.get('dir')}）")
         return {"ok": True, "cleared": before, "dir": str(st.get("dir") or "")}
 

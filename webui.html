@@ -347,11 +347,13 @@ html.theming dialog {
 }
 .sidebar {
   position: sticky;
-  top: 67px;
+  /* 顶栏高度不是常量：窄屏 + 长插件名会让 .topbar 换行增高，写死 67px 会重叠或露缝。
+     --topbar-h 由 ResizeObserver 实测写入（见 initTopbarHeight），兜底 67px。 */
+  top: var(--topbar-h, 67px);
   display: flex;
   flex-direction: column;
   align-self: start;
-  height: calc(100vh - 67px);
+  height: calc(100vh - var(--topbar-h, 67px));
   padding: 26px 14px 22px 22px;
   border-right: 1px solid var(--line);
 }
@@ -807,7 +809,7 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 /* ---------- 规则编辑器 ---------- */
 .rule-section { scroll-margin-top: 90px; }
 /* ---------- 规则与门控 ---------- */
-.stage-row, .rubric-row { align-items: start; margin-bottom: 10px; }
+.stage-row { align-items: start; margin-bottom: 10px; }
 .stage-row {
   padding: 13px 15px 15px;
   border: 1px solid var(--line);
@@ -863,24 +865,6 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 .stage-guide-label { display: block; margin-bottom: 5px; color: var(--muted); font-size: 10px; }
 .stage-guide-label small { margin-left: 6px; color: var(--faint); }
 .stage-guide { min-height: 62px; }
-.rubric-row {
-  padding: 12px 14px 13px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-md);
-  background: var(--surface-2);
-}
-.rubric-row-head { display: flex; align-items: center; gap: 9px; }
-.rubric-dot {
-  flex: 0 0 auto;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--sc, var(--indigo));
-  box-shadow: 0 0 8px var(--sc, var(--indigo));
-}
-.rubric-key { flex: 1 1 auto; min-width: 0; font-weight: 600; }
-.rubric-desc-label { display: block; margin: 10px 0 5px; color: var(--muted); font-size: 10px; }
-.rubric-desc { min-height: 56px; }
 .gating-summary { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 14px; }
 .empty-inline {
   padding: 20px;
@@ -1031,7 +1015,7 @@ dialog::backdrop { background: rgba(20, 18, 14, 0.55); }
   .app { display: block; }
   .sidebar {
     position: sticky;
-    top: 67px;
+    top: var(--topbar-h, 67px);
     z-index: 30;
     display: block;
     width: 100%;
@@ -1062,7 +1046,7 @@ dialog::backdrop { background: rgba(20, 18, 14, 0.55); }
   .field-row, .field-grid-3, .profile-grid { grid-template-columns: 1fr; }
   .preview-control { grid-template-columns: 1fr; }
   /* 原先这四条是死代码：.stage-row 是 block（内部 .stage-row-head 用 flex+wrap
-     自己就能自适应），.rubric-row 这个类在标记里已经不存在了。
+     自己就能自适应）。2.2.16 起 .rubric-row 那条死规则（连同 rubric-dot 关键帧）已删除。
      真正需要移动端布局的是 .rubric-item（label / desc / 删除按钮）。 */
   .rubric-item { grid-template-columns: minmax(0, 1fr) 34px; }
   .rubric-item > :nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
@@ -1615,7 +1599,7 @@ dialog::backdrop { animation: fadeIn 0.35s ease; }
    分页前 322 行 = 1288 次纯浪费的模糊，这是 GPU 占用的大头之一。
 
    已剔除：.card .metric .list-item .segmented .debug-cell .profile-field
-          .profile-summary .stage-row .rubric-row .badge .chip .btn */
+          .profile-summary .stage-row .badge .chip .btn */
 /* ⚠️ 只保留**真的浮在页面渐变之上**的大面积层。
    其余元素全都在 .card 内部，而 .card 背景是 var(--surface)（不透明实色）——
    模糊后的结果与不模糊完全相同，等于白做一次离屏抓取 + 22px 高斯模糊。
@@ -1639,7 +1623,6 @@ dialog::backdrop { animation: fadeIn 0.35s ease; }
 .debug-cell,
 .profile-field,
 .stage-row,
-.rubric-row,
 .sidebar,
 .topbar {
   background-image: linear-gradient(135deg, var(--glass-tint), transparent 55%, var(--glass-tint));
@@ -1843,12 +1826,6 @@ input[type="range"] { background-color: color-mix(in srgb, var(--surface-3) 82%,
   box-shadow: 0 0 12px var(--accent-glow);
 }
 
-/* ---------- 评分细则 FX ---------- */
-.rubric-dot { animation: rubricDotPulse 2.4s ease-in-out infinite; }
-@keyframes rubricDotPulse {
-  0%, 100% { box-shadow: 0 0 6px var(--sc, var(--indigo)); }
-  50% { box-shadow: 0 0 15px var(--sc, var(--indigo)); }
-}
 
 /* ---------- 备份与迁移：导出 / 导入必须一眼分开 ---------- */
 .transfer-zone { border-left-width: 3px; border-left-style: solid; }
@@ -1938,7 +1915,6 @@ input[type="range"] { background-color: color-mix(in srgb, var(--surface-3) 82%,
 .no-ambient-fx .salience-dots i.on,
 .no-ambient-fx .stage-index,
 .no-ambient-fx .stage-ladder i,
-.no-ambient-fx .rubric-dot,
 .no-ambient-fx .switch input:checked + span::after,
 .no-ambient-fx input[type="range"]::-webkit-slider-thumb {
   animation: none !important;
@@ -3709,8 +3685,13 @@ function renderOverviewMetrics(data) {
   try { FX.countUp(); } catch (e) { /* FX 尚未初始化时忽略 */ }
 }
 
+/* value 默认**转义**：以前由调用方自己 esc，漏一处就是注入点（埋雷式 API）。
+   需要放标记的地方显式用 statusLineHtml —— 让「要 HTML」成为一个看得见的决定。 */
 function statusLine(name, value) {
-  return `<div class="status-line"><span class="status-name">${esc(name)}</span><span class="status-value">${value}</span></div>`;
+  return `<div class="status-line"><span class="status-name">${esc(name)}</span><span class="status-value">${esc(value)}</span></div>`;
+}
+function statusLineHtml(name, html) {
+  return `<div class="status-line"><span class="status-name">${esc(name)}</span><span class="status-value">${html}</span></div>`;
 }
 
 function renderOverviewTiers(data) {
@@ -3720,7 +3701,7 @@ function renderOverviewTiers(data) {
     statusLine('2 档 · 往事', `${t2.count} 条 · 最多注入 ${t2.max_entries} 条 / ${t2.max_chars} 字`) +
     statusLine('2 档 · 检索', `相似度阈值 ${t2.threshold} · 扫描 ${t2.scan_msgs} 条消息`) +
     statusLine('3 档 · 世界知识', `${t3.count} 条 · 阈值 ${t3.threshold} · ${t3.enabled ? '启用' : '关闭'}`) +
-    statusLine('最近命中', `<span class="mono">${esc(data.last_hit || '—')}</span>`);
+    statusLineHtml('最近命中', `<span class="mono">${esc(data.last_hit || '—')}</span>`);
 }
 
 function renderOverviewGating(data) {
@@ -3750,7 +3731,7 @@ function renderOverviewRuntime(data) {
     statusLine('负分回升', d.recover_enabled ? `每 ${d.recover_interval_hours}h 回升 ${d.recover_percent}%` : '已关闭') +
     statusLine('记忆生命周期', lc.enabled ? `半衰期 ${lc.half_life_days} 天 · 下限 ${lc.floor}` : '已关闭') +
     statusLine('频道笔记', m.enabled ? `上限 ${m.max_items} 条 · 注入 ${m.inject_recent}+${m.inject_matched} 条` : '已关闭') +
-    statusLine('防白嫖护栏', esc((data.guard || {}).desc || '—'));
+    statusLine('防白嫖护栏', (data.guard || {}).desc || '—');
 }
 
 function renderOverviewDir(data) {
@@ -3758,9 +3739,9 @@ function renderOverviewDir(data) {
   const mem = ds.memory || {}, t4 = ds.tier4 || {}, sc = ds.stateCache || {};
   const ok = (v) => v ? '<span class="badge success">正常</span>' : '<span class="badge danger">异常</span>';
   $('#overviewDir').innerHTML =
-    statusLine('背景数据目录', `<span class="mono">${esc(data.dataDir || '—')}</span>`) +
-    statusLine('目录解析', ds.degraded ? '<span class="badge danger">已降级为演示数据</span>' : ok(!mem.degraded)) +
-    statusLine('生长层 tier4', t4.degraded ? '<span class="badge danger">降级</span>' : ok(true)) +
+    statusLineHtml('背景数据目录', `<span class="mono">${esc(data.dataDir || '—')}</span>`) +
+    statusLineHtml('目录解析', ds.degraded ? '<span class="badge danger">已降级为演示数据</span>' : ok(!mem.degraded)) +
+    statusLineHtml('生长层 tier4', t4.degraded ? '<span class="badge danger">降级</span>' : ok(true)) +
     statusLine('状态缓存', `${sc.entries != null ? sc.entries + ' 条' : '—'}`) +
     (ds.degraded ? '<p class="hint" style="margin-top:10px">数据目录解析失败，插件正以包内演示数据运行——请检查账号目录权限。</p>' : '');
 }
@@ -5360,7 +5341,9 @@ async function withBusy(btn, fn) {
   } finally {
     btn.disabled = false;
     btn.classList.remove('is-loading');
-    if (btn.textContent !== oldText && btn.textContent === '') btn.textContent = oldText;
+    // 恢复文本：fn() 期间并没有人改过 textContent（loading 是靠 CSS ::after 画转圈），
+    // 原来那句 `if (textContent !== oldText && textContent === '')` 恒假、纯噪声。
+    if (!btn.textContent) btn.textContent = oldText;
   }
 }
 
@@ -5943,6 +5926,21 @@ const FX = (() => {
 })();
 
 /* 包装：翻页转场 + 撒花 */
+/* 顶栏实高 → CSS 变量：侧栏 sticky 的 top / height 依赖它。
+   写死 67px 的假设在「窄屏 + 长插件名导致顶栏换行」时会失效（重叠或露缝）。 */
+function initTopbarHeight() {
+  const bar = document.querySelector('.topbar');
+  if (!bar) return;
+  const apply = () => {
+    const hgt = Math.round(bar.getBoundingClientRect().height);
+    if (hgt > 0) document.documentElement.style.setProperty('--topbar-h', `${hgt}px`);
+  };
+  apply();
+  if (typeof ResizeObserver === 'function') new ResizeObserver(apply).observe(bar);
+  window.addEventListener('resize', apply);
+}
+initTopbarHeight();
+
 const _goto = goto;
 goto = async function (tab, opts) {
   // ⚠️ 必须透传 opts 并**返回** Promise：顶栏「刷新当前页」依赖

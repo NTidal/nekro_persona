@@ -5,7 +5,7 @@
 > **2.0 起**：前 3 档是手工策划的「种子」（模型不可改）；**tier4 是「生长」**——角色在运行时自己沉淀的身份锚点（身份）与频道笔记（功能），
 > 并具备**种子包 / 生长包分离导出**：角色定义可公开版本化，「这一世活过的痕迹」可整体迁移备份。
 
-版本 **2.2.15**　作者 **NTidal**　许可 **GPLv3**
+版本 **2.2.16**　作者 **NTidal**　许可 **GPLv3**
 
 ---
 
@@ -621,6 +621,30 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
 
 > 本日志只保留**最近三个版本**的改动；更早的版本见 git 提交历史（`git log --oneline`）。
 
+### 2.2.16
+
+**侧栏不再假设顶栏 67px / statusLine 默认转义 / 清死代码 / 门槛钳上限 / 热度重置加锁**
+
+- **侧栏 sticky 的 1px 硬编码**：`.sidebar { top: 67px }` 对应的前提是顶栏恒为 66px —— 窄屏 +
+  长插件名让顶栏换行后，侧栏会和顶栏重叠或露缝。现在改用 `top: var(--topbar-h, 67px)` /
+  `height: calc(100vh - var(--topbar-h, 67px))`（桌面与移动端两处），`--topbar-h` 由
+  `initTopbarHeight()` 用 `ResizeObserver` 实测顶栏高度写入，窗口 resize 也重算。
+- **`statusLine(name, value)` 的 value 不转义**：以前由调用方自己 `esc`，是「漏一处就成注入点」
+  的埋雷式 API。现在 `statusLine` 内部转义，需要放标记的地方显式用新增的 `statusLineHtml`
+  ——「要 HTML」成为一个看得见的决定。顺带把 `防白嫖护栏` 那处调用方 `esc` 去掉，避免双重转义。
+- **死代码清理**：`.rubric-row` / `.rubric-row-head` / `.rubric-dot` / `.rubric-key` /
+  `.rubric-desc` 在标记里早已不存在（实际用 `.rubric-item`），连 `rubricDotPulse` 关键帧一起删
+  （选择器组、玻璃层列表、`no-ambient-fx` 列表里的引用同步清掉）。`withBusy` 里恢复文本的条件
+  `if (textContent !== oldText && textContent === '')` 恒假（loading 是 CSS `::after` 画的，
+  没人改 textContent），改成 `if (!btn.textContent)`。
+- **`POST /api/entry` 的 min_favor 只钳 ≥0**：前端钳了上限，直接调 API 可以写入超过
+  `MAX_ABS_SCORE` 的门槛 —— 这种条目**永远不会解锁**。现在 modify 与 `/api/entry/new` 两处都
+  钳到 `helpers["max_abs_score"]()`（实测 9999 → 100），并删掉已被 `max(0,…)` 覆盖的死校验。
+- **`POST /api/heat/reset` 不持锁**：与检索路径的 `_bump_hits` 存在「刚累加的计数被空字典覆盖」
+  的理论竞态。现在 `memory` 侧新增 `_HIT_LOCK`（`RLock`，reset 持锁时会再进 `_save_hit_stats`）
+  与 `reset_hit_stats()`，WebUI 只调这个接口；`_bump_hits` 的读改写也在锁内
+  （实测 8 线程 × 20 条 × 1 次 = 160，一条不丢）。
+
 ### 2.2.15
 
 **「保存并重试」真的重试 + 弹窗打开时提示能看见 + 密钥框不再抢走弹窗**
@@ -665,37 +689,3 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
   一句无信息量的提示。本插件自己的 `{"error":"HTTPException","message":"…"}` 仍是业务错误。
 - **Firefox 滑杆拇指没样式**：只有 `::-webkit-slider-thumb`，Firefox 回退成默认外观。补
   `::-moz-range-thumb`（与 webkit 同款）和 `::-moz-range-track`（跟主题走）。
-
-### 2.2.13
-
-**前端「高」2 项 + 「中」3 项 + 「低」6 项**
-
-- **业务 404 被当成「后端挂了」**：`mutate()` 里 `e.status === 404` 一律走演示分支，可后端在
-  正常业务里就会回 404（找不到条目 / 回收站记录 / 锚点 / 笔记 / 档案）。典型：两个标签页开着，
-  A 页删了条目，B 页（列表已过期）再点删除 → 顶栏亮「演示数据」+ 弹「操作已在本地模拟」，
-  而真相是「这条早就不存在」。现在只有**路由不存在**的 404（响应体不是本插件 JSON）才回落
-  演示；业务 404 直接把后端原话 toast 出来。`load()` 同理 —— 注入预览以前在「频道不存在」时
-  会显示一段 **MOCK 假文本**，对调参页来说是主动误导。
-- **备忘录「搜索态下保存写进错误频道」**：保存用的是 `state.memoChannel`，而它只在非搜索态
-  更新。搜索 → 下拉切到频道 B → 填内容点保存 → 静默写进搜索前的频道 A，且当前列表（按 B
-  过滤）看不到，像「保存丢了」。现在用**界面当前选中的频道**，并在表单里显示「保存到：B」。
-- **暗色主题按钮 loading 转圈不可见**：`color: transparent !important` 把 `currentColor` 也染成
-  透明，只有亮色主题有补救规则。补 `[data-theme="dark"] ...::after { border-top-color:
-  var(--accent-strong) }`，夜间模式下「导出 / 导入 / 重置热度」等 busy 时能看到转圈。
-- **`@keyframes dotPulse` 重名**：两处同名定义，后一处（box-shadow 版）全局覆盖前一处
-  （transform 版），`.metric::after` 的呼吸动画会变形。第二处改名 `rubricDotPulse`。
-- **概览「门槛分布」同名键互相覆盖**：`{...dist_tier1, ...dist_tier2}` 让 2 档条数替换掉 1 档，
-  「门槛 ≥ X」统计偏小。改为逐键求和。
-- **侧栏「背景记忆」徽章不刷新**：只在 `loadOverview` 更新，增/删/恢复条目后是旧值。改成
-  `loadMemory` 也更新（按三档条数求和）。
-- **浏览器刷新绕过未保存守卫**：脏值确认只挂在应用内 `goto()`，F5 / 关标签会静默丢掉「规则与
-  门控」「运行参数」的修改。补 `beforeunload`。
-- **下拉选中值失效后界面与数据源不一致**：频道消失时 `el.value = keep` 失败、select 显示第一项，
-  而加载逻辑仍用旧 `state.*Channel`。`fillChannelSelects` 结尾把 state 拉回与界面一致。
-- **笔记披露门槛硬编码 100**：`min(100, …)` 让 `MAX_ABS_SCORE=200` 的部署最高只能填 100；
-  改用 `helpers["max_abs_score"]()`。前端 `memoMinFavor` 也改走 `clampInt(0, maxAbsSafe())`
-  （负数手输以前会被后端静默夹成 0）。
-- **演示态「清理过期」用错频道**：真实请求用界面频道、mockApply 用 `state.memoChannel`，
-  跨频道搜索态下不一致。统一成 `_ck`。
-- **取消导航仍触发转场**：`goto` 包装层先放 `FX.veil()/replay()` 再 await，用户点「取消」后页面
-  没变却闪了一次转场。改成切换成功（返回值不为 false）后再放。
