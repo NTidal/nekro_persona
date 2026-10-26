@@ -946,6 +946,23 @@ dialog::backdrop { background: rgba(20, 18, 14, 0.55); }
   width: min(370px, calc(100vw - 32px));
   pointer-events: none;
 }
+
+/* 用 popover 把 toast 送进 top layer：原生 <dialog>.showModal() 之后，普通 z-index
+   永远画在 dialog::backdrop（含 blur(12px) + 暗色）下面 —— 弹窗里点「改分」时的成功/
+   失败提示基本不可读。popover 与 dialog 同属 top layer，后加入的在上。
+   UA 对 popover 有一堆默认样式（inset:0 / margin:auto / border / padding / background），
+   必须显式清掉，否则会盖住整屏。 */
+.toast-region[popover] {
+  inset: auto 20px 20px auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  overflow: visible;
+}
+@supports selector(:popover-open) {
+  .toast-region:not(:popover-open) { display: none; }
+}
 .toast {
   display: flex;
   align-items: flex-start;
@@ -2746,9 +2763,21 @@ body.is-scrolling .dialog-foot {
   </div>
   <div class="dialog-body" id="confirmBody"></div>
   <div class="dialog-foot" id="confirmFoot"></div>
+<!-- 密钥弹窗：必须是**独立**的 <dialog>。以前复用 #dialog，401 一到就把正在用的弹窗
+     （重置热度 / 档案详情 / 确认流程）内容覆写掉，按钮的 loading/禁用状态也一起没了。 -->
+<dialog id="keyDlg" class="dialog">
+  <div class="dialog-head">
+    <div><h2 id="keyDlgTitle"></h2><p id="keyDlgSubtitle"></p></div>
+    <button class="btn icon-only ghost" type="button" id="keyDlgClose" aria-label="关闭">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+    </button>
+  </div>
+  <div class="dialog-body" id="keyDlgBody"></div>
+  <div class="dialog-foot" id="keyDlgFoot"></div>
+</dialog>
 </dialog>
 
-<div class="toast-region" id="toastRegion" aria-live="polite"></div>
+<div class="toast-region" id="toastRegion" popover="manual" aria-live="polite"></div>
 
 <!-- 幻墨 FX 层 -->
 <canvas id="fxCanvas" aria-hidden="true"></canvas>
@@ -2822,13 +2851,29 @@ const TIER_LABEL = { tier1: '1 档 · 身份', tier2: '2 档 · 往事', tier3: 
 
 /* ---------------- Toast ---------------- */
 function toast(msg, type = 'info', ms = 3400) {
+  const region = $('#toastRegion');
+  if (!region) return;
   const el = document.createElement('div');
   el.className = `toast ${type}`;
   el.textContent = msg;
-  $('#toastRegion').appendChild(el);
+  region.appendChild(el);
+  // ⚠️ 原生 <dialog>.showModal() 之后，任何 z-index 都画不过 top layer：弹窗打开时的
+  //    提示会被 ::backdrop（还带 blur）压在后面。这里把 toast 区域按 popover 重新 show
+  //    一次 —— 后加入 top layer 的元素在上，于是它排在 dialog 之上。
+  if (typeof region.showPopover === 'function') {
+    try {
+      if (region.matches(':popover-open')) region.hidePopover();
+      region.showPopover();
+    } catch (err) { /* 旧浏览器：退回 z-index（弹窗内看不清，但至少不报错） */ }
+  }
   setTimeout(() => {
     el.classList.add('out');
-    setTimeout(() => el.remove(), 240);
+    setTimeout(() => {
+      el.remove();
+      if (!region.children.length && typeof region.hidePopover === 'function') {
+        try { if (region.matches(':popover-open')) region.hidePopover(); } catch (err) {}
+      }
+    }, 240);
   }, ms);
 }
 
@@ -3061,6 +3106,16 @@ async function api(path, { method = 'GET', body } = {}) {
   return data;
 }
 
+/* ── 401 重放 ─────────────────────────────────────────────────────
+   api() 收到 401 时，包装层把「这次调用」登记到 _authPending；密钥框的「保存并重试」
+   保存后真的重放它。以前 401 一律 return null —— 触发 401 的那次 POST 被静默丢弃，
+   用户看到列表刷新就以为删/存成功了（按钮文案却叫「保存并重试」）。
+   重放期间再遇 401 直接抛给调用方，不再弹框（否则填错密钥会来回弹）。 */
+let _authPending = null;
+let _authReplaying = false;
+function _setAuthPending(run, label) { if (!_authReplaying) _authPending = { run, label }; }
+function _takeAuthPending() { const j = _authPending; _authPending = null; return j; }
+
 /* 业务错误 = 后端确实返回了本插件 API 的 JSON（带 message/detail）；
    路由层 404（路径写错 / 插件没挂上）不会有这两个字段。 */
 function isBusinessError(e) {
@@ -3081,7 +3136,12 @@ async function load(path, mockFn) {
     setDemo(false);
     return d;
   } catch (e) {
-    if (e.status === 401) { openKeyDialog(e.message); return null; }
+    if (e.status === 401) {
+      if (_authReplaying) throw e;                  // 重放期间不再弹框，交给调用方提示
+      _setAuthPending(() => load(path, mockFn), path);
+      openKeyDialog(e.message);
+      return null;
+    }
     if (e.status === 403) { toast(e.message, 'warning', 5200); return null; }
     if (isBusinessError(e)) {
       // 「频道不存在」这类业务错误不能拿演示数据糊弄：注入预览会显示一段假文本，
@@ -3103,8 +3163,10 @@ async function postAction(path, body) {
     return await api(path, { method: 'POST', body: body === undefined ? {} : body });
   } catch (e) {
     if (e.status === 401) {
+      if (_authReplaying) throw e;
+      _setAuthPending(() => postAction(path, body), path);
       openKeyDialog(e.message);
-      toast(e.message || '需要访问密钥：请在右上角设置 X-WebUI-Key', 'warning', 5200);
+      toast(e.message || '需要访问密钥：本次操作没有执行', 'warning', 5200);
       return null;
     }
     throw e;
@@ -3112,14 +3174,22 @@ async function postAction(path, body) {
 }
 
 /* POST：真实执行；演示模式下只做本地模拟并提示 */
-async function mutate(path, body, { mockApply, okMsg } = {}) {
+async function mutate(path, body, opts = {}) {
+  const { mockApply, okMsg } = opts;
   try {
     const d = await api(path, { method: 'POST', body });
     setDemo(false);
     if (okMsg) toast(okMsg, 'success');
     return d;
   } catch (e) {
-    if (e.status === 401) { openKeyDialog(e.message); return null; }
+    if (e.status === 401) {
+      if (_authReplaying) throw e;
+      _setAuthPending(() => mutate(path, body, opts), path);
+      // 明确告诉用户「这次操作没有执行」：以前只弹密钥框，列表一刷新看着像成功了
+      toast('需要访问密钥：本次操作没有执行', 'warning', 5200);
+      openKeyDialog(e.message);
+      return null;
+    }
     // ⚠️ 只有「路由不存在」的 404 才当后端挂掉。业务 404（找不到条目/回收站记录/
     //    锚点/笔记/档案）是正常结果：走演示分支会亮「演示数据」徽章、再弹一条
     //    「操作已在本地模拟」，而真相是「这东西早就不存在了」。
@@ -3509,32 +3579,75 @@ $('#refreshBtn').addEventListener('click', async () => {
 });
 
 /* ---------------- 访问密钥 ---------------- */
+const keyDlg = $('#keyDlg');
+function closeKeyDialog() { if (keyDlg.open) keyDlg.close(); }
+
 function openKeyDialog(reason) {
   // reason = 后端 401 的原文（如「未配置 WEBUI_ACCESS_KEY：管理接口默认拒绝访问…」）。
-  // 以前只弹框、把后端的话丢掉 —— 用户只看到「请提供密钥」，不知道其实是服务端没配。
-  openDialog({
-    title: '访问密钥',
-    subtitle: reason || '后端要求 X-WebUI-Key 请求头（插件配置 WEBUI_ACCESS_KEY）',
-    body: `<div class="field-label">密钥<input class="field" id="keyInput" type="password" placeholder="粘贴插件配置里的 WEBUI_ACCESS_KEY" value="${esc(state.key)}"></div>
-           <p class="hint">密钥只保存在本机 localStorage，不会上传到任何第三方。</p>
-           <p class="hint">若你就是管理员：请到 NA 插件配置里设置 WEBUI_ACCESS_KEY —— 未配置时所有接口都会返回 401，留空不能绕过。</p>`,
-    foot: `<button class="btn" type="button" data-dlg="cancel">取消</button>
-           <button class="btn primary" type="button" data-dlg="save-key">保存并重试</button>`,
-  });
+  // 独立 <dialog>：复用 #dialog 会把用户正在用的弹窗（重置热度 / 档案详情 / 确认流程）
+  // 内容直接覆写掉，那个弹窗按钮的 loading/禁用状态也随之丢失。
+  $('#keyDlgTitle').textContent = '访问密钥';
+  $('#keyDlgSubtitle').textContent =
+    reason || '后端要求 X-WebUI-Key 请求头（插件配置 WEBUI_ACCESS_KEY）';
+  $('#keyDlgBody').innerHTML =
+    `<div class="field-label">密钥<input class="field" id="keyInput" type="password"
+       placeholder="粘贴插件配置里的 WEBUI_ACCESS_KEY" value="${esc(state.key)}"></div>
+     <p class="hint">密钥只保存在本机 localStorage，不会上传到任何第三方。</p>
+     <p class="hint">若你就是管理员：请到 NA 插件配置里设置 WEBUI_ACCESS_KEY —— 未配置时
+       所有接口都会返回 401，留空不能绕过。</p>
+     <p class="hint" id="keyRetryHint" hidden></p>`;
+  $('#keyDlgFoot').innerHTML =
+    `<button class="btn" type="button" data-dlg="cancel">取消</button>
+     <button class="btn primary" type="button" data-dlg="save-key">保存并重试</button>`;
+  const hint = $('#keyRetryHint');
+  if (hint && _authPending) {
+    hint.hidden = false;
+    hint.textContent = `保存后会自动重试：${_authPending.label}`;
+  }
+  if (!keyDlg.open) keyDlg.showModal();
+  const inp = $('#keyInput');
+  if (inp) { inp.focus(); inp.select && inp.select(); }
 }
 $('#dialogFoot').addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-dlg]');
   if (!btn) return;
   const act = btn.dataset.dlg;
   if (act === 'cancel') return closeDialog();
-  if (act === 'save-key') {
-    state.key = $('#keyInput').value.trim();
-    try { localStorage.setItem('np_key', state.key); } catch (err) {}
-    closeDialog();
-    toast('密钥已保存', 'success', 1600);
-    (LOADERS[state.tab] || (() => {}))();
-  }
 });
+$('#keyDlgFoot').addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-dlg]');
+  if (!btn) return;
+  const act = btn.dataset.dlg;
+  if (act === 'cancel') { _takeAuthPending(); return closeKeyDialog(); }
+  if (act !== 'save-key') return;
+  const inp = $('#keyInput');
+  state.key = (inp ? inp.value : '').trim();
+  try { localStorage.setItem('np_key', state.key); } catch (err) {}
+  closeKeyDialog();
+  const job = _takeAuthPending();
+  const reload = LOADERS[state.tab] || (() => {});
+  if (!job) { toast('密钥已保存', 'success', 1600); reload(); return; }
+  // 「保存并重试」现在名副其实：真的把触发 401 的那次调用再跑一遍
+  btn.disabled = true;
+  _authReplaying = true;
+  try {
+    await job.run();
+    toast(`密钥已保存，已重试：${job.label}`, 'success', 2600);
+  } catch (err) {
+    if (err && err.status === 401) {
+      toast('密钥仍被拒绝，请核对插件配置里的 WEBUI_ACCESS_KEY', 'error', 6200);
+    } else {
+      toast((err && err.message) || '重试失败', 'error', 5200);
+    }
+  } finally {
+    _authReplaying = false;
+  }
+  reload();                       // 无论成败都刷一次当前页，避免界面停在中途状态
+});
+$('#keyDlgClose').addEventListener('click', () => { _takeAuthPending(); closeKeyDialog(); });
+// Esc / 点遮罩关闭 = 放弃重放，别让下一次 401 误用陈旧的 pending
+keyDlg.addEventListener('close', () => { _takeAuthPending(); });
+
 $('#keyBtn').addEventListener('click', openKeyDialog);
 
 /* ---------------- 概览 ---------------- */
@@ -5766,7 +5879,9 @@ const FX = (() => {
       const p = document.createElement('i');
       p.className = 'fx-confetti';
       p.style.background = colors[i % colors.length];
-      document.body.appendChild(p);
+      // 弹窗开着时粒子要进 dialog：普通 body 子元素会被 top layer 的 dialog 与
+      // 带 blur 的 ::backdrop 挡在后面（看不见，还以为没触发）。
+      (document.querySelector('dialog[open]') || document.body).appendChild(p);
       const ang = Math.random() * Math.PI * 2;
       const dist = 120 + Math.random() * 260;
       const dx = Math.cos(ang) * dist;
