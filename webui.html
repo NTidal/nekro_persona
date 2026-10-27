@@ -2726,6 +2726,18 @@ body.is-scrolling .dialog-foot {
   <div class="dialog-body" id="dialogBody"></div>
   <div class="dialog-foot" id="dialogFoot"></div>
 </dialog>
+<!-- 密钥弹窗：必须是**独立**的 <dialog>。以前复用 #dialog，401 一到就把正在用的弹窗
+     （重置热度 / 档案详情 / 确认流程）内容覆写掉，按钮的 loading/禁用状态也一起没了。 -->
+<dialog id="keyDlg" class="dialog">
+  <div class="dialog-head">
+    <div><h2 id="keyDlgTitle"></h2><p id="keyDlgSubtitle"></p></div>
+    <button class="btn icon-only ghost" type="button" id="keyDlgClose" aria-label="关闭">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+    </button>
+  </div>
+  <div class="dialog-body" id="keyDlgBody"></div>
+  <div class="dialog-foot" id="keyDlgFoot"></div>
+</dialog>
 
 <!-- 确认弹窗：必须是**独立**的 <dialog>。
      复用 #dialog 会把正在编辑的弹窗内容顶掉（点「删除档案」再取消，档案弹窗就没了，
@@ -2739,18 +2751,6 @@ body.is-scrolling .dialog-foot {
   </div>
   <div class="dialog-body" id="confirmBody"></div>
   <div class="dialog-foot" id="confirmFoot"></div>
-<!-- 密钥弹窗：必须是**独立**的 <dialog>。以前复用 #dialog，401 一到就把正在用的弹窗
-     （重置热度 / 档案详情 / 确认流程）内容覆写掉，按钮的 loading/禁用状态也一起没了。 -->
-<dialog id="keyDlg" class="dialog">
-  <div class="dialog-head">
-    <div><h2 id="keyDlgTitle"></h2><p id="keyDlgSubtitle"></p></div>
-    <button class="btn icon-only ghost" type="button" id="keyDlgClose" aria-label="关闭">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
-    </button>
-  </div>
-  <div class="dialog-body" id="keyDlgBody"></div>
-  <div class="dialog-foot" id="keyDlgFoot"></div>
-</dialog>
 </dialog>
 
 <div class="toast-region" id="toastRegion" popover="manual" aria-live="polite"></div>
@@ -3089,7 +3089,14 @@ async function api(path, { method = 'GET', body } = {}) {
    重放期间再遇 401 直接抛给调用方，不再弹框（否则填错密钥会来回弹）。 */
 let _authPending = null;
 let _authReplaying = false;
-function _setAuthPending(run, label) { if (!_authReplaying) _authPending = { run, label }; }
+function _setAuthPending(run, label, sticky) {
+  if (_authReplaying) return;
+  // ⚠️ 写操作优先：保存条目 POST 401 之后，处理函数通常紧跟着 loadMemory()/loadXxx()，
+  //    那个 GET 也会 401 —— 无条件覆盖会让「保存并重试」重放的是列表加载（toast 自证
+  //    「已重试：entries」），用户那条保存被静默丢弃。sticky=true 的写操作不被 GET 覆盖。
+  if (_authPending && _authPending.sticky && !sticky) return;
+  _authPending = { run, label, sticky: !!sticky };
+}
 function _takeAuthPending() { const j = _authPending; _authPending = null; return j; }
 
 /* 业务错误 = 后端确实返回了本插件 API 的 JSON（带 message/detail）；
@@ -3140,7 +3147,7 @@ async function postAction(path, body) {
   } catch (e) {
     if (e.status === 401) {
       if (_authReplaying) throw e;
-      _setAuthPending(() => postAction(path, body), path);
+      _setAuthPending(() => postAction(path, body), path, true);
       openKeyDialog(e.message);
       toast(e.message || '需要访问密钥：本次操作没有执行', 'warning', 5200);
       return null;
@@ -3160,7 +3167,7 @@ async function mutate(path, body, opts = {}) {
   } catch (e) {
     if (e.status === 401) {
       if (_authReplaying) throw e;
-      _setAuthPending(() => mutate(path, body, opts), path);
+      _setAuthPending(() => mutate(path, body, opts), path, true);
       // 明确告诉用户「这次操作没有执行」：以前只弹密钥框，列表一刷新看着像成功了
       toast('需要访问密钥：本次操作没有执行', 'warning', 5200);
       openKeyDialog(e.message);
@@ -3578,7 +3585,8 @@ function openKeyDialog(reason) {
   const hint = $('#keyRetryHint');
   if (hint && _authPending) {
     hint.hidden = false;
-    hint.textContent = `保存后会自动重试：${_authPending.label}`;
+    hint.textContent = `保存后会自动重试：${_authPending.label}`
+      + (_authPending.sticky ? '（这是你的写操作，不会被列表刷新覆盖）' : '');
   }
   if (!keyDlg.open) keyDlg.showModal();
   const inp = $('#keyInput');
@@ -4909,21 +4917,41 @@ function renderAnchor(data) {
     </div>`).join('');
 }
 
+/* 圆点设为第 N 档的公共逻辑：鼠标点具体圆点 → 直接设该档；键盘激活 → 前进一档（到顶回 1）。 */
+async function setAnchorSalience(id, v) {
+  const res = await mutate('tier4', { op: 'salience', id, salience: v }, {
+    mockApply: () => {
+      const a2 = MOCK.raw.anchors.find((x) => x.id === id);
+      if (a2) a2.salience = v;
+    },
+    okMsg: `核心度已设为 ${v}`,
+  });
+  if (res) loadAnchor();
+}
+
+/* F8：圆点是 role="button" tabindex="0"，但 Enter/Space 之前没有任何响应（点得到、按不动）。
+   Enter/Space = 前进一档；ArrowLeft/ArrowRight 直接减/加一档。 */
+$('#anchorList').addEventListener('keydown', async (e) => {
+  const dots = e.target.closest('[data-act="salience-set"]');
+  if (!dots) return;
+  const cur = [...dots.querySelectorAll('i[data-v]')]
+    .filter((d) => d.classList.contains('on')).length || 1;
+  let next = null;
+  if (e.key === 'Enter' || e.key === ' ') next = cur >= 5 ? 1 : cur + 1;
+  else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') next = Math.min(5, cur + 1);
+  else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') next = Math.max(1, cur - 1);
+  if (next === null) return;
+  e.preventDefault();
+  await setAnchorSalience(dots.dataset.id, next);
+});
+
 $('#anchorList').addEventListener('click', async (e) => {
   // 点「核心度」圆点 = 直接设为第 N 档（原来只能下拉选，圆点纯装饰、点了没反应）
   const dots = e.target.closest('[data-act="salience-set"]');
   if (dots) {
     const dot = e.target.closest('i[data-v]');
     if (!dot) return;
-    const v = parseInt(dot.dataset.v, 10) || 1;
-    const res = await mutate('tier4', { op: 'salience', id: dots.dataset.id, salience: v }, {
-      mockApply: () => {
-        const a2 = MOCK.raw.anchors.find((x) => x.id === dots.dataset.id);
-        if (a2) a2.salience = v;
-      },
-      okMsg: `核心度已设为 ${v}`,
-    });
-    if (res) loadAnchor();
+    await setAnchorSalience(dots.dataset.id, parseInt(dot.dataset.v, 10) || 1);
     return;
   }
   const btn = e.target.closest('[data-act="del"]');

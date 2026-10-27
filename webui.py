@@ -1891,7 +1891,15 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             }
         # 扩展：分档互动指引（key = 档位名）
         if "stage_guides" in body and isinstance(body["stage_guides"], dict):
-            names = {str(s.get("name") or "") for s in (patch.get("stages") or [])}
+            _stage_src = patch.get("stages")
+            if _stage_src is None:
+                # ⚠️ 只改指引、不带 stages 的请求：以前 names 为空集 → `if names and ...`
+                #    短路，孤儿指引（档位已改名/删除）全部保留。这里读一次磁盘上的现有档位。
+                try:
+                    _stage_src = (memory.load_favor_cfg() or {}).get("stages") or []
+                except Exception:  # noqa: BLE001
+                    _stage_src = []
+            names = {str(s.get("name") or "").strip() for s in (_stage_src or [])}
             guides: Dict[str, str] = {}
             for raw_name, raw_text in body["stage_guides"].items():
                 name = str(raw_name or "").strip()[:12]
@@ -2724,7 +2732,9 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             raise HTTPException(status_code=500, detail=_public_detail(f"写入命中统计失败：{exc}")) from exc
         st = memory._state()
         plugin.logger.info(f"[persona] WebUI 重置热度：清空 {before} 条命中统计（{st.get('dir')}）")
-        return {"ok": True, "cleared": before, "dir": str(st.get("dir") or "")}
+        # dir 是宿主机绝对路径：与 _public_detail 同口径替换，别泄露部署结构
+        return {"ok": True, "cleared": before,
+                "dir": _public_detail(str(st.get("dir") or ""))}
 
     @router.post("/api/reload", summary="重载背景记忆")
     async def api_reload(request: Request) -> Dict[str, Any]:
@@ -2733,6 +2743,11 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             await memory.ensure_loaded(force=True)
         except ValueError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        # 热度统计也要跟着重读：它是独立 sidecar，ensure_loaded 不会碰它
+        try:
+            memory.reload_hit_stats()
+        except Exception as exc:  # noqa: BLE001
+            plugin.logger.warning(f"[persona] 重载命中统计失败（忽略）: {exc}")
         return {"ok": True, "status": memory.status()}
 
     return router

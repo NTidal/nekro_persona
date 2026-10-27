@@ -72,7 +72,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.2.16",
+    version="2.2.17",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -3966,8 +3966,12 @@ async def _memlog_scan_once() -> int:
             # 注意：push_materials 返回的是「桶内累计条数」而非本次增量，
             # 直接累加会把 1+3+5+… 全部相加，日志严重虚高（实测把 15 条报成 50 条）。
             # 这里用 len(mats) 才是真正的「本次新采集数」。
-            persona_consolidator.push_materials(ck, mats)
-            added += len(mats)
+            # 同一段对话可能吐出重复 reason（多轮重试、同一句被多次判定）：入桶前按
+            # 归一化文本去重（桶是 500 条上限，重复素材会白占额度）。dedup_materials
+            # 之前一直只有定义没有调用 —— 顺手接进正式路径。
+            _mats = persona_consolidator.dedup_materials(mats)
+            persona_consolidator.push_materials(ck, _mats)
+            added += len(_mats)
 
     if max_id > cursor:
         with _MEMLOG_STATE_LOCK:

@@ -973,6 +973,21 @@ def _bump_hits_locked(entries: List[Dict[str, Any]], tier: int, now: float,
         st["hit_last_save"] = float(now)
 
 
+def reload_hit_stats() -> int:
+    """从磁盘重读命中统计（`/api/reload` 用），返回读到的条数。
+
+    ⚠️ 必须有这个入口：`ensure_loaded(force=True)` 只在 `hit_loaded` 为假时才读 sidecar，
+    一旦内存里是空的（比如刚做过重置），重载背景记忆**不会**把盘上的统计读回来 ——
+    而下一次 `_bump_hits` 的去抖落盘又会拿空内存覆盖文件。
+    """
+    with _HIT_LOCK:
+        st = _state()
+        st["hit_stats"] = _load_hit_stats(st.get("dir"))
+        st["hit_loaded"] = True
+        st["hit_dirty"] = False
+        return len(st["hit_stats"])
+
+
 def reset_hit_stats() -> int:
     """清空命中统计并立即落盘，返回被清掉的条数。
 
