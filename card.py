@@ -352,14 +352,19 @@ def _split_emoji_runs(text: str) -> list:
     return runs
 
 
+# 同字号下彩色 emoji 的墨迹明显大于汉字（实测 25px 时 ⚽ 宽 34px / 汉字 25px），
+# 直接同字号画出来会「大一号」，所以按这个比例缩一点。
+_EMOJI_SIZE_RATIO = 0.86
+
+
 def _emoji_font_for(font: Any) -> Any | None:
-    """按主字体字号取 emoji 字体实例（同字号缓存）；不可用返回 None。"""
+    """按主字体字号取 emoji 字体实例（缩放后同字号缓存）；不可用返回 None。"""
     if not _emoji_font_path:
         return None
     size = getattr(font, "size", None)
     if not size:
         return None
-    key = int(size)
+    key = max(8, int(round(float(size) * _EMOJI_SIZE_RATIO)))
     if key not in _emoji_font_cache:
         try:
             from PIL import ImageFont
@@ -532,16 +537,30 @@ class _EmojiDraw:
             out.append((buf, cur_font, cur_emoji))
         return out if changed else None
 
+    def _emoji_dy(self, seg: str, ef: Any, base_font: Any) -> float:
+        """把 emoji 的墨迹垂直居中到汉字墨迹上。
+
+        ⚠️ 同字号下 emoji 的 ink 顶部比汉字高一截（实测 25px 时 辰=5..27 / ⚽=-3..23），
+           直接按同一基线画会整体偏上、看着"飘"在文字上方。
+        """
+        try:
+            bb_e = self._draw.textbbox((0, 0), seg, font=ef)
+            bb_b = self._draw.textbbox((0, 0), "国", font=base_font)
+            return ((bb_b[1] + bb_b[3]) - (bb_e[1] + bb_e[3])) / 2
+        except Exception:  # noqa: BLE001
+            return 0
+
     def text(self, xy, text, fill=None, font=None, **kwargs):
         runs = self._runs(text, font)
         if not runs:
             return self._draw.text(xy, text, fill=fill, font=font, **kwargs)
         x = xy[0]
         for seg, f, is_e in runs:
+            dy = self._emoji_dy(seg, f, font) if is_e else 0
             if is_e and _emoji_font_color:
-                self._draw.text((x, xy[1]), seg, font=f, embedded_color=True, **kwargs)
+                self._draw.text((x, xy[1] + dy), seg, font=f, embedded_color=True, **kwargs)
             else:
-                self._draw.text((x, xy[1]), seg, fill=fill, font=f, **kwargs)
+                self._draw.text((x, xy[1] + dy), seg, fill=fill, font=f, **kwargs)
             x += self._draw.textlength(seg, font=f)
         return None
 
@@ -558,7 +577,8 @@ class _EmojiDraw:
         box = None
         x = xy[0]
         for seg, f, _e in runs:
-            bb = self._draw.textbbox((x, xy[1]), seg, font=f, **kwargs)
+            _dy = self._emoji_dy(seg, f, font) if _e else 0
+            bb = self._draw.textbbox((x, xy[1] + _dy), seg, font=f, **kwargs)
             box = bb if box is None else (
                 min(box[0], bb[0]), min(box[1], bb[1]),
                 max(box[2], bb[2]), max(box[3], bb[3]),
