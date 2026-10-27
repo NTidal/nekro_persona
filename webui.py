@@ -2864,6 +2864,25 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             in_data_dir = bool(resolved) and Path(resolved).parent == Path(font_dir)
         except Exception:  # noqa: BLE001
             in_data_dir = False
+        # emoji 字体是独立的探测链（数据目录 *emoji* → 系统扫描 → 固定候选），单独汇报
+        emoji: Dict[str, Any] = {"name": "", "resolved": "", "color": False,
+                                 "inDataDir": False, "pinSource": "", "exists": False}
+        try:
+            em_path = _card._find_emoji_font(font_dir) or ""
+            em_marker = Path(font_dir) / _card._EMOJI_PIN_MARKER
+            em_pin: Dict[str, Any] = {}
+            if em_marker.is_file():
+                em_pin = json.loads(em_marker.read_text(encoding="utf-8")) or {}
+            emoji = {
+                "name": Path(em_path).name if em_path else "",
+                "resolved": em_path,
+                "color": bool(_card._font_has_color(em_path)) if em_path else False,
+                "inDataDir": bool(em_path) and Path(em_path).parent == Path(font_dir),
+                "pinSource": str(em_pin.get("source") or ""),
+                "exists": bool(em_path and Path(em_path).is_file()),
+            }
+        except Exception:  # noqa: BLE001
+            plugin.logger.debug("emoji 字体探测失败（忽略）", exc_info=True)
         return {
             "config": cfg_path,
             "resolved": resolved,
@@ -2873,6 +2892,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "pinned": str(pin_info.get("pinned") or ""),
             "pinSource": str(pin_info.get("source") or ""),
             "fonts": _font_files(),
+            "emoji": emoji,
             "pinEnabled": str(os.environ.get("NEKRO_PERSONA_FONT_PIN", "1")).strip().lower()
             not in ("0", "false", "no", "off"),
         }

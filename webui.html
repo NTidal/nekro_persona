@@ -2505,6 +2505,7 @@ body.is-scrolling .dialog-foot {
               <input type="file" id="cardFontFile" accept=".ttf,.ttc,.otf" hidden>
             </div>
           </div>
+          <p class="hint" id="cardEmojiLine">emoji 字体：读取中…</p>
           <p class="hint" id="cardFontHint">
             上传的字体写入插件数据目录 fonts/ 并立即启用；开关口径见下。
           </p>
@@ -4756,6 +4757,21 @@ async function loadCards(opts = {}) {
   const badge = $('#cardFontBadge');
   badge.textContent = font.exists ? '出图可用' : '无字体';
   badge.className = 'badge' + (font.exists ? '' : ' warn');
+
+  const em = font.emoji || {};
+  const emLine = $('#cardEmojiLine');
+  if (emLine) {
+    if (em.name) {
+      const where = em.inDataDir ? '数据目录' : (em.pinSource ? `系统字体（来源 ${em.pinSource}）` : '系统目录');
+      emLine.innerHTML = `emoji 字体：<b>${esc(em.name)}</b>　·　${em.color ? '彩色' : '单色'}　·　${esc(where)}`
+        + `${em.inDataDir && em.pinSource ? '（已落地副本）' : ''}`
+        + `<br>把文件名里带 <code>emoji</code> 的字体放进数据目录 fonts/ 即可覆盖。`;
+      emLine.classList.remove('warn');
+    } else {
+      emLine.innerHTML = '⚠️ 未找到 emoji 字体，卡片里的 emoji 会显示成豆腐块：把 <code>*emoji*.ttf</code>（如 emoji-segoe.ttf）放进数据目录 fonts/。';
+      emLine.classList.add('warn');
+    }
+  }
 
   const sel = $('#cardFontSelect');
   const fonts = font.fonts || [];

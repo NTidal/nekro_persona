@@ -5,7 +5,7 @@
 > **2.0 起**：前 3 档是手工策划的「种子」（模型不可改）；**tier4 是「生长」**——角色在运行时自己沉淀的身份锚点（身份）与频道笔记（功能），
 > 并具备**种子包 / 生长包分离导出**：角色定义可公开版本化，「这一世活过的痕迹」可整体迁移备份。
 
-版本 **2.3.4**　作者 **NTidal**　许可 **GPLv3**
+版本 **2.3.5**　作者 **NTidal**　许可 **GPLv3**
 
 ---
 
@@ -621,6 +621,35 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
 
 > 本日志只保留**最近三个版本**的改动；更早的版本见 git 提交历史（`git log --oneline`）。
 
+### 2.3.5
+
+**emoji 字体：探测范围补齐 + 也纳入落地 + 前端可见**
+
+2.3.4 之前 emoji 字体是「只认固定候选路径」的自动探测，且**没有**落地：
+
+1. 探测只查 `_EMOJI_FONT_CANDIDATES` 里写死的几个路径（windows/seguiemj、noto、Symbola 等），
+   而本项目的镜像把 emoji 字体放在 `/usr/share/fonts/truetype/nekro/emoji-segoe.ttf` ——
+   **不在候选里**。数据目录没放 emoji 字体的实例（例如刚重建的容器）会判定「没有 emoji 字体」，
+   卡片里的 emoji 全部变成豆腐块。
+2. 即使探到了，也只是「现探现用」：容器重建后系统字体一变，彩色 emoji 就没了。
+
+现在：
+
+- 探测链改为 **数据目录 `*emoji*` → 系统字体目录扫描（`/usr/share/fonts`、`/usr/local/share/fonts`、
+  `~/.local/share/fonts`、`C:/Windows/Fonts`，按文件名含 emoji）→ 固定候选**；
+- 探到后与正文字体一样**落地**：复制进插件数据目录并写 `.emoji_font_pin.json`
+  （与正文的 `.font_pin.json` 分开记录，互不覆盖）；
+- WebUI「卡片预览 → 当前字体」多一行：emoji 字体名 / 彩色或单色 / 在数据目录还是系统 / 是否落地副本；
+  没探到会红字提示怎么修。想覆盖就把文件名带 `emoji` 的字体丢进数据目录 `fonts/`。
+
+实测（NA1，把数据目录指向空目录模拟裸机）：
+
+```
+探测到: /tmp/emoji_bare_fonts/emoji-segoe.ttf   （来自 /usr/share/fonts/truetype/nekro/emoji-segoe.ttf）
+彩色: True   已落地: True   标记: .emoji_font_pin.json  {"pinned":…,"source":…,"size":12934920}
+第二次调用: 同一文件、未被重写（不重复复制 12.9 MB）
+```
+
 ### 2.3.4
 
 **WebUI 新增「卡片预览」页：三张卡模拟渲染 + 当前字体与自定义字体**
@@ -683,22 +712,3 @@ POST /api/font?name=x.otf   请求体为字体原始字节（application/octet-s
 ④ 副本删除 → 自动重新落地
 ⑤ 源本来就在数据目录 → 不复制、路径不变
 ```
-
-### 2.3.2
-
-**修 emoji 与汉字不对齐（看着「乱」）：缩放 + 垂直居中**
-
-2.3.1 里 emoji 虽然重新走彩色字体了，但直接按同一字号、同一起点画，观感是「飘在字上方、大一号」：
-
-```
-25px 实测：汉字「辰」ink = y 5..27；emoji「⚽」ink = y -3..23，宽 34px（汉字 25px）
-→ 垂直偏上 6px，横向宽 35%
-```
-
-现在两处都对上：
-
-- `_EMOJI_SIZE_RATIO = 0.86` —— emoji 按 0.86 倍字号出图，墨迹宽度接近一个汉字；
-  `textlength` 用的是同一个缩放后的字体实例，所以排版测量不会和实际绘制脱节；
-- `_EmojiDraw._emoji_dy()` —— 取 emoji 墨迹与「国」字墨迹的垂直中心差，绘制时补上（textbbox 同步）。
-
-实测：修复后 emoji 与「辰光归娅」在同一视觉中线上，标签胶囊里的 🌸、印象里的 🌙 也归位。

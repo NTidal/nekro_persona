@@ -157,6 +157,8 @@ _FONT_LOCK = threading.RLock()
 #   · 只在第一次（或副本丢失时）复制，之后读标记文件直接命中，不重复拷贝。
 # 关掉：环境变量 NEKRO_PERSONA_FONT_PIN=0
 _FONT_PIN_MARKER = ".font_pin.json"
+# emoji 字体单独的落地标记（正文与 emoji 是两条独立的探测链，标记不能互相覆盖）
+_EMOJI_PIN_MARKER = ".emoji_font_pin.json"
 
 
 def _font_pin_enabled() -> bool:
@@ -165,8 +167,11 @@ def _font_pin_enabled() -> bool:
     )
 
 
-def _pin_font(src: str, pin_dir: str) -> str:
-    """把字体复制到插件数据目录并返回副本路径；失败或禁用时原样返回 src。"""
+def _pin_font(src: str, pin_dir: str, marker_name: str = _FONT_PIN_MARKER) -> str:
+    """把字体复制到插件数据目录并返回副本路径；失败或禁用时原样返回 src。
+
+    marker_name 区分「正文/标题字体」与「emoji 字体」两条独立的落地记录。
+    """
     src_path = Path(src)
     if not pin_dir or not src_path.is_file() or not _font_pin_enabled():
         return src
@@ -179,7 +184,7 @@ def _pin_font(src: str, pin_dir: str) -> str:
         except Exception:  # noqa: BLE001
             pass
 
-        marker = pin_root / _FONT_PIN_MARKER
+        marker = pin_root / marker_name
         if marker.is_file():
             try:
                 data = json.loads(marker.read_text(encoding="utf-8"))
@@ -371,10 +376,45 @@ def _pick_emoji_font(paths: list) -> str | None:
     return exists[0] if exists else None
 
 
-def _find_emoji_font(font_dir: str = "") -> str | None:
-    """查找 emoji 字体：插件数据目录 fonts 下文件名含 emoji 的字体 → 系统常见路径。
+def _scan_system_emoji_fonts() -> list:
+    """扫系统字体目录里文件名含 emoji 的字体。
 
-    缓存同样按 font_dir 做 key，失败不锁死。
+    ⚠️ 2.3.4 之前只认 `_EMOJI_FONT_CANDIDATES` 里的固定路径，而本项目的镜像把
+       emoji 字体放在 `/usr/share/fonts/truetype/nekro/emoji-segoe.ttf` ——
+       不在候选表里，于是「数据目录没放 emoji 字体」的实例会白白判定「没有 emoji 字体」，
+       卡片里的 emoji 全成豆腐块。现在先按名字扫目录，扫不到才退固定候选。
+    """
+    roots = [
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+        "/usr/share/fonts/truetype",
+        str(Path.home() / ".local/share/fonts"),
+        "C:/Windows/Fonts",
+    ]
+    out: list = []
+    seen = set()
+    for root in roots:
+        try:
+            rp = Path(root)
+            if not rp.is_dir():
+                continue
+            for ext in ("*.ttf", "*.ttc", "*.otf"):
+                for f in sorted(rp.rglob(ext)):
+                    low = f.name.lower()
+                    if "emoji" in low and str(f) not in seen:
+                        seen.add(str(f))
+                        out.append(str(f))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _find_emoji_font(font_dir: str = "") -> str | None:
+    """查找 emoji 字体：数据目录 fonts 下 *emoji* → 系统目录扫 *emoji* → 固定候选。
+
+    找到后会像正文字体一样**落地**（复制进插件数据目录 + 写 `.emoji_font_pin.json`），
+    这样容器重建 / 换镜像后 emoji 不会突然变豆腐块。
+    缓存按 font_dir 做 key，失败不锁死。
     """
     global _emoji_font_path, _emoji_font_checked, _emoji_font_key, _emoji_font_color
     _key = (font_dir.strip(),)
@@ -393,12 +433,16 @@ def _find_emoji_font(font_dir: str = "") -> str | None:
             ]
             found = _pick_emoji_font(local)
     if not found:
+        found = _pick_emoji_font(_scan_system_emoji_fonts())
+    if not found:
         found = _pick_emoji_font(list(_EMOJI_FONT_CANDIDATES))
 
     if not found:
         logger.warning("未找到 emoji 字体，卡片中的 emoji 将显示为豆腐块（可放 *emoji*.ttf 到数据目录 fonts/）")
         return None
 
+    # 落地：系统 emoji 字体复制进数据目录，之后一律用副本
+    found = _pin_font(found, font_dir.strip(), _EMOJI_PIN_MARKER)
     _emoji_font_path = found
     _emoji_font_color = _font_has_color(found)
     _emoji_font_key = _key
