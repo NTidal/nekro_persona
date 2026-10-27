@@ -5,7 +5,7 @@
 > **2.0 起**：前 3 档是手工策划的「种子」（模型不可改）；**tier4 是「生长」**——角色在运行时自己沉淀的身份锚点（身份）与频道笔记（功能），
 > 并具备**种子包 / 生长包分离导出**：角色定义可公开版本化，「这一世活过的痕迹」可整体迁移备份。
 
-版本 **2.3.12**　作者 **NTidal**　许可 **GPLv3**
+版本 **2.4.0**　作者 **NTidal**　许可 **GPLv3**
 
 ---
 
@@ -621,6 +621,69 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
 
 > 本日志只保留**最近三个版本**的改动；更早的版本见 git 提交历史（`git log --oneline`）。
 
+### 2.4.0
+
+**卡片外观改成「图层模型」：一串图层从底到顶合成，模板存 JSON**
+
+2.3.12 只有「一张背景图 + 模糊 + 明暗」三个旋钮，加个 logo、给照片压一条渐变压暗带、
+给不同卡配不同底图，都得再加参数。这版把外观统一成**层**：一个 dict 一层，按顺序合成。
+
+#### 两阶段 + 十种层
+
+| 阶段 | 层类型 | 作用 |
+|---|---|---|
+| back（画内容之前） | `gradient` | 任意 stop 数的线性渐变（竖/横） |
+|  | `image` | 图片：`fit`=cover/contain/stretch，`blur`、`dim`（不写=自动明暗补偿） |
+|  | `veil` | 整层薄纱（默认暖白，保文字可读） |
+|  | `scrim` | 单边渐隐压暗带（`from`=top/bottom/left/right，`size`、`alpha`） |
+|  | `blobs` | 原有的柔光斑 |
+|  | `tint` | 纯色染色 |
+| front（画内容之后） | `border` | 圆角描边 |
+|  | `text` | 文字水印（`x/y/size/color/align`） |
+|  | `sticker` | 贴图（logo / 角标，`x/y/w/h`） |
+|  | `grain` | 噪点（弱化胶片颗粒，照片底时压色带） |
+
+坐标一律 0~1 相对值，跟渲染倍率、卡片尺寸无关。图片 `src` 建议只写文件名
+（渲染前按数据目录解析成绝对路径，换机器/换挂载点都不怕）。
+
+内置默认模板等价于老观感：`gradient(暖色三停) + blobs`；有自定义背景图时 back 为空（照片就是背景）。
+**升级零回归**：没配模板 = 完全等于 2.3.12 的效果。
+
+#### 一个完整模板
+
+```json
+{"version": 1, "name": "photo-look", "layers": [
+  {"type": "image",   "stage": "back",  "src": "photo2.png", "fit": "cover", "blur": 12},
+  {"type": "veil",    "stage": "back",  "color": "#fffcf6", "alpha": 0.22},
+  {"type": "blobs",   "stage": "back",  "alpha": 1.0},
+  {"type": "border",  "stage": "front", "color": "#ffffffcc", "width": 2, "radius": 0.032},
+  {"type": "sticker", "stage": "front", "src": "logo.png", "x": 0.945, "y": 0.045, "w": 0.045},
+  {"type": "text",    "stage": "front", "text": "nekro_persona · 分层外观",
+   "x": 0.03, "y": 0.945, "size": 11, "color": "#00000055", "align": "left"}
+]}
+```
+
+#### 两处「自动兜底」（防呆，实测踩过）
+
+- 写了 `image` 却没写 `veil` → 自动在图片层后面补一层 0.18 薄纱；
+- 图片层没写 `dim` → 按平均亮度自动算明暗补偿（目标亮度 0.72）。
+- 任何一层出错（图丢了、参数类型错、未知类型）→ **只跳过那一层**并 warning，不出白板也不崩。
+
+#### 页面
+
+「卡片预览」新增**外观图层**卡片：模板下拉（内置默认 + 已保存模板）、加层（10 种类型）、
+层列表（上下移 / 删除 / 每个字段就地编辑）、`仅预览不保存` / `保存并启用`。
+保存写入 `<插件数据目录>/card_layers/<名字>.json` 并把配置 `RANK_CARD_LAYERS` 指过去。
+
+接口：`GET /api/card_layers`、`POST /api/card_layers`（`{name, layers}` 保存 /
+`{select: 名字}` 切换 / `{clear:true}` 复位）；预览接口支持 `layers` 覆盖，不保存也能看效果。
+
+#### 实测
+
+- 三张卡都能跑通图层（单人 1520×782 / 排行榜 1224×440 / 总览 1232×820，尺寸规则不变）；
+- 单人卡分层渲染 0.30s，与默认外观 0.32s 基本持平；坏层容错（`/nope.png` + 未知类型 + 空文字 + 非法 alpha）→ 正常出图；
+- 真浏览器探针：图层卡片 6 行全部渲染、10 种类型可选、模板下拉正确、`pageerror` 0、预览 267 KB。
+
 ### 2.3.12
 
 **方案 A 落地：卡片支持自定义背景图（全局一张）+ 自动可读性调节**
@@ -734,59 +797,3 @@ WebUI「卡片预览 → 字体」显示成一行：
 实测（NA1，真浏览器）：接口 `GET /api/card_preview` 返回 `backend` 字段与上表一致；
 字体页那一行文案正确渲染；推荐目录 5 个「一键安装」按钮 + 3 个「需到官方页面手动下载」；
 `pageerror` 0。
-
-### 2.3.10
-
-**一键安装（只对 OFL 字体开放）+ 修「字形覆盖判定」的根本 bug**
-
-#### 哪些字体能一键安装
-
-判定两头都要满足：许可允许（SIL OFL 1.1 明确允许随软件再分发）、官方有**稳定直链**。
-直链全部实测过 HTTP 200（2026-10 复核）：
-
-| 字体 | 官方直链 | 体积 | 一键安装 |
-|---|---|---|---|
-| 得意黑 Smiley Sans | `…/smiley-sans/releases/latest/download/smiley-sans-v2.0.1.zip` → 取 `SmileySans-Oblique.ttf` | 5.8 MB（字体 2.5 MB） | ✅ |
-| Noto Sans SC（与思源同源） | `…/noto-cjk/releases/download/Sans2.004/18_NotoSansSC.zip` → 取 `NotoSansSC-Regular.otf` | 47.8 MB（字体 8 MB） | ✅ |
-| 霞鹜文楷 LXGW WenKai | `…/LxgwWenKai/releases/latest/download/LXGWWenKai-Regular.ttf` | 24.7 MB | ✅ |
-| Noto Color Emoji | `google/fonts/raw/main/ofl/notocoloremoji/NotoColorEmoji-Regular.ttf` | 24.2 MB | ✅ |
-| 思源黑体 Source Han Sans SC | `…/source-han-sans/releases/download/2.005R/09_SourceHanSansSC.zip` | 90.8 MB | ⚠️ 能装但很大（包内含 7 个字重） |
-| 更纱黑体 Sarasa Gothic | `…/Sarasa-Gothic/releases/download/v1.0.43/Sarasa-TTC-1.0.43.zip`（TTF 只有 .7z，814 MB） | 395 MB | ❌ 太大 |
-| MiSans | 官方是 JS 下载页，**无稳定直链** | — | ❌ 许可禁止再分发 + 无直链 |
-| 阿里妈妈普惠体 | 同上 | — | ❌ 同上 |
-
-安装流程（服务端，`POST /api/font/install {"id": "…"}`）：
-
-1. 按目录里的官方直链下载（`urllib`，120s 超时，硬上限 400 MB）；
-2. 是 zip 就按 `pick` 取出单个字体文件（顺带取 `LICENSE`，没有就自动写一份带来源的说明文件
-   —— OFL 要求随字体保留许可）；
-3. 用能力探测复核「下到的确实是可用字体」，不通过就删掉并报错；
-4. 落进插件数据目录 `fonts/`，按 `kind` 设为正文字体或 emoji 字体并立即生效。
-   关掉开关：`NEKRO_PERSONA_FONT_INSTALL=0`。
-
-#### 顺带修掉一个更深的 bug：字形覆盖判定一直失真
-
-`_char_in_font()` 原来用 `ImageFont` 的 `get_char_index()` —— **本项目的 Pillow 构建里没这个方法**
-（新版 Pillow 去掉了），异常被吞进兜底分支后又用 `getmask().getbbox() is not None` 判断，
-而带 `.notdef` 轮廓的字体对任何码点都返回非空 mask，于是「有字形」恒为真。实测后果：
-
-```
-修正前：Noto Color Emoji → 汉字 100% / emoji 0%（完全反了）
-        思源黑体        → emoji 100%（其实只有 6%）
-        emoji-segoe.ttf → 汉字 100%（其实 3%）
-修正后：Noto Color Emoji → 汉字 0%  / emoji 100% / 彩色
-        思源黑体        → 汉字 100% / emoji 6%
-        emoji-segoe     → 汉字 3%  / emoji 100% / 彩色
-```
-
-连带影响：2.2.32 起的「逐字借字回退」实际上一直是死的（判定说「都有字形」）。现在改成
-**fontTools 直接读 cmap**（TTC 取第一个字体，按路径缓存），读不到才退「与 `.notdef` 掩码比对」。
-验证：现场裁一个只含「的」的子集字体 → `的=True / 娅=False`，完整思源黑体 → 两者都 True。
-
-副作用是干净的：字体下拉不再出现「emoji-segoe 也能当正文字体」这种荒唐分组
-（正文字体 5 项、emoji 字体只剩 1 项彩色）。
-
-实测（NA1）：得意黑安装 1.1～1.7s、文件 2.5 MB + 自动生成的许可说明；
-Noto Color Emoji 安装后自动切为 emoji 字体且 `cjk=0 / emoji=100% / 彩色`；真浏览器探针
-`pageerror` 0、正文字体下拉 6 项、emoji 下拉 2 项、推荐目录 8 条、预览出图正常。
-测试装的字体已清理，五台维持「思源黑体 + emoji-segoe」。

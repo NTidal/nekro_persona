@@ -2560,6 +2560,37 @@ body.is-scrolling .dialog-foot {
 
       <div class="card">
         <div class="card-head">
+          <div>
+            <h2 class="card-title">外观图层</h2>
+            <div class="card-subtitle" id="cardLayersSub">内置默认（暖色渐变 + 光斑）</div>
+          </div>
+          <span class="badge" id="cardLayersBadge">默认</span>
+        </div>
+        <div class="card-body">
+          <div class="preview-control">
+            <div class="field-label">模板
+              <select class="select" id="cardLayersSelect"></select>
+            </div>
+            <div class="field-label">加一层
+              <select class="select" id="cardLayerAdd"></select>
+            </div>
+            <div class="row-end">
+              <button class="btn" type="button" id="cardLayerAddBtn">添加</button>
+              <button class="btn" type="button" id="cardLayersPreview">仅预览不保存</button>
+              <button class="btn primary" type="button" id="cardLayersSave">保存并启用</button>
+            </div>
+          </div>
+          <div id="cardLayerList" style="margin-top:10px"></div>
+          <p class="hint" id="cardLayersHint">
+            从底到顶合成：<code>gradient / image / veil / scrim / blobs / tint</code> 是背景层，
+            <code>border / text / sticker / grain</code> 是前景层（画在内容之上）。
+            坐标用 0~1 相对值；图片层不写 <code>dim</code> 会自动做明暗补偿，不写 <code>veil</code> 会自动补一层薄纱。
+          </p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
           <div><h2 class="card-title">渲染参数</h2><div class="card-subtitle">示例数据不碰真实档案，可直接看效果</div></div>
         </div>
         <div class="card-body">
@@ -4917,6 +4948,8 @@ async function loadCards(opts = {}) {
     }
   }
 
+  if (!$('#cardLayerList').children.length) await loadCardLayers({ fresh: true });
+
   const bg = info.background || {};
   const bgSel = $('#cardBgSelect');
   if (bgSel) {
@@ -4998,6 +5031,217 @@ $('#cardFontCatalogList').addEventListener('click', async (e) => {
     btn.disabled = false;
     btn.textContent = label;
   }
+});
+
+/* ---- 外观图层 ---- */
+state.layers = null;          // 当前编辑中的层数组（页面状态，保存前不落盘）
+state.layerInfo = null;
+
+const LAYER_FIELDS = {
+  gradient: [["horizontal", "check"], ["stops", "stops"]],
+  image: [["src", "image"], ["fit", "select:cover,contain,stretch"], ["blur", "num"], ["dim", "num"], ["alpha", "num"]],
+  veil: [["color", "color"], ["alpha", "num"]],
+  scrim: [["from", "select:top,bottom,left,right"], ["color", "color"], ["alpha", "num"], ["size", "num"]],
+  blobs: [["alpha", "num"]],
+  tint: [["color", "color"], ["alpha", "num"]],
+  border: [["color", "color"], ["width", "num"], ["radius", "num"], ["inset", "num"], ["alpha", "num"]],
+  text: [["text", "text"], ["x", "num"], ["y", "num"], ["size", "num"], ["color", "color"], ["align", "select:left,center,right"]],
+  sticker: [["src", "image"], ["x", "num"], ["y", "num"], ["w", "num"], ["h", "num"], ["alpha", "num"]],
+  grain: [["alpha", "num"]],
+};
+
+function layerFieldHtml(layer, idx, field, spec) {
+  const [key, kind] = spec;
+  const val = layer[key] === undefined ? '' : layer[key];
+  const id = `lf-${idx}-${key}`;
+  if (kind === 'check') {
+    return `<label class="hint" style="margin-right:10px"><input type="checkbox" data-li="${idx}" data-lk="${key}" ${val ? 'checked' : ''}> ${key}</label>`;
+  }
+  if (kind.startsWith('select:')) {
+    const opts = kind.slice(7).split(',');
+    return `<label class="hint" style="margin-right:10px">${key}
+      <select class="select" data-li="${idx}" data-lk="${key}" style="min-width:96px">`
+      + opts.map((o) => `<option value="${esc(o)}"${String(val) === o ? ' selected' : ''}>${esc(o)}</option>`).join('')
+      + `</select></label>`;
+  }
+  if (kind === 'image') {
+    const imgs = (state.layerInfo && state.layerInfo.images) || [];
+    return `<label class="hint" style="margin-right:10px">${key}
+      <select class="select" data-li="${idx}" data-lk="${key}" style="min-width:150px">`
+      + `<option value="">（选择图片）</option>`
+      + imgs.map((x) => `<option value="${esc(x.name)}"${String(val).includes(x.name) ? ' selected' : ''}>${esc(x.name)}</option>`).join('')
+      + `</select></label>`;
+  }
+  if (kind === 'stops') {
+    const txt = Array.isArray(val) ? JSON.stringify(val) : '';
+    return `<label class="hint">stops
+      <input class="field" data-li="${idx}" data-lk="${key}" value="${esc(txt)}" style="min-width:220px"
+        placeholder='[[0,"#fdf6ec"],[1,"#f6d5b8"]]'></label>`;
+  }
+  const type = kind === 'color' ? 'text' : (kind === 'text' ? 'text' : 'number');
+  const step = kind === 'num' ? '0.01' : '';
+  return `<label class="hint" style="margin-right:10px">${key}
+    <input class="field" type="${type}" step="${step}" data-li="${idx}" data-lk="${key}"
+      value="${esc(val)}" style="width:${kind === 'num' ? 70 : 130}px"></label>`;
+}
+
+function renderLayerEditor() {
+  const box = $('#cardLayerList');
+  if (!box) return;
+  const layers = state.layers || [];
+  if (!layers.length) {
+    box.innerHTML = '<p class="hint">（空模板：将使用内置暖色渐变 + 光斑。点「添加」开始搭层）</p>';
+    return;
+  }
+  box.innerHTML = layers.map((layer, i) => {
+    const fields = (LAYER_FIELDS[layer.type] || []).map((f) => layerFieldHtml(layer, i, f[0], f[1])).join('');
+    return `<div style="border:1px solid var(--line);border-radius:10px;padding:8px 10px;margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span class="badge">${i + 1}</span>
+        <strong style="font-size:12px">${esc(layer.type)}</strong>
+        <span class="badge">${layer.stage === 'front' ? '前景' : '背景'}</span>
+        <span style="flex:1"></span>
+        <button class="mini-btn" type="button" data-lmove="${i}">上移</button>
+        <button class="mini-btn" type="button" data-lmove="${i}" data-dir="down">下移</button>
+        <button class="mini-btn" type="button" data-ldel="${i}">删除</button>
+      </div>
+      <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">${fields}</div>
+    </div>`;
+  }).join('');
+}
+
+async function loadCardLayers(opts = {}) {
+  let info = state.layerInfo;
+  if (!info || opts.fresh) {
+    info = await load('card_layers', () => null);
+    if (!info) return;
+    state.layerInfo = info;
+  }
+  const st = info.layers || {};
+  const sel = $('#cardLayersSelect');
+  if (sel) {
+    const tpls = st.templates || [];
+    sel.innerHTML = `<option value="">（内置默认）</option>`
+      + tpls.map((t) => `<option value="${esc(t.name)}"${t.name === st.name ? ' selected' : ''}>`
+        + `${esc(t.name)}（${t.count} 层）</option>`).join('');
+  }
+  const add = $('#cardLayerAdd');
+  if (add && !add.options.length) {
+    add.innerHTML = (st.types || []).map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join('');
+  }
+  if (!state.layers || opts.fresh) {
+    const cur = (st.templates || []).find((t) => t.name === st.name);
+    state.layers = cur ? JSON.parse(JSON.stringify(cur.layers || []))
+      : JSON.parse(JSON.stringify(st.defaults || []));
+  }
+  $('#cardLayersSub').textContent = st.name ? `模板 ${st.name}` : '内置默认（暖色渐变 + 光斑）';
+  const badge = $('#cardLayersBadge');
+  badge.textContent = st.name ? (st.exists ? `${(state.layers || []).length} 层` : '模板丢失') : '默认';
+  badge.className = 'badge' + (st.name && !st.exists ? ' warn' : '');
+  renderLayerEditor();
+}
+
+$('#cardLayersSelect').addEventListener('change', async (e) => {
+  const d = await postAction('card_layers', { select: e.target.value });
+  if (!d) return;
+  state.layerInfo = null;
+  state.layers = null;
+  await loadCardLayers({ fresh: true });
+  toast(e.target.value ? '已切换模板：' + e.target.value : '已恢复内置默认', 'success');
+});
+
+$('#cardLayerAddBtn').addEventListener('click', () => {
+  const t = $('#cardLayerAdd').value;
+  if (!t) return;
+  const base = { type: t, stage: (t === 'border' || t === 'text' || t === 'sticker' || t === 'grain') ? 'front' : 'back' };
+  if (t === 'image') Object.assign(base, { fit: 'cover', blur: 12 });
+  if (t === 'veil') Object.assign(base, { color: '#fffcf6', alpha: 0.18 });
+  if (t === 'text') Object.assign(base, { text: '水印', x: 0.5, y: 0.95, size: 11, color: '#00000055', align: 'center' });
+  if (t === 'sticker') Object.assign(base, { x: 0.03, y: 0.03, w: 0.06, alpha: 1 });
+  if (t === 'border') Object.assign(base, { color: '#ffffffcc', width: 2, radius: 0.032, alpha: 1 });
+  if (t === 'scrim') Object.assign(base, { from: 'top', color: '#000000', alpha: 0.3, size: 0.25 });
+  if (t === 'grain') Object.assign(base, { alpha: 0.05 });
+  state.layers = (state.layers || []).concat([base]);
+  renderLayerEditor();
+});
+
+$('#cardLayerList').addEventListener('click', (e) => {
+  const mv = e.target.closest('[data-lmove]');
+  const del = e.target.closest('[data-ldel]');
+  if (mv) {
+    const i = parseInt(mv.dataset.lmove, 10);
+    const down = mv.dataset.dir === 'down';
+    const j = down ? i + 1 : i - 1;
+    if (j < 0 || j >= state.layers.length) return;
+    const arr = state.layers;
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+    renderLayerEditor();
+  } else if (del) {
+    const i = parseInt(del.dataset.ldel, 10);
+    state.layers.splice(i, 1);
+    renderLayerEditor();
+  }
+});
+
+$('#cardLayerList').addEventListener('change', (e) => {
+  const el = e.target;
+  const i = el.dataset && el.dataset.li;
+  const k = el.dataset && el.dataset.lk;
+  if (i === undefined || !k) return;
+  const idx = parseInt(i, 10);
+  let v = el.type === 'checkbox' ? el.checked : el.value;
+  if (el.type === 'number') v = v === '' ? undefined : parseFloat(v);
+  if (k === 'stops') {
+    try { v = JSON.parse(v); } catch (err) { toast('stops 必须是 JSON 数组', 'warning'); return; }
+  }
+  if (k === 'src') {
+    const imgs = (state.layerInfo && state.layerInfo.images) || [];
+    const hit = imgs.find((x) => x.name === v);
+    v = hit ? hit.path || ('backgrounds_custom/' + hit.name) : v;
+  }
+  state.layers[idx][k] = v;
+});
+
+$('#cardLayersPreview').addEventListener('click', async () => {
+  await renderPreviewWithLayers();
+});
+
+async function renderPreviewWithLayers() {
+  const btn = $('#cardRunBtn');
+  btn.classList.add('is-loading');
+  try {
+    const body = {
+      card: $('#cardKind').value,
+      source: $('#cardSource').value,
+      scale: parseFloat($('#cardScale').value) || 0,
+      layers: state.layers || [],
+    };
+    if (body.source === 'channel') body.chat_key = $('#cardChannel').value;
+    const data = await postAction('card_preview', body);
+    if (!data) return;
+    const img = $('#cardPreviewImg');
+    img.src = data.image;
+    img.hidden = false;
+    $('#cardPreviewEmpty').hidden = true;
+    const m = data.meta || {};
+    $('#cardPreviewMeta').textContent =
+      `${m.card} · ${m.count} 条档案 · ${fmtBytes(m.bytes)} · ${m.layers || 0} 层外观`;
+  } catch (err) {
+    toast(err.message || '渲染失败', 'error');
+  } finally {
+    btn.classList.remove('is-loading');
+  }
+}
+
+$('#cardLayersSave').addEventListener('click', async () => {
+  const name = (prompt('模板名（会保存到插件数据目录 card_layers/ 并立即启用）', 'my-look') || '').trim();
+  if (!name) return;
+  const d = await postAction('card_layers', { name, layers: state.layers || [] });
+  if (!d) return;
+  state.layerInfo = null;
+  await loadCardLayers({ fresh: true });
+  toast('已保存并启用模板：' + name, 'success');
+  await renderPreviewWithLayers();
 });
 
 /* ---- 背景 ---- */

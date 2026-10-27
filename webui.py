@@ -2946,6 +2946,69 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     def _bg_custom_dir() -> Path:
         return plugin.get_plugin_data_dir() / "backgrounds_custom"
 
+    _LAYERS_CACHE: Dict[str, Any] = {}
+
+    def _current_layers():
+        """当前生效的图层模板（配置给路径或内联 JSON）；没配返回 None = 内置默认。"""
+        cfg = plugin.get_config()
+        raw_val = str(getattr(cfg, "RANK_CARD_LAYERS", "") or "").strip()
+        if not raw_val:
+            return None
+        if raw_val.startswith(("[", "{")):
+            try:
+                return json.loads(raw_val)
+            except Exception:  # noqa: BLE001
+                return None
+        try:
+            p = Path(raw_val)
+            if not p.is_file():
+                return None
+            key = f"{p}:{int(p.stat().st_mtime)}"
+            if key in _LAYERS_CACHE:
+                return _LAYERS_CACHE[key]
+            data = json.loads(p.read_text(encoding="utf-8"))
+            cover = data.get("layers") if isinstance(data, dict) else data
+            resolved = _card.resolve_layer_sources(cover or [], str(plugin.get_plugin_data_dir()))
+            data = {"layers": resolved} if isinstance(data, dict) else resolved
+            _LAYERS_CACHE.clear()
+            _LAYERS_CACHE[key] = data
+            return data
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _layers_dir() -> Path:
+        return plugin.get_plugin_data_dir() / "card_layers"
+
+    def _layers_templates() -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        try:
+            d = _layers_dir()
+            if d.is_dir():
+                for f in sorted(d.glob("*.json")):
+                    try:
+                        data = json.loads(f.read_text(encoding="utf-8"))
+                    except Exception:  # noqa: BLE001
+                        continue
+                    layers = data.get("layers") if isinstance(data, dict) else data
+                    out.append({"name": f.stem, "layers": layers or [],
+                                "count": len(layers or [])})
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+    def _layers_state() -> Dict[str, Any]:
+        cfg = plugin.get_config()
+        cur = str(getattr(cfg, "RANK_CARD_LAYERS", "") or "").strip()
+        return {
+            "config": cur,
+            "name": Path(cur).stem if cur else "",
+            "exists": bool(cur and Path(cur).is_file()),
+            "templates": _layers_templates(),
+            "types": list(_card._LAYER_TYPES),
+            "defaults": [dict(x) for x in _card._LAYER_DEFAULT],
+            "images": _bg_state()["images"],
+        }
+
     def _bg_state() -> Dict[str, Any]:
         """当前背景配置 + 目录里可选的自定义背景图。"""
         cfg = plugin.get_config()
@@ -3117,6 +3180,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             ],
             "fontCatalog": [dict(x) for x in _FONT_CATALOG],
             "background": _bg_state(),
+            "layers": _layers_state(),
             "backend": (lambda: _card.backend_report(str(_font_dir())))() if hasattr(
                 _card, "backend_report",
             ) else {},
@@ -3197,7 +3261,16 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         bg_blur = float(body.get("bg_blur", bg_cfg["blur"]) or 0.0)
         bg_dim = int(body.get("bg_dim", bg_cfg["dim"]) or 0)
         meta["bg"] = {"name": Path(bg_path).name if bg_path else "", "blur": bg_blur, "dim": bg_dim}
+        if "layers" in body:
+            kwargs_layers = _card.resolve_layer_sources(
+                body.get("layers") or [], str(plugin.get_plugin_data_dir()),
+            )
+        else:
+            kwargs_layers = _current_layers()
+        _lyr = _card._layer_list(kwargs_layers)
+        meta["layers"] = len(_lyr) if _lyr is not None else 0
         kwargs = {
+            "layers": kwargs_layers,
             "bg_path": bg_path,
             "bg_blur": bg_blur,
             "bg_dim": bg_dim,
@@ -3234,6 +3307,52 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "meta": meta,
             "image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
         }
+
+    @router.get("/api/card_layers", summary="卡片外观图层：模板列表 + 默认值 + 可用素材")
+    async def api_card_layers_info(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        return {"ok": True, "layers": _layers_state()}
+
+    @router.post("/api/card_layers", summary="保存 / 选择 / 清除外观图层模板")
+    async def api_card_layers(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        body = await _json_body(request)
+        cfg = plugin.get_config()
+        if body.get("clear"):
+            setattr(cfg, "RANK_CARD_LAYERS", "")
+            plugin.save_config(cfg)
+            _card.reset_background_cache()
+            return {"ok": True, "layers": _layers_state()}
+        if "select" in body:
+            name = Path(str(body.get("select") or "")).name.strip()
+            if not name:
+                setattr(cfg, "RANK_CARD_LAYERS", "")
+            else:
+                target = _layers_dir() / (name if name.endswith(".json") else f"{name}.json")
+                if not target.is_file():
+                    raise HTTPException(status_code=404, detail=f"没有这个模板: {name}")
+                setattr(cfg, "RANK_CARD_LAYERS", str(target))
+            plugin.save_config(cfg)
+            _card.reset_background_cache()
+            return {"ok": True, "layers": _layers_state()}
+        name = Path(str(body.get("name") or "")).stem.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="模板名不能为空")
+        layers = _card.normalize_layers(body.get("layers") or [])
+        if not layers:
+            raise HTTPException(status_code=400, detail="图层为空或全部不可识别")
+        d = _layers_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        target = d / f"{name}.json"
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps({"version": 1, "name": name, "layers": layers},
+                                  ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(target)
+        setattr(cfg, "RANK_CARD_LAYERS", str(target))
+        plugin.save_config(cfg)
+        _card.reset_background_cache()
+        plugin.logger.info(f"[persona] 保存外观图层模板 {name}（{len(layers)} 层）并启用")
+        return {"ok": True, "layers": _layers_state()}
 
     @router.get("/api/card_bg", summary="卡片背景：当前配置 + 可选背景图")
     async def api_card_bg_info(request: Request) -> Dict[str, Any]:

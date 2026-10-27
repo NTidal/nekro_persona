@@ -1262,6 +1262,382 @@ def _background(PIL, width: int, height: int, *, path: str = "", blur: float = 1
         return _vertical_bg(PIL, width, height)
 
 
+# ============ 图层合成（2.4.0）============
+# 卡片外观不再是一堆散装参数，而是一串**图层**（JSON 数组），按顺序从底到顶合成：
+#   back  阶段：gradient / image / veil / scrim / blobs / tint
+#   front 阶段：border / text / sticker(image) / grain
+# 为什么分层：2.3.12 只有「一张背景图 + 模糊 + 明暗」三个旋钮，想加个 logo、想给不同卡配不同
+# 底图、想给照片压一条渐变压暗带，都得再加参数；层模型把这些统一成「一层一个 dict」。
+#
+# 坐标约定：x/y/w/h 一律用 0~1 的相对值（跟渲染倍率、卡片尺寸无关），像素换算在合成时做。
+
+_LAYER_DEFAULT = [
+    {"type": "gradient", "stage": "back", "stops": [[0.0, "#fdf6ec"], [0.49, "#fbe9d2"], [1.0, "#f6d5b8"]]},
+    {"type": "blobs", "stage": "back", "alpha": 1.0},
+]
+# 用户自己写了 image 层但没写 veil 时，自动补这层薄纱（否则浅色面板上文字容易被照片纹路吃掉）
+_LAYER_AUTO_VEIL = {"type": "veil", "stage": "back", "color": "#fffcf6", "alpha": 0.18}
+_LAYER_TYPES = (
+    "gradient", "image", "veil", "scrim", "blobs", "tint",
+    "border", "text", "sticker", "grain",
+)
+
+
+def _hex_to_rgb(value, fallback=(255, 255, 255)):
+    """#rgb / #rrggbb / #rrggbbaa → (r,g,b,a)。解析失败回落 fallback（alpha=255）。"""
+    try:
+        t = str(value or "").strip().lstrip("#")
+        if len(t) == 3:
+            t = "".join(c * 2 for c in t)
+        if len(t) not in (6, 8):
+            return (fallback[0], fallback[1], fallback[2], 255)
+        r, g, b = int(t[0:2], 16), int(t[2:4], 16), int(t[4:6], 16)
+        a = int(t[6:8], 16) if len(t) == 8 else 255
+        return (r, g, b, a)
+    except Exception:  # noqa: BLE001
+        return (fallback[0], fallback[1], fallback[2], 255)
+
+
+def _alpha(value, default=1.0) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _rel(value, total: int, default: float = 0.0) -> int:
+    """0~1 相对坐标 → 像素（也接受已经大于 1 的绝对像素值）。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = default
+    return int(round(v * total)) if v <= 1.0 else int(round(v))
+
+
+def normalize_layers(layers) -> list:
+    """清洗层列表：丢掉不认识/结构不对的层，rest 用默认值补全。"""
+    out: list = []
+    if not isinstance(layers, (list, tuple)):
+        return out
+    for raw_layer in layers:
+        if not isinstance(raw_layer, dict):
+            continue
+        t = str(raw_layer.get("type") or "").strip().lower()
+        if t not in _LAYER_TYPES:
+            continue
+        layer = dict(raw_layer)
+        layer["type"] = t
+        layer["stage"] = "front" if str(raw_layer.get("stage") or "back").lower() == "front" else "back"
+        if not layer.get("enabled", True):
+            continue
+        out.append(layer)
+    return out
+
+
+def resolve_layer_sources(layers, base_dir: str = "") -> list:
+    """把 image / sticker 层的相对路径解析成绝对路径。
+
+    模板里只存「文件名」最稳（换机器、换挂载点都不怕），渲染前按数据目录解析：
+    先试 `<base>/<src>`，再试 `<base>/backgrounds_custom/<src>`。
+    """
+    out: list = []
+    base = str(base_dir or "").strip()
+    for layer in normalize_layers(layers):
+        item = dict(layer)
+        if item["type"] in ("image", "sticker"):
+            src = str(item.get("src") or "").strip()
+            if src and base and not Path(src).is_absolute():
+                for cand in (Path(base) / src, Path(base) / "backgrounds_custom" / src):
+                    if cand.is_file():
+                        item["src"] = str(cand)
+                        break
+        out.append(item)
+    return out
+
+
+def _layer_list(layers):
+    """把外部传进来的 layers 统一成「已清洗的列表」；None 表示调用方没给模板。
+
+    接受：None / list / {"layers": [...]} / JSON 字符串。
+    """
+    if layers is None:
+        return None
+    if isinstance(layers, str):
+        try:
+            layers = json.loads(layers or "[]")
+        except Exception:  # noqa: BLE001
+            return None
+    if isinstance(layers, dict):
+        layers = layers.get("layers") or []
+    if not isinstance(layers, (list, tuple)):
+        return None
+    return normalize_layers(layers)
+
+
+def _split_layers(layers, has_bg: bool = False):
+    """拆成 (back, front) 两份。
+
+    `layers=None`（没配模板）时用内置默认：有自定义背景图就只留空 back（照片本身就是背景），
+    否则沿用「暖色渐变 + 光斑」，保证老配置升级后观感不变。
+    """
+    lay = _layer_list(layers)
+    if lay is None:
+        return ([] if has_bg else [dict(x) for x in _LAYER_DEFAULT]), []
+    back = [x for x in lay if x["stage"] == "back"]
+    front = [x for x in lay if x["stage"] == "front"]
+    # 自己写了图片层却没写薄纱 → 自动补一层（可显式写 veil 覆盖/调淡）
+    if any(x["type"] == "image" for x in back) and not any(x["type"] == "veil" for x in back):
+        idx = max(i for i, x in enumerate(back) if x["type"] == "image")
+        back.insert(idx + 1, dict(_LAYER_AUTO_VEIL))
+    return back, front
+
+
+def _compose_layers(PIL, img, layers: list, *, stage: str, base_ctx: dict | None = None):
+    """把指定 stage 的图层按顺序叠到 img 上，返回新图。任何一层出错只跳过该层。"""
+    ctx = base_ctx or {}
+    for layer in layers:
+        if layer.get("stage") != stage:
+            continue
+        t = layer["type"]
+        try:
+            alpha = _alpha(layer.get("alpha"), 1.0)
+            if alpha <= 0:
+                continue
+            if t == "gradient":
+                stops = layer.get("stops") or [[0.0, "#fdf6ec"], [1.0, "#f6d5b8"]]
+                horizontal = bool(layer.get("horizontal"))
+                layer_img = _gradient_layer(PIL, img.size, stops, horizontal)
+                img = PIL.Image.blend(img, layer_img, alpha) if alpha < 1 else layer_img
+            elif t == "image":
+                src = str(layer.get("src") or "").strip()
+                if not src or not Path(src).is_file():
+                    continue
+                _bg_ctx.is_image = True   # 面板据此加厚 tint
+                lay = _image_layer(PIL, img.size, src, layer, ctx.get("scale", 1.0))
+                if lay is None:
+                    continue
+                img = PIL.Image.blend(img, lay, alpha) if alpha < 1 else lay
+            elif t == "veil":
+                color = _hex_to_rgb(layer.get("color") or "#fffcf6")
+                lay = PIL.Image.new("RGB", img.size, color[:3])
+                img = PIL.Image.blend(img, lay, _alpha(layer.get("alpha"), 0.22))
+            elif t == "scrim":
+                img = _scrim_layer(PIL, img, layer)
+            elif t == "blobs":
+                blobs = _decorative_blobs(PIL, img.size[0], img.size[1])
+                img = PIL.Image.blend(img, blobs, alpha) if alpha < 1 else blobs
+            elif t == "tint":
+                color = _hex_to_rgb(layer.get("color") or "#ffd9b0")
+                lay = PIL.Image.new("RGB", img.size, color[:3])
+                img = PIL.Image.blend(img, lay, _alpha(layer.get("alpha"), 0.1))
+            elif t == "border":
+                img = _border_layer(PIL, img, layer)
+            elif t == "text":
+                img = _text_layer(PIL, img, layer, ctx)
+            elif t == "sticker":
+                img = _sticker_layer(PIL, img, layer, ctx)
+            elif t == "grain":
+                img = _grain_layer(PIL, img, layer)
+        except Exception:  # noqa: BLE001
+            logger.warning(f"图层合成失败（已跳过该层）: {layer.get('type')}", exc_info=True)
+            continue
+    return img
+
+
+def _gradient_layer(PIL, size, stops, horizontal: bool = False):
+    """任意 stop 数的线性渐变（竖向或横向），先算 1px 再拉伸。"""
+    w, h = size
+    length = w if horizontal else h
+    parsed = []
+    for st in stops:
+        try:
+            pos = max(0.0, min(1.0, float(st[0])))
+            parsed.append((pos, _hex_to_rgb(st[1])[:3]))
+        except Exception:  # noqa: BLE001
+            continue
+    if not parsed:
+        parsed = [(0.0, (253, 246, 236)), (1.0, (246, 213, 184))]
+    parsed.sort(key=lambda x: x[0])
+    strip = PIL.Image.new("RGB", (1, length)) if not horizontal else PIL.Image.new("RGB", (length, 1))
+    px = strip.load()
+    for i in range(length):
+        t = i / max(length - 1, 1)
+        c = parsed[-1][1]
+        if t <= parsed[0][0]:
+            c = parsed[0][1]
+        else:
+            for k in range(len(parsed) - 1):
+                p0, c0 = parsed[k]
+                p1, c1 = parsed[k + 1]
+                if p0 <= t <= p1:
+                    f = (t - p0) / max(p1 - p0, 1e-9)
+                    c = tuple(int(c0[j] + (c1[j] - c0[j]) * f) for j in range(3))
+                    break
+        if horizontal:
+            px[i, 0] = c
+        else:
+            px[0, i] = c
+    return strip.resize((w, h), PIL.Image.NEAREST)
+
+
+def _image_layer(PIL, size, src: str, layer: dict, scale: float):
+    """图片层：cover/contain/stretch 三种填充 + 可选模糊。"""
+    from PIL import ImageFilter, ImageOps
+
+    w, h = size
+    img = ImageOps.exif_transpose(PIL.Image.open(src)).convert("RGB")
+    limit = max(w, h) * 2
+    if max(img.size) > limit:
+        img.thumbnail((limit, limit), PIL.Image.LANCZOS)
+    fit = str(layer.get("fit") or "cover").lower()
+    if fit == "stretch":
+        out = img.resize((w, h), PIL.Image.LANCZOS)
+    elif fit == "contain":
+        k = min(w / img.size[0], h / img.size[1])
+        nw, nh = max(1, int(img.size[0] * k)), max(1, int(img.size[1] * k))
+        out = PIL.Image.new("RGB", (w, h), _hex_to_rgb(layer.get("pad") or "#000000")[:3])
+        out.paste(img.resize((nw, nh), PIL.Image.LANCZOS), ((w - nw) // 2, (h - nh) // 2))
+    else:  # cover
+        out = _cover_fit(PIL, img, w, h)
+    radius = float(layer.get("blur") or 0) * max(float(scale), 1.0)
+    if radius > 0.4:
+        out = out.filter(ImageFilter.GaussianBlur(radius=radius))
+    # 图片层的明暗补偿：没写 dim 就自动（与 _background 的口径一致，保文字可读）
+    raw_dim = layer.get("dim")
+    if raw_dim is None or str(raw_dim).strip() == "":
+        weight = _mean_luma(PIL, out)
+        dim = int(round(max(-22.0, min(26.0, (0.72 - weight) * 100))))
+    else:
+        try:
+            dim = int(raw_dim)
+        except (TypeError, ValueError):
+            dim = 0
+    if dim:
+        over = PIL.Image.new("RGB", out.size, (255, 255, 255) if dim > 0 else (0, 0, 0))
+        out = PIL.Image.blend(out, over, min(abs(dim), 100) / 250.0)
+    return out
+
+
+def _scrim_layer(PIL, img, layer: dict):
+    """线性压暗/提亮带：从某一边往中间渐隐，用来压住标题/页脚。"""
+    w, h = img.size
+    color = _hex_to_rgb(layer.get("color") or "#000000")[:3]
+    strength = _alpha(layer.get("alpha"), 0.35)
+    where = str(layer.get("from") or "top").lower()
+    span = _alpha(layer.get("size"), 0.35)
+    mask = PIL.Image.new("L", (w, h), 0)
+    mpx = mask.load()
+    length = max(1, int((h if where in ("top", "bottom") else w) * span))
+    vert = where in ("top", "bottom")
+    for i in range(length):
+        f = 1.0 - (i / max(length - 1, 1))
+        v = int(255 * strength * f)
+        if vert:
+            y = i if where == "top" else h - 1 - i
+            for x in range(w):
+                mpx[x, y] = v
+        else:
+            x = i if where == "left" else w - 1 - i
+            for y in range(h):
+                mpx[x, y] = v
+    overlay = PIL.Image.new("RGB", (w, h), color)
+    # composite(image1, image2, mask)：mask=255 处取 image2（压暗带），0 处保留原图
+    return PIL.Image.composite(img, overlay, mask)
+
+
+def _border_layer(PIL, img, layer: dict):
+    """圆角描边层（画在卡片外框内侧）。"""
+    w, h = img.size
+    color = _hex_to_rgb(layer.get("color") or "#ffffff")
+    width = max(1, _rel(layer.get("width") or 2, w, 2))
+    radius = _rel(layer.get("radius") or 0.03, min(w, h), 24)
+    inset = _rel(layer.get("inset") or 0.011, min(w, h), 8)
+    overlay = PIL.Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    from PIL import ImageDraw
+
+    d = ImageDraw.Draw(overlay)
+    d.rounded_rectangle([inset, inset, w - 1 - inset, h - 1 - inset],
+                        radius=radius, outline=(color[0], color[1], color[2], int(color[3] * _alpha(layer.get("alpha"), 1.0))),
+                        width=width)
+    return PIL.Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+
+
+def _text_layer(PIL, img, layer: dict, ctx: dict):
+    """文字层（水印 / 角标）。x/y 是相对锚点，align 决定左右，font 取正文字体。"""
+    from PIL import ImageDraw, ImageFont
+
+    w, h = img.size
+    text = str(layer.get("text") or "").strip()
+    if not text:
+        return img
+    scale = float(ctx.get("scale") or 1.0)
+    size = int(round(float(layer.get("size") or 11) * scale))
+    font_path = ctx.get("font_path") or ""
+    try:
+        font = ImageFont.truetype(font_path, max(8, size)) if font_path else ImageFont.load_default()
+    except Exception:  # noqa: BLE001
+        font = ImageFont.load_default()
+    overlay = PIL.Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
+    color = _hex_to_rgb(layer.get("color") or "#00000066")
+    fill = (color[0], color[1], color[2], int(color[3] * _alpha(layer.get("alpha"), 1.0)))
+    x = _rel(layer.get("x"), w, 0.5)
+    y = _rel(layer.get("y"), h, 0.97)
+    align = str(layer.get("align") or "center").lower()
+    try:
+        bw = d.textbbox((0, 0), text, font=font)[2]
+    except Exception:  # noqa: BLE001
+        bw = 0
+    if align == "center":
+        x -= bw // 2
+    elif align in ("right", "end"):
+        x -= bw
+    d.text((x, y), text, font=font, fill=fill)
+    return PIL.Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+
+
+def _sticker_layer(PIL, img, layer: dict, ctx: dict):
+    """贴图层：按相对矩形贴一张图（logo / 角标 / 水印图）。"""
+    from PIL import ImageOps
+
+    w, h = img.size
+    src = str(layer.get("src") or "").strip()
+    if not src or not Path(src).is_file():
+        return img
+    logo = ImageOps.exif_transpose(PIL.Image.open(src)).convert("RGBA")
+    tw = _rel(layer.get("w") or 0.08, w, 0.08)
+    if layer.get("h"):
+        th = _rel(layer.get("h"), h, tw)
+    else:
+        th = max(1, int(round(logo.size[1] * (tw / max(logo.size[0], 1)))))
+    logo = logo.resize((max(1, tw), max(1, th)), PIL.Image.LANCZOS)
+    alpha = _alpha(layer.get("alpha"), 1.0)
+    if alpha < 1:
+        r, g, b, a = logo.split()
+        a = a.point(lambda v: int(v * alpha))
+        logo = PIL.Image.merge("RGBA", (r, g, b, a))
+    base = img.convert("RGBA")
+    base.alpha_composite(logo, (_rel(layer.get("x"), w, 0.03), _rel(layer.get("y"), h, 0.03)))
+    return base.convert("RGB")
+
+
+def _grain_layer(PIL, img, layer: dict):
+    """噪点层（弱化的胶片颗粒，照片背景时能压住色带）。"""
+    import random as _random
+
+    w, h = img.size
+    strength = _alpha(layer.get("alpha"), 0.05)
+    noise = PIL.Image.new("L", (max(1, w // 3), max(1, h // 3)))
+    px = noise.load()
+    rnd = _random.Random(20260101)
+    for yy in range(noise.size[1]):
+        for xx in range(noise.size[0]):
+            px[xx, yy] = 128 + rnd.randint(-40, 40)
+    noise = noise.resize((w, h), PIL.Image.BILINEAR)
+    overlay = PIL.Image.merge("RGB", (noise, noise, noise))
+    return PIL.Image.blend(img, overlay, strength)
+
+
 def _decorative_blobs(PIL, width: int, height: int):
     """暖色装饰光斑层：给毛玻璃提供"可模糊"的背景内容。
 
@@ -1498,6 +1874,7 @@ def render_favorability_rank(
     bg_path: str = "",
     bg_blur: float = 14.0,
     bg_dim: int = 0,
+    layers: Any = None,
 ) -> bytes | None:
     """渲染好感度排行榜为 PNG 卡片，返回字节；不可用时返回 None。
 
@@ -1511,7 +1888,7 @@ def render_favorability_rank(
         return _render_favorability_rank_impl(
             entries, max_abs_score, limit=limit, font_path=font_path,
             font_dir=font_dir, avatar_dir=avatar_dir, scale=scale,
-            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim,
+            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim, layers=layers,
         )
     except Exception:  # noqa: BLE001
         logger.exception("好感度排行榜卡片渲染异常，回退为文本")
@@ -1530,6 +1907,7 @@ def _render_favorability_rank_impl(
     bg_path: str = "",
     bg_blur: float = 14.0,
     bg_dim: int = 0,
+    layers: Any = None,
 ) -> bytes | None:
     """真正的渲染实现（由 render_favorability_rank 兜底调用）。
 
@@ -1541,6 +1919,7 @@ def _render_favorability_rank_impl(
         font_path: 配置指定的中文字体文件路径。
         font_dir: 插件数据目录中的字体目录。
     """
+    back_layers, front_layers = _split_layers(layers, has_bg=bool(str(bg_path or "").strip()))
     PIL = _load_pil()
     if PIL is None:
         return None
@@ -1622,8 +2001,13 @@ def _render_favorability_rank_impl(
     img_h = card_h + MARGIN * 2
     S = float(scale) if scale and scale > 0 else _RENDER_SCALE
 
-    img = _background(PIL, int(img_w * S), int(img_h * S),
-                      path=bg_path, blur=bg_blur, dim=bg_dim, scale=S)
+    _bg_ctx.is_image = bool(str(bg_path or "").strip())
+    img = _compose_layers(
+        PIL,
+        _background(PIL, int(img_w * S), int(img_h * S),
+                    path=bg_path, blur=bg_blur, dim=bg_dim, scale=S),
+        back_layers, stage="back", base_ctx={"scale": S, "font_path": font_path_resolved},
+    )
 
     # 暖色装饰光斑：毛玻璃的"可模糊内容"（纯平渐变上看不出磨砂感）
     try:
@@ -1980,6 +2364,8 @@ def _render_favorability_rank_impl(
     # 玻璃边缘（描边 + 顶部高光）最后统一合成：返回新图像，之后不再绘制
     img = _glass_edges(PIL, img, _edge_panels, scale=S)
 
+    img = _compose_layers(PIL, img, front_layers, stage="front",
+                          base_ctx={"scale": S, "font_path": font_path_resolved})
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
     return buf.getvalue()
@@ -2032,6 +2418,7 @@ def render_profile_card(
     bg_path: str = "",
     bg_blur: float = 14.0,
     bg_dim: int = 0,
+    layers: Any = None,
 ) -> bytes | None:
     """渲染**单人**关系档案卡片，返回 PNG 字节；不可用返回 None。
 
@@ -2047,7 +2434,7 @@ def render_profile_card(
         return _render_profile_card_impl(
             entry, max_abs_score, font_path=font_path, font_dir=font_dir,
             avatar_dir=avatar_dir, scale=scale,
-            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim,
+            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim, layers=layers,
         )
     except Exception:  # noqa: BLE001
         logger.exception("关系档案卡片渲染异常，回退为文本")
@@ -2065,7 +2452,9 @@ def _render_profile_card_impl(
     bg_path: str = "",
     bg_blur: float = 14.0,
     bg_dim: int = 0,
+    layers: Any = None,
 ) -> bytes | None:
+    back_layers, front_layers = _split_layers(layers, has_bg=bool(str(bg_path or "").strip()))
     PIL = _load_pil()
     if PIL is None:
         return None
@@ -2150,8 +2539,13 @@ def _render_profile_card_impl(
     img_w = CARD_W + MARGIN * 2
     img_h = card_h + MARGIN * 2
 
-    img = _background(PIL, int(img_w * S), int(img_h * S),
-                      path=bg_path, blur=bg_blur, dim=bg_dim, scale=S)
+    _bg_ctx.is_image = bool(str(bg_path or "").strip())
+    img = _compose_layers(
+        PIL,
+        _background(PIL, int(img_w * S), int(img_h * S),
+                    path=bg_path, blur=bg_blur, dim=bg_dim, scale=S),
+        back_layers, stage="back", base_ctx={"scale": S, "font_path": fp},
+    )
     try:
         img = PIL.Image.alpha_composite(
             img.convert("RGBA"), _decorative_blobs(PIL, img.width, img.height)
@@ -2348,6 +2742,8 @@ def _render_profile_card_impl(
     draw.text((hx, fy), "nekro_persona · 关系档案", font=f_foot, fill=_MUTED)
 
     img = _glass_edges(PIL, img, [(card_box, 24, (255, 255, 255, 150), (255, 255, 255, 210))], scale=S)
+    img = _compose_layers(PIL, img, front_layers, stage="front",
+                          base_ctx={"scale": S, "font_path": fp})
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
     return buf.getvalue()
@@ -2378,13 +2774,14 @@ def render_impression_overview(
     bg_path: str = "",
     bg_blur: float = 14.0,
     bg_dim: int = 0,
+    layers: Any = None,
 ) -> bytes | None:
     """渲染「印象总览」：每人一行，带头像/昵称/ID/标签/稳定印象/好感度。不可用返回 None。"""
     try:
         return _render_impression_overview_impl(
             entries, max_abs_score, limit=limit, font_path=font_path,
             font_dir=font_dir, avatar_dir=avatar_dir, scale=scale,
-            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim,
+            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim, layers=layers,
         )
     except Exception:  # noqa: BLE001
         logger.exception("印象总览卡片渲染异常，回退为文本")
@@ -2403,6 +2800,7 @@ def _render_impression_overview_impl(
     bg_path: str = "",
     bg_blur: float = 14.0,
     bg_dim: int = 0,
+    layers: Any = None,
 ) -> bytes | None:
     """印象总览：按人数自动分列，**每格竖向节奏与「查看印象」单人卡一致**。
 
@@ -2410,6 +2808,7 @@ def _render_impression_overview_impl(
     标签高 20 行距 6 / 「稳定印象」标题 30 / 正文 15px·25px 行距 / 底部内边距 16。
     上一版把这些数压成 14/26/18/24/13·20，中文行被压到字脚贴边，看着像被盖住。
     """
+    back_layers, front_layers = _split_layers(layers, has_bg=bool(str(bg_path or "").strip()))
     PIL = _load_pil()
     if PIL is None:
         return None
@@ -2560,8 +2959,13 @@ def _render_impression_overview_impl(
     img_w = card_w + MARGIN * 2
     img_h = card_h + MARGIN * 2
 
-    img = _background(PIL, int(img_w * S), int(img_h * S),
-                      path=bg_path, blur=bg_blur, dim=bg_dim, scale=S)
+    _bg_ctx.is_image = bool(str(bg_path or "").strip())
+    img = _compose_layers(
+        PIL,
+        _background(PIL, int(img_w * S), int(img_h * S),
+                    path=bg_path, blur=bg_blur, dim=bg_dim, scale=S),
+        back_layers, stage="back", base_ctx={"scale": S, "font_path": fp},
+    )
     try:
         img = PIL.Image.alpha_composite(
             img.convert("RGBA"), _decorative_blobs(PIL, img.width, img.height)
@@ -2758,6 +3162,8 @@ def _render_impression_overview_impl(
               font=f_foot, fill=_MUTED)
 
     img = _glass_edges(PIL, img, _edges, scale=S)
+    img = _compose_layers(PIL, img, front_layers, stage="front",
+                          base_ctx={"scale": S, "font_path": fp})
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
     return buf.getvalue()

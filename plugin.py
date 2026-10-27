@@ -72,7 +72,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.3.12",
+    version="2.4.0",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -573,6 +573,12 @@ class FavorabilityConfig(ConfigBase):
         "自定义背景的模糊半径（0~60，逻辑像素；绘制时会乘以渲染倍率）",
         en_title="Card Background Blur", en_desc="Blur radius for custom background (0-60)",
         ge=0.0, le=60.0,
+    )
+    RANK_CARD_LAYERS: str = _fav_field(
+        "", "卡片外观图层模板",
+        "外观图层模板 JSON 的路径（留空 = 内置默认：暖色渐变 + 光斑）。"
+        "模板是一串图层：gradient/image/veil/scrim/blobs/tint（背景）与 border/text/sticker/grain（前景）",
+        en_title="Card Layer Template", en_desc="Path to a layer-template JSON; empty = built-in default",
     )
     RANK_CARD_BG_DIM: int = _fav_field(
         0, "卡片背景明暗补偿",
@@ -2834,12 +2840,59 @@ async def _handle_impression_overview(_ctx: schemas.AgentCtx, message: ChatMessa
         return None
 
 
+_LAYERS_CACHE: dict = {}
+
+
+def _card_layers():
+    """读外观图层模板（配置里给路径或直接给 JSON）；读不到返回 None = 用内置默认。
+
+    按 (路径, mtime) 缓存，模板文件改了才重读。
+    """
+    raw_val = str(getattr(config, "RANK_CARD_LAYERS", "") or "").strip()
+    if not raw_val:
+        return None
+    base = str(plugin.get_plugin_data_dir())
+
+    def _res(v):
+        """模板里的相对图片路径 → 绝对路径（按数据目录解析）。"""
+        try:
+            cover = v.get("layers") if isinstance(v, dict) else v
+            return {"layers": card.resolve_layer_sources(cover, base)} if isinstance(v, dict) \
+                else card.resolve_layer_sources(cover, base)
+        except Exception:  # noqa: BLE001
+            return v
+
+    if raw_val.startswith("[") or raw_val.startswith("{"):
+        try:
+            return _res(json.loads(raw_val))
+        except Exception:  # noqa: BLE001
+            plugin.logger.warning("RANK_CARD_LAYERS 内联 JSON 解析失败，用内置默认")
+            return None
+    try:
+        p = Path(raw_val)
+        if not p.is_file():
+            plugin.logger.warning(f"图层模板不存在，用内置默认: {raw_val}")
+            return None
+        key = (str(p), int(p.stat().st_mtime))
+        hit = _LAYERS_CACHE.get(key)
+        if hit is not None:
+            return hit
+        data = _res(json.loads(p.read_text(encoding="utf-8")))
+        _LAYERS_CACHE.clear()
+        _LAYERS_CACHE[key] = data
+        return data
+    except Exception:  # noqa: BLE001
+        plugin.logger.warning("图层模板读取失败，用内置默认", exc_info=True)
+        return None
+
+
 def _card_bg_kwargs() -> dict:
-    """当前配置里的背景参数（空路径 = 内置渐变）。"""
+    """当前配置里的背景 / 外观参数（空路径 = 内置渐变）。"""
     return {
         "bg_path": str(getattr(config, "RANK_CARD_BG", "") or "").strip(),
         "bg_blur": float(getattr(config, "RANK_CARD_BG_BLUR", 14.0) or 0.0),
         "bg_dim": int(getattr(config, "RANK_CARD_BG_DIM", 0) or 0),
+        "layers": _card_layers(),
     }
 
 
