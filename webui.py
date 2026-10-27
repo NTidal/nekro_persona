@@ -18,6 +18,7 @@ import asyncio
 import base64
 import glob
 import hmac
+import io
 import json
 import os
 import re
@@ -2942,6 +2943,41 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     def _font_dir() -> Path:
         return plugin.get_plugin_data_dir() / "fonts"
 
+    def _bg_custom_dir() -> Path:
+        return plugin.get_plugin_data_dir() / "backgrounds_custom"
+
+    def _bg_state() -> Dict[str, Any]:
+        """当前背景配置 + 目录里可选的自定义背景图。"""
+        cfg = plugin.get_config()
+        cur = str(getattr(cfg, "RANK_CARD_BG", "") or "").strip()
+        items: List[Dict[str, Any]] = []
+        try:
+            d = _bg_custom_dir()
+            if d.is_dir():
+                for f in sorted(d.iterdir()):
+                    if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+                        w = h = 0
+                        try:
+                            from PIL import Image as _Img
+
+                            with _Img.open(f) as im:
+                                w, h = im.size
+                        except Exception:  # noqa: BLE001
+                            pass
+                        items.append({"name": f.name, "size": f.stat().st_size,
+                                      "width": w, "height": h})
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "config": cur,
+            "name": Path(cur).name if cur else "",
+            "exists": bool(cur and Path(cur).is_file()),
+            "blur": float(getattr(cfg, "RANK_CARD_BG_BLUR", 14.0) or 0.0),
+            "dim": int(getattr(cfg, "RANK_CARD_BG_DIM", 0) or 0),
+            "veil": float(getattr(_card, "_BG_VEIL_ALPHA", 0.22) or 0.0),
+            "images": items,
+        }
+
     def _cards_dir() -> Path:
         return plugin.get_plugin_data_dir() / "card_previews"
 
@@ -3080,6 +3116,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 {"id": "overview", "label": "印象总览", "desc": "自动分列网格，只收有标签的档案"},
             ],
             "fontCatalog": [dict(x) for x in _FONT_CATALOG],
+            "background": _bg_state(),
             "backend": (lambda: _card.backend_report(str(_font_dir())))() if hasattr(
                 _card, "backend_report",
             ) else {},
@@ -3155,7 +3192,15 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             _card.set_emoji_font_override(str(getattr(cfg, "RANK_CARD_EMOJI_FONT", "") or ""))
         except Exception:  # noqa: BLE001
             plugin.logger.debug("设置 emoji 字体覆盖失败（忽略）", exc_info=True)
+        bg_cfg = _bg_state()
+        bg_path = str(body.get("bg_path", bg_cfg["config"]) or "")
+        bg_blur = float(body.get("bg_blur", bg_cfg["blur"]) or 0.0)
+        bg_dim = int(body.get("bg_dim", bg_cfg["dim"]) or 0)
+        meta["bg"] = {"name": Path(bg_path).name if bg_path else "", "blur": bg_blur, "dim": bg_dim}
         kwargs = {
+            "bg_path": bg_path,
+            "bg_blur": bg_blur,
+            "bg_dim": bg_dim,
             "font_path": font_path,
             "font_dir": font_dir,
             "avatar_dir": str(plugin.get_plugin_data_dir() / "avatars"),
@@ -3189,6 +3234,69 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "meta": meta,
             "image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
         }
+
+    @router.get("/api/card_bg", summary="卡片背景：当前配置 + 可选背景图")
+    async def api_card_bg_info(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        return {"ok": True, "background": _bg_state()}
+
+    @router.post("/api/card_bg", summary="设置 / 上传卡片背景图")
+    async def api_card_bg(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        cfg = plugin.get_config()
+        ctype = (request.headers.get("content-type") or "").lower()
+        if ctype.startswith("application/octet-stream"):
+            name = Path(str(request.query_params.get("name") or "bg.png")).name.strip()
+            if not name.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp")):
+                raise HTTPException(status_code=400, detail="只接受 .jpg / .png / .webp / .bmp")
+            raw_bytes = await request.body()
+            if len(raw_bytes) < 1024:
+                raise HTTPException(status_code=400, detail="文件太小，不像是图片")
+            if len(raw_bytes) > 20 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail="图片超过 20 MB")
+            try:                      # 先解析再落盘：损坏文件不能留在目录里
+                from PIL import Image as _Img
+
+                with _Img.open(io.BytesIO(raw_bytes)) as _im:
+                    _im.verify()
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=400, detail=f"不是有效图片：{exc}") from exc
+            d = _bg_custom_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            dst = d / name
+            tmp = dst.with_name(dst.name + ".tmp")
+            tmp.write_bytes(raw_bytes)
+            tmp.replace(dst)
+            setattr(cfg, "RANK_CARD_BG", str(dst))
+            plugin.save_config(cfg)
+            _card.reset_background_cache()
+            plugin.logger.info(f"[persona] WebUI 上传卡片背景 {name}（{len(raw_bytes):,} 字节）")
+            return {"ok": True, "background": _bg_state()}
+        body = await _json_body(request)
+        if body.get("clear"):
+            setattr(cfg, "RANK_CARD_BG", "")
+        if "name" in body:
+            name = Path(str(body.get("name") or "")).name.strip()
+            if name:
+                target = _bg_custom_dir() / name
+                if not target.is_file():
+                    raise HTTPException(status_code=404, detail=f"背景目录里没有 {name}")
+                setattr(cfg, "RANK_CARD_BG", str(target))
+            else:
+                setattr(cfg, "RANK_CARD_BG", "")
+        if "blur" in body:
+            try:
+                setattr(cfg, "RANK_CARD_BG_BLUR", max(0.0, min(60.0, float(body["blur"]))))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="blur 必须是数字")
+        if "dim" in body:
+            try:
+                setattr(cfg, "RANK_CARD_BG_DIM", max(-100, min(100, int(body["dim"]))))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="dim 必须是整数")
+        plugin.save_config(cfg)
+        _card.reset_background_cache()
+        return {"ok": True, "background": _bg_state()}
 
     @router.post("/api/font/install", summary="一键安装推荐字体（仅 OFL 字体、官方直链）")
     async def api_font_install(request: Request) -> Dict[str, Any]:

@@ -1167,6 +1167,101 @@ def _vertical_bg(PIL, width: int, height: int):
     return col.resize((width, height), PIL.Image.NEAREST)
 
 
+# 是否正在用「自定义图片」当背景（线程内标记，面板据此加厚 tint）
+_bg_ctx = threading.local()
+# (路径, mtime, w, h, blur, dim) → 已处理好的背景图（排行榜/总览高度随人数变，会命中多个尺寸）
+_BG_CACHE: dict = {}
+_BG_CACHE_MAX = 8
+# 图片背景的全局薄纱浓度（0 = 不蒙）。0.22 是实测出来的折中：标题区亮度够、照片还看得出内容
+_BG_VEIL_ALPHA = 0.22
+
+
+def reset_background_cache() -> None:
+    """换了背景图或调了参数后清缓存（webui 改配置时调用）。"""
+    _BG_CACHE.clear()
+
+
+def _cover_fit(PIL, img, width: int, height: int):
+    """等比铺满再居中裁剪（cover），保证不拉伸、不变形。"""
+    iw, ih = img.size
+    if iw <= 0 or ih <= 0:
+        return img
+    k = max(width / iw, height / ih)
+    nw, nh = max(1, int(round(iw * k))), max(1, int(round(ih * k)))
+    img = img.resize((nw, nh), PIL.Image.LANCZOS)
+    left = max(0, (nw - width) // 2)
+    top = max(0, (nh - height) // 2)
+    return img.crop((left, top, left + width, top + height))
+
+
+def _mean_luma(PIL, img) -> float:
+    """平均亮度（0~1，抽样算，别整图遍历）。"""
+    small = img.convert("L").resize((32, 32))
+    px = list(small.getdata())
+    return (sum(px) / len(px) / 255.0) if px else 0.5
+
+
+def _background(PIL, width: int, height: int, *, path: str = "", blur: float = 14.0,
+                dim: int = 0, scale: float = 1.0):
+    """卡片背景：有自定义图就「cover-fit + 模糊 + 压暗/提亮」，否则回落到暖色渐变。
+
+    dim: 0 = 自动（按背景平均亮度往「浅底」方向调，专门保文字可读）；
+         负数压暗、正数提亮，绝对值越大越狠（上限 100）。
+    任何异常都回落到渐变 —— 背景图绝不能把整张卡搞挂。
+    """
+    _bg_ctx.is_image = False
+    src = str(path or "").strip()
+    if not src:
+        return _vertical_bg(PIL, width, height)
+    try:
+        p = Path(src)
+        if not p.is_file():
+            logger.warning(f"自定义背景不存在，回落到渐变: {src}")
+            return _vertical_bg(PIL, width, height)
+        key = (str(p), int(p.stat().st_mtime), int(width), int(height),
+               round(float(blur), 1), int(dim))
+        hit = _BG_CACHE.get(key)
+        if hit is not None:
+            _bg_ctx.is_image = True
+            return hit.copy()
+        from PIL import ImageFilter, ImageOps
+
+        img = ImageOps.exif_transpose(PIL.Image.open(p)).convert("RGB")
+        limit = max(width, height) * 2
+        if max(img.size) > limit:          # 4K/8K 原图先缩，避免每帧 decode 大图
+            img.thumbnail((limit, limit), PIL.Image.LANCZOS)
+        bg = _cover_fit(PIL, img, width, height)
+        radius = float(blur) * max(float(scale), 1.0)
+        if radius > 0.4:
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=radius))
+        weight = _mean_luma(PIL, bg)
+        d = int(dim)
+        if d == 0:
+            # 目标亮度 0.72：卡片是「浅底 + 深色字 + 磨砂面板」，偏暗会脏、偏亮会飘
+            d = int(round(max(-22.0, min(26.0, (0.72 - weight) * 100))))
+        if d:
+            overlay = PIL.Image.new("RGB", bg.size, (255, 255, 255) if d > 0 else (0, 0, 0))
+            # 最多 40% 混合：再多就把照片压成一片灰白
+            bg = PIL.Image.blend(bg, overlay, min(abs(d), 100) / 250.0)
+        # 全局薄纱（暖白）：标题/页脚这类**直接压在照片上**的文字不会带面板，
+        # 光靠面板加厚救不了它们，所以整张图层再蒙一层薄纱保底对比
+        if _BG_VEIL_ALPHA > 0:
+            veil = PIL.Image.new("RGB", bg.size, (255, 252, 246))
+            bg = PIL.Image.blend(bg, veil, min(float(_BG_VEIL_ALPHA), 0.6))
+        if len(_BG_CACHE) >= _BG_CACHE_MAX:
+            try:
+                _BG_CACHE.pop(next(iter(_BG_CACHE)))
+            except Exception:  # noqa: BLE001
+                _BG_CACHE.clear()
+        _BG_CACHE[key] = bg.copy()
+        _bg_ctx.is_image = True
+        return bg
+    except Exception:  # noqa: BLE001
+        logger.warning(f"自定义背景渲染失败，回落到渐变: {src}", exc_info=True)
+        _bg_ctx.is_image = False
+        return _vertical_bg(PIL, width, height)
+
+
 def _decorative_blobs(PIL, width: int, height: int):
     """暖色装饰光斑层：给毛玻璃提供"可模糊"的背景内容。
 
@@ -1184,6 +1279,9 @@ def _decorative_blobs(PIL, width: int, height: int):
 
 
 def _frosted_panel(PIL, base, box, radius, *, blur=14, tint=(255, 250, 242), tint_alpha=70, scale=1.0):
+    # 图片背景比渐变「花」，面板要更实一点，否则浅色面板上的深色字会被背景纹路吃掉
+    if getattr(_bg_ctx, "is_image", False):
+        tint_alpha = min(255, int(tint_alpha) + 16)
     """毛玻璃面板：裁剪背后区域 → 高斯模糊 → 暖白半透明叠加 → 圆角遮罩贴回。
 
     box 为逻辑坐标 [x0, y0, x1, y1]（内部 × scale 转设备像素）。
@@ -1397,6 +1495,9 @@ def render_favorability_rank(
     font_dir: str = "",
     avatar_dir: str = "",
     scale: float = 0.0,
+    bg_path: str = "",
+    bg_blur: float = 14.0,
+    bg_dim: int = 0,
 ) -> bytes | None:
     """渲染好感度排行榜为 PNG 卡片，返回字节；不可用时返回 None。
 
@@ -1410,6 +1511,7 @@ def render_favorability_rank(
         return _render_favorability_rank_impl(
             entries, max_abs_score, limit=limit, font_path=font_path,
             font_dir=font_dir, avatar_dir=avatar_dir, scale=scale,
+            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim,
         )
     except Exception:  # noqa: BLE001
         logger.exception("好感度排行榜卡片渲染异常，回退为文本")
@@ -1425,6 +1527,9 @@ def _render_favorability_rank_impl(
     font_dir: str = "",
     avatar_dir: str = "",
     scale: float = 0.0,
+    bg_path: str = "",
+    bg_blur: float = 14.0,
+    bg_dim: int = 0,
 ) -> bytes | None:
     """真正的渲染实现（由 render_favorability_rank 兜底调用）。
 
@@ -1517,7 +1622,8 @@ def _render_favorability_rank_impl(
     img_h = card_h + MARGIN * 2
     S = float(scale) if scale and scale > 0 else _RENDER_SCALE
 
-    img = _vertical_bg(PIL, int(img_w * S), int(img_h * S))
+    img = _background(PIL, int(img_w * S), int(img_h * S),
+                      path=bg_path, blur=bg_blur, dim=bg_dim, scale=S)
 
     # 暖色装饰光斑：毛玻璃的"可模糊内容"（纯平渐变上看不出磨砂感）
     try:
@@ -1923,6 +2029,9 @@ def render_profile_card(
     font_dir: str = "",
     avatar_dir: str = "",
     scale: float = 0.0,
+    bg_path: str = "",
+    bg_blur: float = 14.0,
+    bg_dim: int = 0,
 ) -> bytes | None:
     """渲染**单人**关系档案卡片，返回 PNG 字节；不可用返回 None。
 
@@ -1938,6 +2047,7 @@ def render_profile_card(
         return _render_profile_card_impl(
             entry, max_abs_score, font_path=font_path, font_dir=font_dir,
             avatar_dir=avatar_dir, scale=scale,
+            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim,
         )
     except Exception:  # noqa: BLE001
         logger.exception("关系档案卡片渲染异常，回退为文本")
@@ -1952,6 +2062,9 @@ def _render_profile_card_impl(
     font_dir: str = "",
     avatar_dir: str = "",
     scale: float = 0.0,
+    bg_path: str = "",
+    bg_blur: float = 14.0,
+    bg_dim: int = 0,
 ) -> bytes | None:
     PIL = _load_pil()
     if PIL is None:
@@ -2037,7 +2150,8 @@ def _render_profile_card_impl(
     img_w = CARD_W + MARGIN * 2
     img_h = card_h + MARGIN * 2
 
-    img = _vertical_bg(PIL, int(img_w * S), int(img_h * S))
+    img = _background(PIL, int(img_w * S), int(img_h * S),
+                      path=bg_path, blur=bg_blur, dim=bg_dim, scale=S)
     try:
         img = PIL.Image.alpha_composite(
             img.convert("RGBA"), _decorative_blobs(PIL, img.width, img.height)
@@ -2261,12 +2375,16 @@ def render_impression_overview(
     font_dir: str = "",
     avatar_dir: str = "",
     scale: float = 0.0,
+    bg_path: str = "",
+    bg_blur: float = 14.0,
+    bg_dim: int = 0,
 ) -> bytes | None:
     """渲染「印象总览」：每人一行，带头像/昵称/ID/标签/稳定印象/好感度。不可用返回 None。"""
     try:
         return _render_impression_overview_impl(
             entries, max_abs_score, limit=limit, font_path=font_path,
             font_dir=font_dir, avatar_dir=avatar_dir, scale=scale,
+            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim,
         )
     except Exception:  # noqa: BLE001
         logger.exception("印象总览卡片渲染异常，回退为文本")
@@ -2282,6 +2400,9 @@ def _render_impression_overview_impl(
     font_dir: str = "",
     avatar_dir: str = "",
     scale: float = 0.0,
+    bg_path: str = "",
+    bg_blur: float = 14.0,
+    bg_dim: int = 0,
 ) -> bytes | None:
     """印象总览：按人数自动分列，**每格竖向节奏与「查看印象」单人卡一致**。
 
@@ -2439,7 +2560,8 @@ def _render_impression_overview_impl(
     img_w = card_w + MARGIN * 2
     img_h = card_h + MARGIN * 2
 
-    img = _vertical_bg(PIL, int(img_w * S), int(img_h * S))
+    img = _background(PIL, int(img_w * S), int(img_h * S),
+                      path=bg_path, blur=bg_blur, dim=bg_dim, scale=S)
     try:
         img = PIL.Image.alpha_composite(
             img.convert("RGBA"), _decorative_blobs(PIL, img.width, img.height)

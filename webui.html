@@ -2527,6 +2527,39 @@ body.is-scrolling .dialog-foot {
 
       <div class="card">
         <div class="card-head">
+          <div>
+            <h2 class="card-title">背景</h2>
+            <div class="card-subtitle" id="cardBgSub">内置暖色渐变</div>
+          </div>
+          <span class="badge" id="cardBgBadge">渐变</span>
+        </div>
+        <div class="card-body">
+          <div class="preview-control">
+            <div class="field-label">背景图
+              <select class="select" id="cardBgSelect"></select>
+            </div>
+            <div class="score-control">
+              <div class="score-top"><span>模糊半径</span><output id="cardBgBlurOut">14</output></div>
+              <input type="range" id="cardBgBlur" min="0" max="60" step="1" value="14">
+            </div>
+            <div class="score-control">
+              <div class="score-top"><span>明暗补偿</span><output id="cardBgDimOut">自动</output></div>
+              <input type="range" id="cardBgDim" min="-100" max="100" step="5" value="0">
+            </div>
+            <div class="row-end">
+              <button class="btn" type="button" id="cardBgUploadBtn">上传背景图</button>
+              <input type="file" id="cardBgFile" accept=".jpg,.jpeg,.png,.webp,.bmp" hidden>
+            </div>
+          </div>
+          <p class="hint" id="cardBgHint">
+            选中即生效：图片会等比铺满 + 按目标尺寸裁剪 + 模糊，再自动做明暗补偿保证文字可读
+            （明暗补偿 0 = 自动，负数压暗、正数提亮）。照片较花时可调低模糊或加大补偿。
+          </p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
           <div><h2 class="card-title">渲染参数</h2><div class="card-subtitle">示例数据不碰真实档案，可直接看效果</div></div>
         </div>
         <div class="card-body">
@@ -4884,6 +4917,26 @@ async function loadCards(opts = {}) {
     }
   }
 
+  const bg = info.background || {};
+  const bgSel = $('#cardBgSelect');
+  if (bgSel) {
+    const imgs = bg.images || [];
+    bgSel.innerHTML = `<option value="">（内置暖色渐变）</option>`
+      + imgs.map((x) => `<option value="${esc(x.name)}"${x.name === bg.name ? ' selected' : ''}>`
+        + `${esc(x.name)}（${fmtBytes(x.size)}${x.width ? ' · ' + x.width + '×' + x.height : ''}）</option>`).join('');
+    const blur = $('#cardBgBlur'), dim = $('#cardBgDim');
+    if (document.activeElement !== blur) blur.value = Math.round(bg.blur || 0);
+    if (document.activeElement !== dim) dim.value = Math.round(bg.dim || 0);
+    $('#cardBgBlurOut').textContent = Math.round(bg.blur || 0);
+    $('#cardBgDimOut').textContent = Number(bg.dim || 0) === 0 ? '自动' : (bg.dim > 0 ? '+' : '') + bg.dim;
+    $('#cardBgSub').textContent = bg.name
+      ? `${bg.name}　·　模糊 ${Math.round(bg.blur || 0)}　·　补偿 ${Number(bg.dim || 0) === 0 ? '自动' : bg.dim}`
+      : '内置暖色渐变（无自定义图）';
+    const badge = $('#cardBgBadge');
+    badge.textContent = bg.name ? (bg.exists ? '自定义' : '图片丢失') : '渐变';
+    badge.className = 'badge' + (bg.name && !bg.exists ? ' warn' : '');
+  }
+
   $('#cardFontHint').innerHTML = font.pinEnabled
     ? '选中即生效（不用点保存）。系统字体首次被探测到时会自动复制一份进数据目录（<code>.font_pin.json</code> 记录来源）；下拉里的百分比是把该字体真渲染一遍样本字符得出的覆盖度。'
     : '⚠️ 已通过 <code>NEKRO_PERSONA_FONT_PIN=0</code> 关闭字体落地，系统字体不会被复制。';
@@ -4944,6 +4997,63 @@ $('#cardFontCatalogList').addEventListener('click', async (e) => {
     btn.classList.remove('is-loading');
     btn.disabled = false;
     btn.textContent = label;
+  }
+});
+
+/* ---- 背景 ---- */
+let _bgTimer = 0;
+async function saveBg(patch, rerender) {
+  const d = await postAction('card_bg', patch);
+  if (!d) return;
+  state.cardInfo = null;
+  await loadCards({ fresh: true });
+  if (rerender) await runCardPreview();
+}
+
+$('#cardBgSelect').addEventListener('change', async (e) => {
+  await saveBg({ name: e.target.value }, true);
+  toast(e.target.value ? '背景已切换：' + e.target.value : '已恢复内置渐变', 'success');
+});
+
+function _bgSliderChanged() {
+  const blur = parseFloat($('#cardBgBlur').value) || 0;
+  const dim = parseInt($('#cardBgDim').value, 10) || 0;
+  $('#cardBgBlurOut').textContent = blur;
+  $('#cardBgDimOut').textContent = dim === 0 ? '自动' : (dim > 0 ? '+' : '') + dim;
+  clearTimeout(_bgTimer);
+  _bgTimer = setTimeout(async () => {
+    await saveBg({ blur, dim }, 'keep');
+  }, 350);
+}
+$('#cardBgBlur').addEventListener('input', _bgSliderChanged);
+$('#cardBgDim').addEventListener('input', _bgSliderChanged);
+
+$('#cardBgUploadBtn').addEventListener('click', () => $('#cardBgFile').click());
+$('#cardBgFile').addEventListener('change', async (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  if (file.size > 20 * 1024 * 1024) { toast('图片超过 20 MB', 'warning'); return; }
+  let buf;
+  try { buf = await file.arrayBuffer(); } catch (err) { toast('读取文件失败', 'error'); return; }
+  const btn = $('#cardBgUploadBtn');
+  btn.classList.add('is-loading');
+  try {
+    const res = await fetch('./api/card_bg?name=' + encodeURIComponent(file.name), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', ...(state.key ? { 'X-WebUI-Key': state.key } : {}) },
+      body: buf,
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error((data && (data.message || data.detail)) || `HTTP ${res.status}`);
+    toast('背景已上传并启用：' + file.name, 'success');
+    state.cardInfo = null;
+    await loadCards({ fresh: true });
+    await runCardPreview();
+  } catch (err) {
+    toast('上传失败：' + err.message, 'error');
+  } finally {
+    btn.classList.remove('is-loading');
+    e.target.value = '';
   }
 });
 

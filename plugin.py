@@ -72,7 +72,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.3.11",
+    version="2.3.12",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -562,6 +562,23 @@ class FavorabilityConfig(ConfigBase):
         "", "卡片 emoji 字体路径",
         "卡片里 emoji 使用的彩色字体文件路径（如 emoji-segoe.ttf）；留空则自动探测",
         en_title="Card Emoji Font Path", en_desc="Color emoji font for cards; empty auto-detects",
+    )
+    RANK_CARD_BG: str = _fav_field(
+        "", "卡片背景图路径",
+        "自定义卡片背景图（.jpg/.png/.webp）；留空则用暖色渐变。图片会等比铺满 + 模糊 + 明暗补偿",
+        en_title="Card Background Image", en_desc="Custom card background image; empty uses built-in gradient",
+    )
+    RANK_CARD_BG_BLUR: float = _fav_field(
+        14.0, "卡片背景模糊半径",
+        "自定义背景的模糊半径（0~60，逻辑像素；绘制时会乘以渲染倍率）",
+        en_title="Card Background Blur", en_desc="Blur radius for custom background (0-60)",
+        ge=0.0, le=60.0,
+    )
+    RANK_CARD_BG_DIM: int = _fav_field(
+        0, "卡片背景明暗补偿",
+        "0 = 自动（按背景平均亮度往浅底方向调，保文字可读）；负数压暗、正数提亮，-100~100",
+        en_title="Card Background Dim", en_desc="0=auto; negative darkens, positive lightens (-100..100)",
+        ge=-100, le=100,
     )
 
     # ==================== 频道重置行为 ====================
@@ -2694,6 +2711,7 @@ async def _render_rank_card(entries: List[dict], max_abs: int) -> bytes | None:
             font_dir=str(plugin.get_plugin_data_dir() / "fonts"),
             avatar_dir=str(plugin.get_plugin_data_dir() / "avatars"),
             scale=_rank_card_scale(),
+            **_card_bg_kwargs(),
         )
     except Exception:  # noqa: BLE001
         plugin.logger.exception("好感度排行榜卡片渲染失败，回退为文本")
@@ -2761,6 +2779,7 @@ async def _render_impression_overview_card(entries: List[dict], max_abs: int) ->
             font_dir=str(plugin.get_plugin_data_dir() / "fonts"),
             avatar_dir=str(plugin.get_plugin_data_dir() / "avatars"),
             scale=_rank_card_scale(),
+            **_card_bg_kwargs(),
         )
     except Exception:  # noqa: BLE001
         plugin.logger.exception("印象总览卡片渲染失败，回退为文本")
@@ -2815,6 +2834,15 @@ async def _handle_impression_overview(_ctx: schemas.AgentCtx, message: ChatMessa
         return None
 
 
+def _card_bg_kwargs() -> dict:
+    """当前配置里的背景参数（空路径 = 内置渐变）。"""
+    return {
+        "bg_path": str(getattr(config, "RANK_CARD_BG", "") or "").strip(),
+        "bg_blur": float(getattr(config, "RANK_CARD_BG_BLUR", 14.0) or 0.0),
+        "bg_dim": int(getattr(config, "RANK_CARD_BG_DIM", 0) or 0),
+    }
+
+
 def _card_emoji_font() -> str:
     """当前配置里的 emoji 字体路径（空 = 自动探测），并同步到 card 模块。"""
     path = str(getattr(config, "RANK_CARD_EMOJI_FONT", "") or "").strip()
@@ -2837,6 +2865,7 @@ async def _render_profile_card_bytes(entry: dict, max_abs: int) -> bytes | None:
             font_dir=str(plugin.get_plugin_data_dir() / "fonts"),
             avatar_dir=str(plugin.get_plugin_data_dir() / "avatars"),
             scale=_rank_card_scale(),
+            **_card_bg_kwargs(),
         )
     except Exception:  # noqa: BLE001
         plugin.logger.exception("关系档案卡片渲染失败，回退为文本")
