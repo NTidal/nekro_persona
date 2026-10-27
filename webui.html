@@ -2502,15 +2502,11 @@ body.is-scrolling .dialog-foot {
               <select class="select" id="cardEmojiSelect"></select>
             </div>
             <div class="row-end">
-              <button class="btn" type="button" id="cardEmojiApply">设为 emoji 字体</button>
-              <button class="btn" type="button" id="cardEmojiAuto">emoji 自动探测</button>
-            </div>
-          </div>
-          <div class="preview-control">
-            <div class="row-end">
               <button class="btn" type="button" id="cardFontApply">设为当前字体</button>
               <button class="btn" type="button" id="cardFontUploadBtn">上传自定义字体</button>
               <button class="btn" type="button" id="cardFontClear">恢复自动探测</button>
+              <button class="btn" type="button" id="cardEmojiApply">设为 emoji 字体</button>
+              <button class="btn" type="button" id="cardEmojiAuto">emoji 自动探测</button>
               <input type="file" id="cardFontFile" accept=".ttf,.ttc,.otf" hidden>
             </div>
           </div>
@@ -4767,6 +4763,12 @@ async function loadCards(opts = {}) {
   badge.textContent = font.exists ? '出图可用' : '无字体';
   badge.className = 'badge' + (font.exists ? '' : ' warn');
 
+  const sel = $('#cardFontSelect');
+  const fonts = font.fonts || [];
+  sel.innerHTML = fonts.length
+    ? fonts.map((f) => `<option value="${esc(f.name)}"${f.name === font.name ? ' selected' : ''}>${esc(f.name)}（${fmtBytes(f.size)}）</option>`).join('')
+    : '<option value="">（数据目录 fonts/ 里没有字体）</option>';
+
   const em = font.emoji || {};
   const emSel = $('#cardEmojiSelect');
   if (emSel) {
@@ -4788,12 +4790,6 @@ async function loadCards(opts = {}) {
       emLine.classList.add('warn');
     }
   }
-
-  const sel = $('#cardFontSelect');
-  const fonts = font.fonts || [];
-  sel.innerHTML = fonts.length
-    ? fonts.map((f) => `<option value="${esc(f.name)}"${f.name === font.name ? ' selected' : ''}>${esc(f.name)}（${fmtBytes(f.size)}）</option>`).join('')
-    : '<option value="">（数据目录 fonts/ 里没有字体）</option>';
 
   const kindSel = $('#cardKind');
   if (!kindSel.options.length) {

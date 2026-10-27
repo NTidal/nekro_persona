@@ -5,7 +5,7 @@
 > **2.0 起**：前 3 档是手工策划的「种子」（模型不可改）；**tier4 是「生长」**——角色在运行时自己沉淀的身份锚点（身份）与频道笔记（功能），
 > 并具备**种子包 / 生长包分离导出**：角色定义可公开版本化，「这一世活过的痕迹」可整体迁移备份。
 
-版本 **2.3.6**　作者 **NTidal**　许可 **GPLv3**
+版本 **2.3.7**　作者 **NTidal**　许可 **GPLv3**
 
 ---
 
@@ -621,6 +621,33 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
 
 > 本日志只保留**最近三个版本**的改动；更早的版本见 git 提交历史（`git log --oneline`）。
 
+### 2.3.7
+
+**修「卡片预览」页整页失效（`Cannot access 'fonts' before initialization`）**
+
+2.3.6 把 emoji 字体下拉的填充代码插到了 `const fonts = font.fonts || [];` **前面**，
+而那段代码里读了 `fonts.length` —— `const` 的暂时性死区直接抛 `ReferenceError`：
+
+```
+Uncaught ReferenceError: Cannot access 'fonts' before initialization
+    at loadCards (webui.html:4773)
+```
+
+后果是 `loadCards()` 在**填完字体名之后就中断**：正文/emoji 两个下拉全空、卡片类型下拉也空
+（它排在后面），emoji 状态行永远停在「读取中…」，整页看起来就是坏的。
+`node --check` 只查语法，抓不到这种运行期 TDZ。
+
+修复：把 emoji 块整体挪到 `const fonts` 之后（按大括号配平整块搬迁，不是零散改行），
+并把 5 个按钮合并到同一行。
+
+顺带加了一个**真浏览器**回归探针 `_cards_page_probe.js`（Playwright + 仓库内 chromium）：
+打开 `/plugins/NTidal.nekro_persona/` → 点侧栏「卡片预览」→ 抓 `pageerror` / console / 4xx
+→ 检查三个下拉的 `options.length` → 点「生成预览」→ 校验 `img.naturalWidth>0` 并截图。
+
+实测（NA1）：修复前 `pageerror: Cannot access 'fonts' before initialization`、下拉 0/0/0；
+修复后 `errs=[]`、字体下拉 6 项、emoji 下拉 7 项（含「自动探测」）、卡片下拉 3 项，
+点「生成预览」出图 1140×586（202 KB，字体思源黑体），截图见 `_cards_page.png`。
+
 ### 2.3.6
 
 **emoji 字体也能手动指定（配置项 + 页面下拉）**
@@ -670,34 +697,3 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
 彩色: True   已落地: True   标记: .emoji_font_pin.json  {"pinned":…,"source":…,"size":12934920}
 第二次调用: 同一文件、未被重写（不重复复制 12.9 MB）
 ```
-
-### 2.3.4
-
-**WebUI 新增「卡片预览」页：三张卡模拟渲染 + 当前字体与自定义字体**
-
-侧栏在「注入预览」下面多了一项**卡片预览**，不用去群里发指令就能看效果，也不用猜现在到底用的哪个字体。
-
-页面三块：
-
-1. **当前字体** —— 显示实际生效的字体名、是否已在插件数据目录、是否落地副本（`.font_pin.json`）；
-   下拉列出数据目录 `fonts/` 里的所有字体（含大小），可「设为当前字体」「恢复自动探测」；
-   「上传自定义字体」把 `.ttf/.ttc/.otf`（≤60 MB）直接写进数据目录并立即启用。
-2. **渲染参数** —— 卡片（单人印象卡 / 好感度排行榜 / 印象总览）× 数据来源
-   （示例数据 / 真实频道）× 渲染精度（跟随配置 / 1.5× / 2× / 3×）。
-   示例数据是 4 位虚构用户：高好感 + 长印象、带 emoji 昵称、负分冷场各一种，第一次打开就能看全。
-3. **预览** —— 直接出图（base64 内嵌，不落临时文件），标题栏显示档案条数、字节数、使用的字体。
-
-接口：
-
-```
-GET  /api/card_preview      当前字体 / 可选字体 / 频道列表 / 卡片与精度选项
-POST /api/card_preview      {card, source, scale, chat_key?} → {image: data:image/png;base64,…}
-POST /api/font              {name} 选择数据目录里的字体；{clear:true} 恢复自动探测
-POST /api/font?name=x.otf   请求体为字体原始字节（application/octet-stream）→ 保存并启用
-```
-
-换字体后调用 `card.reset_font_caches()`：字体缓存按 (路径, 目录) 命中，同路径换文件内容不会自动失效。
-
-实测（NA1）：GET 返回 6 个可选字体 / 24 个频道；三种卡的示例渲染分别 386 KB / 388 KB / 713 KB（base64），
-真实频道 14 人总览 1446 KB；切换字体 → 恢复自动探测（回落到 LXGW）→ 再切回思源黑体均即时生效；
-上传 16.5 MB 字体落盘并启用；非法文件名 / 非法卡片类型 / 空频道分别返回 400 与可读原因。
