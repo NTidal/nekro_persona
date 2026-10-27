@@ -5,7 +5,7 @@
 > **2.0 起**：前 3 档是手工策划的「种子」（模型不可改）；**tier4 是「生长」**——角色在运行时自己沉淀的身份锚点（身份）与频道笔记（功能），
 > 并具备**种子包 / 生长包分离导出**：角色定义可公开版本化，「这一世活过的痕迹」可整体迁移备份。
 
-版本 **2.3.10**　作者 **NTidal**　许可 **GPLv3**
+版本 **2.3.11**　作者 **NTidal**　许可 **GPLv3**
 
 ---
 
@@ -621,6 +621,68 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
 
 > 本日志只保留**最近三个版本**的改动；更早的版本见 git 提交历史（`git log --oneline`）。
 
+### 2.3.11
+
+**调研：Pillow 依赖能不能像字体那样管理 —— 结论：不能「塞一份进来」，但能探测**
+
+先给结论，再给现场实测数据。
+
+#### 为什么 Pillow 不能像字体那样管
+
+| 维度 | 字体 | Pillow |
+|---|---|---|
+| 性质 | **数据**（谁放哪都能用，只是路径不同） | **代码 + C ABI**（`PIL/_imaging.cpython-311-x86_64-linux-gnu.so`） |
+| 模块名 | 无 | 全局唯一 `PIL` / `PIL._imaging`，**一份进程里只能有一个** |
+| 与宿主冲突 | 无 | NekroAgent 自己也用 PIL 出图/处理头像，插件再塞一份等于抢全局模块，会把它一起弄坏 |
+| 平台绑定 | 无 | 绑 CPython 3.11 + manylinux x86_64，换镜像/架构即废 |
+| 版本差异 | 只是字形多寡 | **API 级断裂**（本次实测：Pillow 12.2.0 的 `FT2Font` 已无 `get_char_index`） |
+
+所以要换 Pillow 版本，只能在**镜像 / venv 层**做（`pip install -U pillow` 或改 NA 的
+requirements），不是插件能做的事。
+
+#### 能像字体一样管的两个部分
+
+1. **纯 Python 的辅助库可以「放进来就用」**：`fontTools` 4.61.1 无 C 扩展（23.2 MB 全量源码），
+   真需要时可以 vendor 进插件或数据目录并把它插到 `sys.path` 前面 —— 但目前 NA 镜像自带，
+   没必要背体积，所以只做「有就用，没有就降级」。
+2. **能力探测（capability probe）**：这才是能在插件层做的那一半，和字体探测同一套思路 ——
+   探测「渲染后端能干什么」，把结论缓存到数据目录，代码按能力选路径。
+
+`card.probe_imaging_backend()` 探测项（本机实测值）：
+
+```
+python          3.11.13
+pillow          12.2.0
+freetype        2.14.3
+raqm            True        # 复杂文本整形（emoji ZWJ 序列、组合字符）
+char_index      False       # FT2Font 有没有 get_char_index —— Pillow 12 已移除
+mask_notdef     False       # getmask('￾') 是否为空 —— False 说明该字体带 .notdef 轮廓，
+                            #   掩码比对不可靠（这正是 2.3.10 修掉的那个坑）
+color_emoji     False       # 用 getmask 拿不到彩色字形 → 彩色 emoji 必须走 embedded_color
+fonttools       4.61.1
+coverage_source cmap        # 字形判定当前用 fontTools 的 cmap（精确）
+```
+
+结果缓存到 `<插件数据目录>/render_backend.json`（只在 Pillow/FreeType 版本变化时重写），
+WebUI「卡片预览 → 字体」显示成一行：
+
+```
+渲染后端：Pillow 12.2.0 · FreeType 2.14.3 · raqm ✓ · 字形判定 cmap(fontTools 4.61.1)
+```
+
+如果哪天后端缺 fontTools（`coverage_source=mask`），这一行会变成黄字警告：
+「字形判定：掩码比对（退化模式，可能误判）」—— 就是让人一眼看出「现在是退化的」。
+
+#### 实操建议
+
+- 想升级 Pillow：改 NA 镜像的 `pip install pillow==x` 或 `requirements.txt`，重跑容器；
+- 插件侧只保证「跨 Pillow 版本都能跑」：不依赖 `get_char_index`、不假设 `getmask` 可靠、
+  彩色 emoji 走 `embedded_color`，并在页面上把后端能力摆出来。
+
+实测（NA1，真浏览器）：接口 `GET /api/card_preview` 返回 `backend` 字段与上表一致；
+字体页那一行文案正确渲染；推荐目录 5 个「一键安装」按钮 + 3 个「需到官方页面手动下载」；
+`pageerror` 0。
+
 ### 2.3.10
 
 **一键安装（只对 OFL 字体开放）+ 修「字形覆盖判定」的根本 bug**
@@ -715,66 +777,3 @@ Noto Color Emoji 安装后自动切为 emoji 字体且 `cjk=0 / emoji=100% / 彩
 
 实测（NA1，真浏览器）：折叠块渲染 8 条、许可徽标齐全、`rel`/`target` 全部正确、
 `pageerror` 0，字体下拉与预览不受影响。
-
-### 2.3.8
-
-**字体选择合一（选中即生效）+ 拿字体真渲染来判定能力 + 分组与推荐**
-
-三个问题一起改：
-
-1. **两处下拉都列全部字体，分不清** —— 之前正文字体和 emoji 字体共用一份字体清单，
-   得靠自己看文件名猜。现在由**能力探测**决定归属。
-2. **要按按钮才生效** —— 现在「选中即生效」，不再有「设为当前字体 / 设为 emoji 字体」按钮。
-3. **「自动探测」不在列表里** —— 现在它是两个下拉的首项（`value=""`），标签里直接写出当前推荐：
-
-```
-正文字体   [ 自动探测（当前推荐：SourceHanSansSC-Regular.otf）        ▾ ]
-            中文正文字体（推荐）
-              SourceHanSansSC-Regular.otf（15.8 MB）· 汉字 100% · emoji 100%（单色）· 推荐
-              msyh.ttc（18.8 MB）· 汉字 100% · emoji 100%（彩色）
-              Deng.ttf / LXGWWenKai-Regular.ttf / simhei.ttf …
-emoji 字体  [ 自动探测（当前推荐：emoji-segoe.ttf）                    ▾ ]
-            彩色 emoji（推荐）
-              emoji-segoe.ttf（12.3 MB）· 汉字 100% · emoji 100%（彩色）· 推荐
-            单色字体（能显示 emoji，但不会上色）
-              LXGWWenKai-Regular.ttf / SourceHanSansSC-Regular.otf / simhei.ttf
-```
-
-### 能力探测怎么做的
-
-`card.probe_font_capabilities(path)` 不靠文件名猜，**拿字体真渲染一批样本字符**再判：
-
-| 指标 | 样本 | 判据 |
-|---|---|---|
-| `cjk` | GB2312 一级高频字 250 个 + 中文标点/全角 24 个 | 覆盖 ≥90% 才算能当正文字体 |
-| `emoji` | 18 个彩色 emoji（⚽🏀😀✨🌸🌙…） | 覆盖 ≥85% 且**字体带彩色表**才是 emoji 字体 |
-| `symbols` | 8 个常见符号（❤☀★☆✔…） | 辅助判断 |
-| `color` | COLR / CBDT / sbix / SVG 表 | 决定能不能上色 |
-
-字形判定用 FreeType 字形索引（`get_char_index(cp) != 0`），不是 `getmask().getbbox()`
-—— 后者对带 `.notdef` 轮廓的字体永远非空（2.3.1 那个 emoji 不生效的坑）。
-
-⚠️ 实践踩到的点：**很多中文字体也带 emoji 码点的单色字形**（实测 LXGW / simhei / 思源黑体全覆盖），
-只看「有没有字形」会把它们全判成 emoji 字体。所以拆成 `color_emoji`（彩色，才进 emoji 推荐）
-与 `mono_emoji`（单色，归到「能显示但不上色」分组）；另外名字带 `emoji` 的字体不进正文字体候选
-（`emoji-segoe.ttf` 其实覆盖了汉字）。
-
-推荐规则：正文 = 汉字覆盖 ≥90%、按「同类名优先级（sourcehan/noto/siyuan/pingfang/wenkai/hei…）
-→ 覆盖率 → 体积」排序取第一个；emoji = 彩色优先、按覆盖率排序。
-
-### 顺带
-
-- 新增独立脚本 `scripts/probe_fonts.py`，可以脱离页面直接体检一目录字体：
-
-```
-/app/.venv/bin/python scripts/probe_fonts.py /path/to/fonts [--json]
-字体                              大小     汉字   emoji    符号  彩色  建议用途
-SourceHanSansSC-Regular.otf     15.8 MB   100%    100%   100%  否   text+emoji-mono
-emoji-segoe.ttf                 12.3 MB   100%    100%   100%  是   emoji
-```
-
-- 页面还留着「上传自定义字体」「重新探测」；能力探测结果按 (文件名, 大小, mtime) 缓存。
-
-实测（NA1，真浏览器）：正文下拉 6 项（自动 + 5 个中文字体，分组正确）、emoji 下拉 5 项
-（自动 + 1 彩色 + 3 单色），两个「自动探测」项都写明当前推荐；把正文切到 `Deng.ttf`
-副标题立即变成「正文 Deng.ttf」；`pageerror` 0、预览出图 1140×586。

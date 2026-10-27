@@ -2509,6 +2509,7 @@ body.is-scrolling .dialog-foot {
           </div>
           <p class="hint" id="cardFontCaps">选中即生效；这里显示该字体的实测能力。</p>
           <p class="hint" id="cardEmojiLine">emoji 字体：读取中…</p>
+          <p class="hint" id="cardBackendLine"></p>
           <p class="hint" id="cardFontHint"></p>
           <details id="cardFontCatalog" style="margin-top:10px">
             <summary style="cursor:pointer;font-size:12px;color:var(--text-soft)">
@@ -4865,6 +4866,22 @@ async function loadCards(opts = {}) {
         }).join('')
         + `</ul>`
       : '（后端没有提供推荐目录）';
+  }
+
+  const be = info.backend || {};
+  const beLine = $('#cardBackendLine');
+  if (beLine) {
+    if (be.pillow) {
+      const src = be.coverage_source === 'cmap'
+        ? `字形判定 cmap(fontTools ${esc(be.fonttools || '?')})`
+        : '字形判定：掩码比对（退化模式，可能误判）';
+      beLine.innerHTML = `渲染后端：Pillow ${esc(be.pillow)}　·　FreeType ${esc(be.freetype || '?')}`
+        + `　·　raqm ${be.raqm ? '✓' : '—'}　·　${src}`;
+      beLine.classList.toggle('warn', be.coverage_source !== 'cmap');
+    } else {
+      beLine.textContent = '渲染后端信息不可用（Pillow 未就绪）';
+      beLine.classList.add('warn');
+    }
   }
 
   $('#cardFontHint').innerHTML = font.pinEnabled

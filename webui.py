@@ -3080,6 +3080,9 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 {"id": "overview", "label": "印象总览", "desc": "自动分列网格，只收有标签的档案"},
             ],
             "fontCatalog": [dict(x) for x in _FONT_CATALOG],
+            "backend": (lambda: _card.backend_report(str(_font_dir())))() if hasattr(
+                _card, "backend_report",
+            ) else {},
             "scales": [
                 {"value": 0, "label": "跟随插件配置"},
                 {"value": 1.5, "label": "1.5×（省流）"},

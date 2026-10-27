@@ -315,6 +315,114 @@ def probe_font_capabilities(path: str) -> dict:
     return out
 
 
+# ============ 渲染后端能力探测 ============
+# Pillow 这类**编译依赖**没法像字体那样「放一份进来就用」：`PIL` / `PIL._imaging` 是全局唯一
+# 模块名，NA 自己也用它出图，插件再塞一份只会互相踩。能做的就是同一套思路的另一半 ——
+# 像探测字体能力那样探测**渲染后端能干什么**，把结论缓存下来、代码按能力选路径。
+_BACKEND_CACHE_FILE = "render_backend.json"
+_backend_report: dict | None = None
+
+
+def probe_imaging_backend() -> dict:
+    """探测成像后端能力（Pillow / FreeType / raqm / 可用的字形判定手段）。"""
+    out: dict = {
+        "python": "",
+        "pillow": "",
+        "freetype": "",
+        "raqm": False,
+        "char_index": False,       # Pillow 的 FT2Font 是否还有 get_char_index（Pillow 12 已移除）
+        "mask_notdef": False,      # getmask 对未映射码点是否返回 None（否则掩码比对不可靠）
+        "color_emoji": False,      # 能否渲染彩色 emoji（COLR/SVG/CBDT 任一）
+        "fonttools": "",
+        "coverage_source": "mask",  # cmap=fontTools 精确判定；mask=掩码比对兜底
+    }
+    try:
+        import platform
+        import PIL
+        from PIL import features
+
+        out["python"] = platform.python_version()
+        out["pillow"] = str(PIL.__version__)
+        try:
+            out["freetype"] = str(features.version("freetype2"))
+        except Exception:  # noqa: BLE001
+            out["freetype"] = ""
+        try:
+            out["raqm"] = bool(features.check("raqm"))
+        except Exception:  # noqa: BLE001
+            out["raqm"] = False
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        from fontTools import version as _ft_version
+
+        out["fonttools"] = str(_ft_version)
+        out["coverage_source"] = "cmap"
+    except Exception:  # noqa: BLE001
+        out["fonttools"] = ""
+        out["coverage_source"] = "mask"
+
+    # 拿一个真实字体试两种判定手段（都用系统里第一个能找到的 CJK 字体）
+    probe_font = None
+    for cand in _FONT_CANDIDATES:
+        try:
+            if Path(cand).is_file():
+                probe_font = cand
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if probe_font:
+        try:
+            from PIL import ImageFont
+
+            f = ImageFont.truetype(probe_font, 20)
+            out["char_index"] = hasattr(getattr(f, "font", None), "get_char_index")
+            try:
+                out["mask_notdef"] = f.getmask("\ufffe").getbbox() is None
+            except Exception:  # noqa: BLE001
+                out["mask_notdef"] = False
+            try:
+                # 彩色字形的字体用 getmask 通常拿不到 → 反过来证明「掩码判定会误判」
+                out["color_emoji"] = bool(f.getmask("\U0001f600").getbbox())
+            except Exception:  # noqa: BLE001
+                out["color_emoji"] = False
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def backend_report(font_dir: str = "", refresh: bool = False) -> dict:
+    """带缓存的探测结果；首次或后端版本变化时写 `<数据目录>/render_backend.json`。"""
+    global _backend_report
+    if _backend_report is not None and not refresh:
+        return _backend_report
+    rep = probe_imaging_backend()
+    _backend_report = rep
+    try:
+        if font_dir.strip():
+            root = Path(font_dir.strip()).parent
+            if root.is_dir():
+                import json as _json
+
+                path = root / _BACKEND_CACHE_FILE
+                old = {}
+                try:
+                    if path.is_file():
+                        old = _json.loads(path.read_text(encoding="utf-8")) or {}
+                except Exception:  # noqa: BLE001
+                    old = {}
+                if old.get("pillow") != rep["pillow"] or old.get("freetype") != rep["freetype"]:
+                    path.write_text(_json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
+                    logger.info(
+                        f"渲染后端: Pillow {rep['pillow']} / FreeType {rep['freetype'] or '?'}"
+                        f" / 字形判定={rep['coverage_source']}",
+                    )
+    except Exception:  # noqa: BLE001
+        logger.debug("渲染后端探测结果写入失败（忽略）", exc_info=True)
+    return rep
+
+
 def reset_font_caches() -> None:
     """清掉字体相关缓存，让下次渲染重新探测。
 
