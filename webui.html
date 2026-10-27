@@ -2510,6 +2510,17 @@ body.is-scrolling .dialog-foot {
           <p class="hint" id="cardFontCaps">选中即生效；这里显示该字体的实测能力。</p>
           <p class="hint" id="cardEmojiLine">emoji 字体：读取中…</p>
           <p class="hint" id="cardFontHint"></p>
+          <details id="cardFontCatalog" style="margin-top:10px">
+            <summary style="cursor:pointer;font-size:12px;color:var(--text-soft)">
+              推荐字体（官方下载页，共 8 个）
+            </summary>
+            <div id="cardFontCatalogList" class="hint" style="margin-top:8px"></div>
+            <p class="hint" style="margin-top:8px">
+              插件本身<strong>不打包、不镜像、不提供直链下载</strong>，只给官方项目页链接——
+              链接不是复制发行。各字体版权与许可归各自作者，商用/再分发请按对应许可执行
+              （OFL 字体需保留许可文件；厂商自有许可通常禁止把字体文件本身再分发）。
+            </p>
+          </details>
         </div>
       </div>
 
@@ -4836,6 +4847,19 @@ async function loadCards(opts = {}) {
     emLine.innerHTML = '⚠️ 未找到 emoji 字体，卡片里的 emoji 会显示成豆腐块：上传一个 emoji 字体，或把 <code>*emoji*.ttf</code> 放进数据目录 fonts/。';
     emLine.classList.add('warn');
   }
+  const cat = info.fontCatalog || [];
+  const catBox = $('#cardFontCatalogList');
+  if (catBox) {
+    catBox.innerHTML = cat.length
+      ? `<ul style="margin:0;padding-left:18px">` + cat.map((x) =>
+          `<li style="margin:4px 0"><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.name)}</a>`
+          + ` <span class="badge" style="margin-left:6px">${esc(x.license)}</span>`
+          + `${x.kind === 'emoji' ? ' <span class="badge">emoji</span>' : ''}`
+          + `<br><span style="color:var(--text-soft)">${esc(x.note)}</span></li>`).join('')
+        + `</ul>`
+      : '（后端没有提供推荐目录）';
+  }
+
   $('#cardFontHint').innerHTML = font.pinEnabled
     ? '选中即生效（不用点保存）。系统字体首次被探测到时会自动复制一份进数据目录（<code>.font_pin.json</code> 记录来源）；下拉里的百分比是把该字体真渲染一遍样本字符得出的覆盖度。'
     : '⚠️ 已通过 <code>NEKRO_PERSONA_FONT_PIN=0</code> 关闭字体落地，系统字体不会被复制。';

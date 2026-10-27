@@ -84,6 +84,70 @@ _PREVIEW_SAMPLES = (
 )
 
 
+# 推荐字体目录：**只给官方项目页链接**，插件本身不打包、不镜像、不提供直链下载。
+# 之所以敢列链接：超链接不是复制发行（没有产生副本），和「在文档里写一句网址」性质相同；
+# 风险只出现在「把字体文件塞进包里」或「指向第三方盗链站」这两种做法上。
+# 每一项都标清许可，让用户自己按各自许可使用。
+_FONT_CATALOG = (
+    {
+        "name": "思源黑体 / Source Han Sans",
+        "license": "SIL OFL 1.1",
+        "kind": "text",
+        "url": "https://github.com/adobe-fonts/source-han-sans/releases",
+        "note": "Adobe + Google 联合开源，可免费商用、可嵌入分发（保留许可文件）。",
+    },
+    {
+        "name": "思源宋体同源：Noto Sans CJK / Noto Serif CJK",
+        "license": "SIL OFL 1.1",
+        "kind": "text",
+        "url": "https://github.com/notofonts/noto-cjk/releases",
+        "note": "与思源黑体同源，字形一致、分发包更全（含 .otf/.ttc 与可变字体）。",
+    },
+    {
+        "name": "霞鹜文楷 LXGW WenKai",
+        "license": "SIL OFL 1.1",
+        "kind": "text",
+        "url": "https://github.com/lxgw/LxgwWenKai/releases",
+        "note": "楷体风格，卡片上观感偏手写；带单色 emoji 字形。",
+    },
+    {
+        "name": "更纱黑体 Sarasa Gothic",
+        "license": "SIL OFL 1.1",
+        "kind": "text",
+        "url": "https://github.com/be5invis/Sarasa-Gothic/releases",
+        "note": "等宽/比例多版本，适合做对齐要求高的排版。",
+    },
+    {
+        "name": "得意黑 Smiley Sans",
+        "license": "SIL OFL 1.1",
+        "kind": "text",
+        "url": "https://github.com/atelier-anchor/smiley-sans/releases",
+        "note": "倾斜风格标题字，适合当标题、不适合长正文。",
+    },
+    {
+        "name": "Noto Color Emoji（彩色 emoji）",
+        "license": "SIL OFL 1.1",
+        "kind": "emoji",
+        "url": "https://github.com/googlefonts/noto-emoji",
+        "note": "Google 官方彩色 emoji，CBDT 位图；Linux 容器里最常用。",
+    },
+    {
+        "name": "MiSans（小米）",
+        "license": "小米 MiSans 字体许可",
+        "kind": "text",
+        "url": "https://hyperos.mi.com/font/zh/download/",
+        "note": "官方声明免费商用；但**再分发字体文件**要按小米的条款来，别打包进二次分发包。",
+    },
+    {
+        "name": "阿里妈妈普惠体 / 东方大楷（阿里巴巴）",
+        "license": "阿里巴巴字体许可",
+        "kind": "text",
+        "url": "https://fonts.alibabagroup.com/",
+        "note": "官方声明免费商用；同样限制把字体文件本身再分发。",
+    },
+)
+
+
 def _safe_font_name(name: str) -> str:
     """字体文件名清洗：只取 basename，且必须是 .ttf/.ttc/.otf。"""
     n = Path(str(name or "")).name.strip()
@@ -2964,6 +3028,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 {"id": "rank", "label": "好感度排行榜", "desc": "好感度总览（名次 + 金银铜）"},
                 {"id": "overview", "label": "印象总览", "desc": "自动分列网格，只收有标签的档案"},
             ],
+            "fontCatalog": [dict(x) for x in _FONT_CATALOG],
             "scales": [
                 {"value": 0, "label": "跟随插件配置"},
                 {"value": 1.5, "label": "1.5×（省流）"},
