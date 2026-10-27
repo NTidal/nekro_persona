@@ -72,7 +72,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.3.5",
+    version="2.3.6",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -557,6 +557,11 @@ class FavorabilityConfig(ConfigBase):
         "", "排行榜卡片字体路径",
         "渲染排行榜图片使用的中文字体文件路径；留空则自动探测系统字体",
         en_title="Rank Card Font Path", en_desc="Chinese font file for the rank card; empty auto-detects",
+    )
+    RANK_CARD_EMOJI_FONT: str = _fav_field(
+        "", "卡片 emoji 字体路径",
+        "卡片里 emoji 使用的彩色字体文件路径（如 emoji-segoe.ttf）；留空则自动探测",
+        en_title="Card Emoji Font Path", en_desc="Color emoji font for cards; empty auto-detects",
     )
 
     # ==================== 频道重置行为 ====================
@@ -2678,6 +2683,7 @@ def _rank_card_scale() -> float:
 
 async def _render_rank_card(entries: List[dict], max_abs: int) -> bytes | None:
     """渲染排行榜图片卡片，不可用时返回 None（调用方回退为文本）。"""
+    _card_emoji_font()
     try:
         return await asyncio.to_thread(
             card.render_favorability_rank,
@@ -2744,6 +2750,7 @@ def _overview_profiles(state: ChannelArchive) -> List[UserArchive]:
 
 async def _render_impression_overview_card(entries: List[dict], max_abs: int) -> bytes | None:
     """渲染印象总览卡片；不可用返回 None。"""
+    _card_emoji_font()
     try:
         return await asyncio.to_thread(
             card.render_impression_overview,
@@ -2808,8 +2815,19 @@ async def _handle_impression_overview(_ctx: schemas.AgentCtx, message: ChatMessa
         return None
 
 
+def _card_emoji_font() -> str:
+    """当前配置里的 emoji 字体路径（空 = 自动探测），并同步到 card 模块。"""
+    path = str(getattr(config, "RANK_CARD_EMOJI_FONT", "") or "").strip()
+    try:
+        card.set_emoji_font_override(path)
+    except Exception:  # noqa: BLE001
+        plugin.logger.debug("设置 emoji 字体覆盖失败（忽略）", exc_info=True)
+    return path
+
+
 async def _render_profile_card_bytes(entry: dict, max_abs: int) -> bytes | None:
     """渲染单人关系档案卡片；不可用返回 None（调用方回退文本）。"""
+    _card_emoji_font()
     try:
         return await asyncio.to_thread(
             card.render_profile_card,

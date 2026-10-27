@@ -2498,6 +2498,15 @@ body.is-scrolling .dialog-foot {
             <div class="field-label">渲染精度
               <select class="select" id="cardScale"></select>
             </div>
+            <div class="field-label">emoji 字体
+              <select class="select" id="cardEmojiSelect"></select>
+            </div>
+            <div class="row-end">
+              <button class="btn" type="button" id="cardEmojiApply">设为 emoji 字体</button>
+              <button class="btn" type="button" id="cardEmojiAuto">emoji 自动探测</button>
+            </div>
+          </div>
+          <div class="preview-control">
             <div class="row-end">
               <button class="btn" type="button" id="cardFontApply">设为当前字体</button>
               <button class="btn" type="button" id="cardFontUploadBtn">上传自定义字体</button>
@@ -4759,13 +4768,20 @@ async function loadCards(opts = {}) {
   badge.className = 'badge' + (font.exists ? '' : ' warn');
 
   const em = font.emoji || {};
+  const emSel = $('#cardEmojiSelect');
+  if (emSel) {
+    const opts = (fonts.length ? fonts : []);
+    emSel.innerHTML = '<option value="">（自动探测）</option>'
+      + opts.map((f) => `<option value="${esc(f.name)}"${f.name === em.name && em.manual ? ' selected' : ''}>${esc(f.name)}（${fmtBytes(f.size)}）</option>`).join('');
+  }
   const emLine = $('#cardEmojiLine');
   if (emLine) {
     if (em.name) {
       const where = em.inDataDir ? '数据目录' : (em.pinSource ? `系统字体（来源 ${em.pinSource}）` : '系统目录');
-      emLine.innerHTML = `emoji 字体：<b>${esc(em.name)}</b>　·　${em.color ? '彩色' : '单色'}　·　${esc(where)}`
+      const mode = em.manual ? '手动指定' : '自动探测';
+      emLine.innerHTML = `emoji 字体：<b>${esc(em.name)}</b>　·　${em.color ? '彩色' : '单色'}　·　${esc(where)}　·　${mode}`
         + `${em.inDataDir && em.pinSource ? '（已落地副本）' : ''}`
-        + `<br>把文件名里带 <code>emoji</code> 的字体放进数据目录 fonts/ 即可覆盖。`;
+        + `<br>也可以在下面的下拉里手动指定；配置项 <code>RANK_CARD_EMOJI_FONT</code> 用的是同一份值。`;
       emLine.classList.remove('warn');
     } else {
       emLine.innerHTML = '⚠️ 未找到 emoji 字体，卡片里的 emoji 会显示成豆腐块：把 <code>*emoji*.ttf</code>（如 emoji-segoe.ttf）放进数据目录 fonts/。';
@@ -4815,6 +4831,26 @@ $('#cardFontClear').addEventListener('click', async () => {
   if (ok !== null) {
     state.cardInfo = null;
     toast('已恢复自动探测', 'info');
+    await loadCards({ fresh: true });
+  }
+});
+
+$('#cardEmojiApply').addEventListener('click', async () => {
+  const name = $('#cardEmojiSelect').value;
+  if (!name) { toast('选一个字体文件（或用「emoji 自动探测」）', 'warning'); return; }
+  const ok = await postAction('font', { emoji: name });
+  if (ok !== null) {
+    state.cardInfo = null;
+    toast('emoji 字体已切换', 'success');
+    await loadCards({ fresh: true });
+  }
+});
+
+$('#cardEmojiAuto').addEventListener('click', async () => {
+  const ok = await postAction('font', { emoji: '' });
+  if (ok !== null) {
+    state.cardInfo = null;
+    toast('emoji 已恢复自动探测', 'info');
     await loadCards({ fresh: true });
   }
 });

@@ -2865,8 +2865,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         except Exception:  # noqa: BLE001
             in_data_dir = False
         # emoji 字体是独立的探测链（数据目录 *emoji* → 系统扫描 → 固定候选），单独汇报
+        em_cfg = str(getattr(cfg, "RANK_CARD_EMOJI_FONT", "") or "").strip()
         emoji: Dict[str, Any] = {"name": "", "resolved": "", "color": False,
-                                 "inDataDir": False, "pinSource": "", "exists": False}
+                                 "inDataDir": False, "pinSource": "", "exists": False,
+                                 "config": em_cfg, "manual": bool(em_cfg)}
         try:
             em_path = _card._find_emoji_font(font_dir) or ""
             em_marker = Path(font_dir) / _card._EMOJI_PIN_MARKER
@@ -2880,6 +2882,8 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "inDataDir": bool(em_path) and Path(em_path).parent == Path(font_dir),
                 "pinSource": str(em_pin.get("source") or ""),
                 "exists": bool(em_path and Path(em_path).is_file()),
+                "config": em_cfg,
+                "manual": bool(em_cfg),
             }
         except Exception:  # noqa: BLE001
             plugin.logger.debug("emoji 字体探测失败（忽略）", exc_info=True)
@@ -2978,6 +2982,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 detail="这个频道没有可渲染的档案（换数据来源或换个频道试试）",
             )
 
+        try:
+            _card.set_emoji_font_override(str(getattr(cfg, "RANK_CARD_EMOJI_FONT", "") or ""))
+        except Exception:  # noqa: BLE001
+            plugin.logger.debug("设置 emoji 字体覆盖失败（忽略）", exc_info=True)
         kwargs = {
             "font_path": font_path,
             "font_dir": font_dir,
@@ -3040,6 +3048,24 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 plugin.save_config(cfg)
                 _card.reset_font_caches()
                 return {"ok": True, "font": _font_state()}
+            if "emoji" in body:
+                # emoji 字体：空串 = 恢复自动探测，否则必须是数据目录里存在的字体
+                em_name = str(body.get("emoji") or "").strip()
+                if em_name:
+                    em_name = _safe_font_name(em_name)
+                    em_target = fdir / em_name
+                    if not em_target.is_file():
+                        raise HTTPException(status_code=404, detail=f"数据目录 fonts/ 里没有 {em_name}")
+                    setattr(cfg, "RANK_CARD_EMOJI_FONT", str(em_target))
+                else:
+                    setattr(cfg, "RANK_CARD_EMOJI_FONT", "")
+                plugin.save_config(cfg)
+                _card.reset_font_caches()
+                _card.set_emoji_font_override(str(getattr(cfg, "RANK_CARD_EMOJI_FONT", "") or ""))
+                plugin.logger.info(
+                    f"[persona] WebUI 切换 emoji 字体 → {em_name or '（自动探测）'}",
+                )
+                return {"ok": True, "font": _font_state()}
             name = _safe_font_name(str(body.get("name") or ""))
             target = fdir / name
             if not target.is_file():
@@ -3047,6 +3073,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         setattr(cfg, "RANK_CARD_FONT", str(target))
         plugin.save_config(cfg)
         _card.reset_font_caches()
+        _card.set_emoji_font_override(str(getattr(cfg, "RANK_CARD_EMOJI_FONT", "") or ""))
         plugin.logger.info(f"[persona] WebUI 切换卡片字体 → {target.name}")
         return {"ok": True, "font": _font_state()}
 

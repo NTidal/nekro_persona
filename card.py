@@ -333,6 +333,9 @@ _EMOJI_FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
 ]
 
+# 手动指定的 emoji 字体（配置项 RANK_CARD_EMOJI_FONT，空 = 自动探测）。
+# 进程内单值：一个插件实例只有一份配置，渲染线程共用同一份，语义与 _emoji_font_path 一致。
+_emoji_font_override: str = ""
 _emoji_font_path: str | None = None
 _emoji_font_checked = False
 _emoji_font_key: tuple | None = None
@@ -409,6 +412,22 @@ def _scan_system_emoji_fonts() -> list:
     return out
 
 
+def set_emoji_font_override(path: str = "") -> None:
+    """设置手动指定的 emoji 字体（空 = 自动探测）；值变了才清缓存。"""
+    global _emoji_font_override, _emoji_font_checked, _emoji_font_key
+    new = str(path or "").strip()
+    if new == _emoji_font_override:
+        return
+    _emoji_font_override = new
+    with _FONT_LOCK:
+        _emoji_font_checked = False
+        _emoji_font_key = None
+        try:
+            _emoji_font_cache.clear()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _find_emoji_font(font_dir: str = "") -> str | None:
     """查找 emoji 字体：数据目录 fonts 下 *emoji* → 系统目录扫 *emoji* → 固定候选。
 
@@ -417,12 +436,19 @@ def _find_emoji_font(font_dir: str = "") -> str | None:
     缓存按 font_dir 做 key，失败不锁死。
     """
     global _emoji_font_path, _emoji_font_checked, _emoji_font_key, _emoji_font_color
-    _key = (font_dir.strip(),)
+    _key = (font_dir.strip(), _emoji_font_override)
     if _emoji_font_checked and _emoji_font_key == _key:
         return _emoji_font_path
 
     found: str | None = None
-    if font_dir.strip():
+    # ① 手动指定优先（配置项 RANK_CARD_EMOJI_FONT / WebUI 选择）
+    if _emoji_font_override:
+        ov = Path(_emoji_font_override)
+        if ov.is_file():
+            found = str(ov)
+        else:
+            logger.warning(f"指定的 emoji 字体不存在，回退自动探测: {_emoji_font_override}")
+    if not found and font_dir.strip():
         d = Path(font_dir.strip())
         if d.is_dir():
             local = [
