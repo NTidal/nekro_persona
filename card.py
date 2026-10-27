@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import importlib
 import io
+import json
 import math
+import os
+import shutil
 import threading
 import random
 import time
@@ -146,6 +149,76 @@ def _load_pil() -> Any | None:
 _FONT_LOCK = threading.RLock()
 
 
+# ============ 字体落地（pin）============
+# 探测到的字体（系统字体 / 配置里指向外部路径的字体）会被复制一份到插件数据目录，
+# 之后一律指向这份副本：
+#   · 容器重建、系统字体被清掉、镜像换基座，卡片字体都不会突然变样或消失；
+#   · 副本跟插件数据一起备份/迁移，路径稳定；
+#   · 只在第一次（或副本丢失时）复制，之后读标记文件直接命中，不重复拷贝。
+# 关掉：环境变量 NEKRO_PERSONA_FONT_PIN=0
+_FONT_PIN_MARKER = ".font_pin.json"
+
+
+def _font_pin_enabled() -> bool:
+    return str(os.environ.get("NEKRO_PERSONA_FONT_PIN", "1")).strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _pin_font(src: str, pin_dir: str) -> str:
+    """把字体复制到插件数据目录并返回副本路径；失败或禁用时原样返回 src。"""
+    src_path = Path(src)
+    if not pin_dir or not src_path.is_file() or not _font_pin_enabled():
+        return src
+    try:
+        pin_root = Path(pin_dir)
+        # 已经在插件数据目录里 → 不用复制
+        try:
+            src_path.resolve().relative_to(pin_root.resolve())
+            return str(src_path)
+        except Exception:  # noqa: BLE001
+            pass
+
+        marker = pin_root / _FONT_PIN_MARKER
+        if marker.is_file():
+            try:
+                data = json.loads(marker.read_text(encoding="utf-8"))
+                pinned = str(data.get("pinned") or "")
+                if pinned and Path(pinned).is_file():
+                    return pinned
+            except Exception:  # noqa: BLE001
+                logger.debug("字体标记文件损坏，重新落地", exc_info=True)
+
+        pin_root.mkdir(parents=True, exist_ok=True)
+        dst = pin_root / src_path.name
+        if dst.exists():
+            # 同名但内容不同（比如换了个同名系统字体）→ 加后缀区分
+            if dst.stat().st_size != src_path.stat().st_size:
+                dst = pin_root / f"{src_path.stem}-pinned{src_path.suffix}"
+        tmp = dst.with_name(dst.name + ".tmp")
+        shutil.copyfile(src_path, tmp)
+        if tmp.stat().st_size != src_path.stat().st_size:
+            tmp.unlink(missing_ok=True)
+            raise OSError("复制后大小不一致")
+        tmp.replace(dst)
+        try:
+            marker.write_text(
+                json.dumps(
+                    {"pinned": str(dst), "source": str(src_path),
+                     "size": dst.stat().st_size},
+                    ensure_ascii=False, indent=1,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("字体标记文件写入失败（不影响使用）", exc_info=True)
+        logger.info(f"字体已落地到插件数据目录: {dst.name}（来源 {src_path}）")
+        return str(dst)
+    except Exception:  # noqa: BLE001
+        logger.warning(f"字体落地失败，继续使用原路径: {src}", exc_info=True)
+        return src
+
+
 def _find_font(font_path: str = "", font_dir: str = "") -> str | None:
     """线程安全入口（实现见 _find_font_impl）。"""
     with _FONT_LOCK:
@@ -173,7 +246,8 @@ def _find_font_impl(font_path: str = "", font_dir: str = "") -> str | None:
     if _explicit:
         _ep = Path(_explicit)
         if _ep.is_file():
-            _font_cache, _font_key, _font_checked = str(_ep), _key, True
+            _picked = _pin_font(str(_ep), font_dir.strip())
+            _font_cache, _font_key, _font_checked = _picked, _key, True
             return _font_cache
         logger.warning(f"指定的字体文件不存在，继续自动查找：{_explicit}")
 
@@ -185,7 +259,8 @@ def _find_font_impl(font_path: str = "", font_dir: str = "") -> str | None:
     for item in candidates:
         p = Path(item)
         if p.is_file() and p.suffix.lower() in (".ttf", ".ttc", ".otf"):
-            _font_cache, _font_key, _font_checked = str(p), _key, True
+            _picked = _pin_font(str(p), font_dir.strip())
+            _font_cache, _font_key, _font_checked = _picked, _key, True
             return _font_cache
         if p.is_dir():
             # ⚠️ 两段匹配必须是「名单在外层、文件在内层」：
@@ -197,7 +272,8 @@ def _find_font_impl(font_path: str = "", font_dir: str = "") -> str | None:
                 for ext in ("*.ttf", "*.ttc", "*.otf"):
                     for f in sorted(p.rglob(ext)):
                         if any(k in f.name.lower() for k in _hints):
-                            _font_cache, _font_key, _font_checked = str(f), _key, True
+                            _picked = _pin_font(str(f), font_dir.strip())
+                            _font_cache, _font_key, _font_checked = _picked, _key, True
                             return _font_cache
     # 2.3.1 起**不再内置字体**：包内那套 Noto Sans SC 子集（扩到 GB18030 后 10.8 MB）
     # 让安装包从 1.2 MB 涨到 9.4 MB，而绝大多数 NA 镜像自带中文字体。
