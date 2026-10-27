@@ -2485,35 +2485,31 @@ body.is-scrolling .dialog-foot {
       <div class="card">
         <div class="card-head">
           <div>
-            <h2 class="card-title">当前字体</h2>
+            <h2 class="card-title">字体</h2>
             <div class="card-subtitle" id="cardFontSub">读取中…</div>
           </div>
           <span class="badge" id="cardFontBadge">—</span>
         </div>
         <div class="card-body">
           <div class="preview-control">
-            <div class="field-label">选择数据目录里的字体
+            <div class="field-label">正文字体
               <select class="select" id="cardFontSelect"></select>
-            </div>
-            <div class="field-label">渲染精度
-              <select class="select" id="cardScale"></select>
             </div>
             <div class="field-label">emoji 字体
               <select class="select" id="cardEmojiSelect"></select>
             </div>
+            <div class="field-label">渲染精度
+              <select class="select" id="cardScale"></select>
+            </div>
             <div class="row-end">
-              <button class="btn" type="button" id="cardFontApply">设为当前字体</button>
               <button class="btn" type="button" id="cardFontUploadBtn">上传自定义字体</button>
-              <button class="btn" type="button" id="cardFontClear">恢复自动探测</button>
-              <button class="btn" type="button" id="cardEmojiApply">设为 emoji 字体</button>
-              <button class="btn" type="button" id="cardEmojiAuto">emoji 自动探测</button>
+              <button class="btn" type="button" id="cardFontReprobe">重新探测</button>
               <input type="file" id="cardFontFile" accept=".ttf,.ttc,.otf" hidden>
             </div>
           </div>
+          <p class="hint" id="cardFontCaps">选中即生效；这里显示该字体的实测能力。</p>
           <p class="hint" id="cardEmojiLine">emoji 字体：读取中…</p>
-          <p class="hint" id="cardFontHint">
-            上传的字体写入插件数据目录 fonts/ 并立即启用；开关口径见下。
-          </p>
+          <p class="hint" id="cardFontHint"></p>
         </div>
       </div>
 
@@ -4738,6 +4734,11 @@ $('#rulesSaveBtn').addEventListener('click', async () => {
 
 /* ---------------- 注入预览 ---------------- */
 /* ---------------- 卡片渲染预览 ---------------- */
+/* 字体选择是「一个下拉 = 一个用途」：正文 / emoji 各一个，选中即生效（不再有「设为X字体」按钮）。
+   下拉按后端探测到的**能力**分组（拿字体真渲染样本字符得出），并标出推荐项：
+     · 正文字体 → 汉字覆盖率 ≥90% 的字体（emoji-segoe 这种名字带 emoji 的不算）
+     · emoji 字体 → 彩色 emoji 优先，单色的单独归到「能显示但不推荐」
+   两处都带一个 value="" 的「自动探测」项，等价于清空配置。 */
 state.cardInfo = null;
 
 function fmtBytes(n) {
@@ -4745,6 +4746,33 @@ function fmtBytes(n) {
   if (v >= 1048576) return (v / 1048576).toFixed(1) + ' MB';
   if (v >= 1024) return Math.round(v / 1024) + ' KB';
   return v + ' B';
+}
+
+function capsBrief(c) {
+  if (!c || !c.ok) return '无法探测';
+  const bits = [`汉字 ${Math.round((c.cjk || 0) * 100)}%`];
+  if (c.emoji) bits.push(`emoji ${Math.round(c.emoji * 100)}%${c.color ? '（彩色）' : '（单色）'}`);
+  return bits.join(' · ');
+}
+
+function optLabel(f, extra) {
+  return `${f.name}（${fmtBytes(f.size)}）· ${capsBrief(f.caps)}${extra ? ' · ' + extra : ''}`;
+}
+
+function buildGroups(sel, groups, autoText, current) {
+  const esc2 = (x) => String(x == null ? '' : x);
+  let html = `<option value=""${current ? '' : ' selected'}>${esc2(autoText)}</option>`;
+  groups.forEach((g) => {
+    if (!g.items.length) return;
+    html += `<optgroup label="${esc2(g.label)}">`;
+    html += g.items.map((f) => {
+      // ⚠️ tag 可能是函数（按字体决定「推荐/不推荐」）；直接拼 g.tag 会把函数源码印进选项里
+      const extra = typeof g.tag === 'function' ? g.tag(f) : (g.tag || '');
+      return `<option value="${esc2(f.name)}"${f.name === current ? ' selected' : ''}>${esc2(optLabel(f, extra))}</option>`;
+    }).join('');
+    html += '</optgroup>';
+  });
+  sel.innerHTML = html;
 }
 
 async function loadCards(opts = {}) {
@@ -4756,40 +4784,31 @@ async function loadCards(opts = {}) {
     state.cardInfo = info;
   }
   const font = info.font || {};
+  const emoji = font.emoji || {};
+  const fonts = font.fonts || [];
+  const rec = font.recommend || {};
+
   $('#cardFontSub').textContent = font.name
-    ? `${font.name}　·　${font.inDataDir ? '已在插件数据目录' : '数据目录之外'}${font.pinned ? '（已落地副本）' : ''}`
+    ? `正文 ${font.name}　·　emoji ${emoji.name || '（无）'}`
     : '未找到中文字体（卡片会回退成文本）';
   const badge = $('#cardFontBadge');
   badge.textContent = font.exists ? '出图可用' : '无字体';
   badge.className = 'badge' + (font.exists ? '' : ' warn');
 
-  const sel = $('#cardFontSelect');
-  const fonts = font.fonts || [];
-  sel.innerHTML = fonts.length
-    ? fonts.map((f) => `<option value="${esc(f.name)}"${f.name === font.name ? ' selected' : ''}>${esc(f.name)}（${fmtBytes(f.size)}）</option>`).join('')
-    : '<option value="">（数据目录 fonts/ 里没有字体）</option>';
+  const textFonts = fonts.filter((f) => (f.caps && f.caps.roles || []).includes('text'));
+  const otherFonts = fonts.filter((f) => !textFonts.includes(f) && !(f.caps && f.caps.roles || []).includes('emoji'));
+  const colorEmoji = fonts.filter((f) => (f.caps && f.caps.roles || []).includes('emoji'));
+  const monoEmoji = fonts.filter((f) => (f.caps && f.caps.roles || []).includes('emoji-mono'));
 
-  const em = font.emoji || {};
-  const emSel = $('#cardEmojiSelect');
-  if (emSel) {
-    const opts = (fonts.length ? fonts : []);
-    emSel.innerHTML = '<option value="">（自动探测）</option>'
-      + opts.map((f) => `<option value="${esc(f.name)}"${f.name === em.name && em.manual ? ' selected' : ''}>${esc(f.name)}（${fmtBytes(f.size)}）</option>`).join('');
-  }
-  const emLine = $('#cardEmojiLine');
-  if (emLine) {
-    if (em.name) {
-      const where = em.inDataDir ? '数据目录' : (em.pinSource ? `系统字体（来源 ${em.pinSource}）` : '系统目录');
-      const mode = em.manual ? '手动指定' : '自动探测';
-      emLine.innerHTML = `emoji 字体：<b>${esc(em.name)}</b>　·　${em.color ? '彩色' : '单色'}　·　${esc(where)}　·　${mode}`
-        + `${em.inDataDir && em.pinSource ? '（已落地副本）' : ''}`
-        + `<br>也可以在下面的下拉里手动指定；配置项 <code>RANK_CARD_EMOJI_FONT</code> 用的是同一份值。`;
-      emLine.classList.remove('warn');
-    } else {
-      emLine.innerHTML = '⚠️ 未找到 emoji 字体，卡片里的 emoji 会显示成豆腐块：把 <code>*emoji*.ttf</code>（如 emoji-segoe.ttf）放进数据目录 fonts/。';
-      emLine.classList.add('warn');
-    }
-  }
+  buildGroups($('#cardFontSelect'), [
+    { label: '中文正文字体（推荐）', items: textFonts, tag: (f) => (f.name === rec.text ? '推荐' : '') },
+    { label: '其他字体（汉字覆盖偏低，不推荐当正文）', items: otherFonts, tag: () => '不推荐' },
+  ], rec.text ? `自动探测（当前推荐：${rec.text}）` : '自动探测', font.inDataDir || font.pinned ? font.name : '');
+
+  buildGroups($('#cardEmojiSelect'), [
+    { label: '彩色 emoji（推荐）', items: colorEmoji, tag: (f) => (f.name === rec.emoji ? '推荐' : '') },
+    { label: '单色字体（能显示 emoji，但不会上色）', items: monoEmoji, tag: () => '不推荐' },
+  ], rec.emoji ? `自动探测（当前推荐：${rec.emoji}）` : '自动探测', emoji.manual ? emoji.name : '');
 
   const kindSel = $('#cardKind');
   if (!kindSel.options.length) {
@@ -4800,10 +4819,25 @@ async function loadCards(opts = {}) {
   const chSel = $('#cardChannel');
   chSel.innerHTML = (info.channels || []).map((c) => `<option value="${esc(c.chat_key)}">${esc(c.chat_key)}（${c.count} 人）</option>`).join('')
     || '<option value="">（没有可用频道）</option>';
-  const wrap = $('#cardChannelWrap');
-  wrap.hidden = $('#cardSource').value !== 'channel';
+  $('#cardChannelWrap').hidden = $('#cardSource').value !== 'channel';
+
+  const cur = fonts.find((f) => f.name === font.name);
+  $('#cardFontCaps').textContent = cur
+    ? `正文 ${cur.name}：${capsBrief(cur.caps)}${cur.caps.note ? ' · ' + cur.caps.note : ''}`
+    : '没有可用的中文字体：把任意中文字体放进数据目录 fonts/。';
+
+  const emLine = $('#cardEmojiLine');
+  if (emoji.name) {
+    const where = emoji.inDataDir ? '数据目录' : (emoji.pinSource ? `系统字体（来源 ${emoji.pinSource}）` : '系统目录');
+    emLine.innerHTML = `emoji 字体：<b>${esc(emoji.name)}</b>　·　${emoji.color ? '彩色' : '单色'}　·　${esc(where)}`
+      + `　·　${emoji.manual ? '手动指定' : '自动探测'}`;
+    emLine.classList.remove('warn');
+  } else {
+    emLine.innerHTML = '⚠️ 未找到 emoji 字体，卡片里的 emoji 会显示成豆腐块：上传一个 emoji 字体，或把 <code>*emoji*.ttf</code> 放进数据目录 fonts/。';
+    emLine.classList.add('warn');
+  }
   $('#cardFontHint').innerHTML = font.pinEnabled
-    ? '上传／选择的字体会写入插件数据目录 fonts/ 并立即启用；系统字体首次被探测到时会自动复制一份进去（<code>.font_pin.json</code> 记录来源）。'
+    ? '选中即生效（不用点保存）。系统字体首次被探测到时会自动复制一份进数据目录（<code>.font_pin.json</code> 记录来源）；下拉里的百分比是把该字体真渲染一遍样本字符得出的覆盖度。'
     : '⚠️ 已通过 <code>NEKRO_PERSONA_FONT_PIN=0</code> 关闭字体落地，系统字体不会被复制。';
 }
 
@@ -4811,44 +4845,40 @@ $('#cardSource').addEventListener('change', () => {
   $('#cardChannelWrap').hidden = $('#cardSource').value !== 'channel';
 });
 
-$('#cardFontApply').addEventListener('click', async () => {
-  const name = $('#cardFontSelect').value;
-  if (!name) { toast('数据目录里没有可选字体，先上传一个', 'warning'); return; }
-  const ok = await postAction('font', { name });
+/* 选中即生效：正文 / emoji 各一个 change 处理器 */
+async function applyFontKind(kind, name) {
+  const body = kind === 'emoji' ? { emoji: name } : { name };
+  if (kind === 'text' && !name) {          // 正文没有「自动」以外的空值语义 → 用 clear
+    const ok0 = await postAction('font', { clear: true });
+    return ok0;
+  }
+  return await postAction('font', body);
+}
+
+$('#cardFontSelect').addEventListener('change', async (e) => {
+  const name = e.target.value;
+  const ok = await applyFontKind('text', name);
   if (ok !== null) {
     state.cardInfo = null;
-    toast('字体已切换', 'success');
+    toast(name ? `正文已切换：${name}` : '正文已恢复自动探测', 'success');
     await loadCards({ fresh: true });
   }
 });
 
-$('#cardFontClear').addEventListener('click', async () => {
-  const ok = await postAction('font', { clear: true });
+$('#cardEmojiSelect').addEventListener('change', async (e) => {
+  const name = e.target.value;
+  const ok = await applyFontKind('emoji', name);
   if (ok !== null) {
     state.cardInfo = null;
-    toast('已恢复自动探测', 'info');
+    toast(name ? `emoji 已切换：${name}` : 'emoji 已恢复自动探测', 'success');
     await loadCards({ fresh: true });
   }
 });
 
-$('#cardEmojiApply').addEventListener('click', async () => {
-  const name = $('#cardEmojiSelect').value;
-  if (!name) { toast('选一个字体文件（或用「emoji 自动探测」）', 'warning'); return; }
-  const ok = await postAction('font', { emoji: name });
-  if (ok !== null) {
-    state.cardInfo = null;
-    toast('emoji 字体已切换', 'success');
-    await loadCards({ fresh: true });
-  }
-});
-
-$('#cardEmojiAuto').addEventListener('click', async () => {
-  const ok = await postAction('font', { emoji: '' });
-  if (ok !== null) {
-    state.cardInfo = null;
-    toast('emoji 已恢复自动探测', 'info');
-    await loadCards({ fresh: true });
-  }
+$('#cardFontReprobe').addEventListener('click', async () => {
+  state.cardInfo = null;
+  await loadCards({ fresh: true });
+  toast('已重新探测字体能力', 'info');
 });
 
 $('#cardFontUploadBtn').addEventListener('click', () => $('#cardFontFile').click());
@@ -4869,7 +4899,7 @@ $('#cardFontFile').addEventListener('change', async (e) => {
     });
     const data = await res.json().catch(() => null);
     if (!res.ok) throw new Error((data && (data.message || data.detail)) || `HTTP ${res.status}`);
-    toast('字体已上传并启用', 'success');
+    toast('字体已上传：' + file.name, 'success');
     state.cardInfo = null;
     await loadCards({ fresh: true });
   } catch (err) {

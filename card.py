@@ -224,6 +224,97 @@ def _pin_font(src: str, pin_dir: str, marker_name: str = _FONT_PIN_MARKER) -> st
         return src
 
 
+# ============ 字体能力探测 ============
+# 「这个字体能渲染什么」不靠文件名猜，直接拿它**渲染一批样本字符**看有没有字形：
+#   · 汉字样本（GB2312 一级高频字，另加标点/全角）→ 判断能不能当正文字体
+#   · emoji 样本（彩色 emoji + 符号）→ 判断能不能当 emoji 字体，以及是不是彩色
+# 结果用于 WebUI 的下拉过滤与「推荐」标注，也供 scripts/probe_fonts.py 单独跑。
+_CJK_PROBE = (
+    "的一是在不了有和人这中大为上个国我以要他时来用们生到作地于出就分对成会可主发年动"
+    "同工也能下过子说产种面而方后多定行学法所民得经十三之进着等部度家电力里如水化高自"
+    "二理起小物现实加量都两体制机当使点从业本去把性好应开它合还因由其些然前外天政四日"
+    "那社义事平形相全表间样与关各重新线内数正心反你明看原又么利比或但质气第向道命此变"
+    "条只没结解问意建月公无系军很情者最立代想已通并提直题程展五果料象员位入常文总次品"
+)
+_CJK_PROBE_EXTRA = "，。、；：？！（）《》“”‘’…—·「」【】～　"
+_EMOJI_PROBE = "⚽🏀😀😄✨🌸🌙🎉👍🎈🍀🔥💡🎵🐱👌🎁"
+_EMOJI_PROBE_SYMBOL = "❤☀★☆✔✖➡⏰"
+
+
+def probe_font_capabilities(path: str) -> dict:
+    """探测一个字体文件能渲染什么（按文件大小+修改时间无关，纯内容判定）。
+
+    返回:
+        {"ok","bytes","cjk","emoji","symbols","color","roles","note"}
+        cjk / emoji / symbols 是 0~1 的字形覆盖率；roles 是建议用途。
+    """
+    out = {
+        "ok": False, "bytes": 0, "cjk": 0.0, "emoji": 0.0, "symbols": 0.0,
+        "color": False, "color_emoji": False, "mono_emoji": False,
+        "roles": [], "kind": "other", "note": "",
+    }
+    p = Path(str(path or ""))
+    try:
+        if not p.is_file():
+            out["note"] = "文件不存在"
+            return out
+        out["bytes"] = p.stat().st_size
+        out["ok"] = True
+    except Exception:  # noqa: BLE001
+        out["note"] = "读不到文件"
+        return out
+
+    def ratio(sample: str) -> float:
+        chars = [c for c in dict.fromkeys(sample) if c.strip()]
+        if not chars:
+            return 0.0
+        hit = sum(1 for c in chars if _char_in_font(str(p), c))
+        return hit / len(chars)
+
+    try:
+        out["cjk"] = round(ratio(_CJK_PROBE + _CJK_PROBE_EXTRA), 3)
+        out["emoji"] = round(ratio(_EMOJI_PROBE), 3)
+        out["symbols"] = round(ratio(_EMOJI_PROBE_SYMBOL), 3)
+        out["color"] = bool(_font_has_color(str(p)))
+    except Exception:  # noqa: BLE001
+        out["note"] = "字形探测失败"
+        return out
+
+    # ⚠️ 很多中文字体也带 emoji 码点的**单色**字形（实测 LXGW / simhei / 思源黑体都有），
+    #    只看「有没有字形」会把它们全判成 emoji 字体。所以彩色单独成一个能力位：
+    #    color_emoji = 既含 emoji 字形、又是彩色字体 —— 这才是能当 emoji 字体的那种。
+    out["color_emoji"] = bool(out["color"] and out["emoji"] >= 0.85)
+    out["mono_emoji"] = bool((not out["color"]) and out["emoji"] >= 0.85)
+
+    # 用途判定除了字形覆盖，再看文件名（与「数据目录里 *emoji* 即 emoji 字体」的老约定一致）：
+    # 名字带 emoji 的字体不当正文字体，即使它顺带覆盖了汉字（emoji-segoe.ttf 就是这种）。
+    is_emoji_name = "emoji" in p.name.lower()
+    roles = []
+    if out["cjk"] >= 0.90 and not is_emoji_name:
+        roles.append("text")
+    if out["color_emoji"] and (is_emoji_name or out["cjk"] < 0.90):
+        roles.append("emoji")
+    elif out["mono_emoji"]:
+        roles.append("emoji-mono")
+    if not roles:
+        if out["cjk"] >= 0.5:
+            out["note"] = "汉字覆盖偏低，不建议当正文字体"
+        elif out["emoji"] > 0:
+            out["note"] = "emoji 覆盖偏低"
+        else:
+            out["note"] = "既不像中文正文，也不像 emoji 字体"
+    out["roles"] = roles
+    if "emoji" in roles:
+        out["kind"] = "emoji"
+    elif "text" in roles:
+        out["kind"] = "text"
+    elif "emoji-mono" in roles:
+        out["kind"] = "emoji-mono"
+    else:
+        out["kind"] = "other"
+    return out
+
+
 def reset_font_caches() -> None:
     """清掉字体相关缓存，让下次渲染重新探测。
 

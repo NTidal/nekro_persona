@@ -5,7 +5,7 @@
 > **2.0 起**：前 3 档是手工策划的「种子」（模型不可改）；**tier4 是「生长」**——角色在运行时自己沉淀的身份锚点（身份）与频道笔记（功能），
 > 并具备**种子包 / 生长包分离导出**：角色定义可公开版本化，「这一世活过的痕迹」可整体迁移备份。
 
-版本 **2.3.7**　作者 **NTidal**　许可 **GPLv3**
+版本 **2.3.8**　作者 **NTidal**　许可 **GPLv3**
 
 ---
 
@@ -621,6 +621,69 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
 
 > 本日志只保留**最近三个版本**的改动；更早的版本见 git 提交历史（`git log --oneline`）。
 
+### 2.3.8
+
+**字体选择合一（选中即生效）+ 拿字体真渲染来判定能力 + 分组与推荐**
+
+三个问题一起改：
+
+1. **两处下拉都列全部字体，分不清** —— 之前正文字体和 emoji 字体共用一份字体清单，
+   得靠自己看文件名猜。现在由**能力探测**决定归属。
+2. **要按按钮才生效** —— 现在「选中即生效」，不再有「设为当前字体 / 设为 emoji 字体」按钮。
+3. **「自动探测」不在列表里** —— 现在它是两个下拉的首项（`value=""`），标签里直接写出当前推荐：
+
+```
+正文字体   [ 自动探测（当前推荐：SourceHanSansSC-Regular.otf）        ▾ ]
+            中文正文字体（推荐）
+              SourceHanSansSC-Regular.otf（15.8 MB）· 汉字 100% · emoji 100%（单色）· 推荐
+              msyh.ttc（18.8 MB）· 汉字 100% · emoji 100%（彩色）
+              Deng.ttf / LXGWWenKai-Regular.ttf / simhei.ttf …
+emoji 字体  [ 自动探测（当前推荐：emoji-segoe.ttf）                    ▾ ]
+            彩色 emoji（推荐）
+              emoji-segoe.ttf（12.3 MB）· 汉字 100% · emoji 100%（彩色）· 推荐
+            单色字体（能显示 emoji，但不会上色）
+              LXGWWenKai-Regular.ttf / SourceHanSansSC-Regular.otf / simhei.ttf
+```
+
+### 能力探测怎么做的
+
+`card.probe_font_capabilities(path)` 不靠文件名猜，**拿字体真渲染一批样本字符**再判：
+
+| 指标 | 样本 | 判据 |
+|---|---|---|
+| `cjk` | GB2312 一级高频字 250 个 + 中文标点/全角 24 个 | 覆盖 ≥90% 才算能当正文字体 |
+| `emoji` | 18 个彩色 emoji（⚽🏀😀✨🌸🌙…） | 覆盖 ≥85% 且**字体带彩色表**才是 emoji 字体 |
+| `symbols` | 8 个常见符号（❤☀★☆✔…） | 辅助判断 |
+| `color` | COLR / CBDT / sbix / SVG 表 | 决定能不能上色 |
+
+字形判定用 FreeType 字形索引（`get_char_index(cp) != 0`），不是 `getmask().getbbox()`
+—— 后者对带 `.notdef` 轮廓的字体永远非空（2.3.1 那个 emoji 不生效的坑）。
+
+⚠️ 实践踩到的点：**很多中文字体也带 emoji 码点的单色字形**（实测 LXGW / simhei / 思源黑体全覆盖），
+只看「有没有字形」会把它们全判成 emoji 字体。所以拆成 `color_emoji`（彩色，才进 emoji 推荐）
+与 `mono_emoji`（单色，归到「能显示但不上色」分组）；另外名字带 `emoji` 的字体不进正文字体候选
+（`emoji-segoe.ttf` 其实覆盖了汉字）。
+
+推荐规则：正文 = 汉字覆盖 ≥90%、按「同类名优先级（sourcehan/noto/siyuan/pingfang/wenkai/hei…）
+→ 覆盖率 → 体积」排序取第一个；emoji = 彩色优先、按覆盖率排序。
+
+### 顺带
+
+- 新增独立脚本 `scripts/probe_fonts.py`，可以脱离页面直接体检一目录字体：
+
+```
+/app/.venv/bin/python scripts/probe_fonts.py /path/to/fonts [--json]
+字体                              大小     汉字   emoji    符号  彩色  建议用途
+SourceHanSansSC-Regular.otf     15.8 MB   100%    100%   100%  否   text+emoji-mono
+emoji-segoe.ttf                 12.3 MB   100%    100%   100%  是   emoji
+```
+
+- 页面还留着「上传自定义字体」「重新探测」；能力探测结果按 (文件名, 大小, mtime) 缓存。
+
+实测（NA1，真浏览器）：正文下拉 6 项（自动 + 5 个中文字体，分组正确）、emoji 下拉 5 项
+（自动 + 1 彩色 + 3 单色），两个「自动探测」项都写明当前推荐；把正文切到 `Deng.ttf`
+副标题立即变成「正文 Deng.ttf」；`pageerror` 0、预览出图 1140×586。
+
 ### 2.3.7
 
 **修「卡片预览」页整页失效（`Cannot access 'fonts' before initialization`）**
@@ -668,32 +731,3 @@ Uncaught ReferenceError: Cannot access 'fonts' before initialization
 实测（NA1）：把 emoji 字体设成思源黑体（单色字体）→ 状态变为「单色 · 手动指定」，出图正常
 （emoji 按单色渲染）；点「emoji 自动探测」→ 回到 `emoji-segoe.ttf`（彩色 · 自动探测）。
 接口均走 `POST /api/font`：`{emoji: "文件名"}` / `{emoji: ""}`。
-
-### 2.3.5
-
-**emoji 字体：探测范围补齐 + 也纳入落地 + 前端可见**
-
-2.3.4 之前 emoji 字体是「只认固定候选路径」的自动探测，且**没有**落地：
-
-1. 探测只查 `_EMOJI_FONT_CANDIDATES` 里写死的几个路径（windows/seguiemj、noto、Symbola 等），
-   而本项目的镜像把 emoji 字体放在 `/usr/share/fonts/truetype/nekro/emoji-segoe.ttf` ——
-   **不在候选里**。数据目录没放 emoji 字体的实例（例如刚重建的容器）会判定「没有 emoji 字体」，
-   卡片里的 emoji 全部变成豆腐块。
-2. 即使探到了，也只是「现探现用」：容器重建后系统字体一变，彩色 emoji 就没了。
-
-现在：
-
-- 探测链改为 **数据目录 `*emoji*` → 系统字体目录扫描（`/usr/share/fonts`、`/usr/local/share/fonts`、
-  `~/.local/share/fonts`、`C:/Windows/Fonts`，按文件名含 emoji）→ 固定候选**；
-- 探到后与正文字体一样**落地**：复制进插件数据目录并写 `.emoji_font_pin.json`
-  （与正文的 `.font_pin.json` 分开记录，互不覆盖）；
-- WebUI「卡片预览 → 当前字体」多一行：emoji 字体名 / 彩色或单色 / 在数据目录还是系统 / 是否落地副本；
-  没探到会红字提示怎么修。想覆盖就把文件名带 `emoji` 的字体丢进数据目录 `fonts/`。
-
-实测（NA1，把数据目录指向空目录模拟裸机）：
-
-```
-探测到: /tmp/emoji_bare_fonts/emoji-segoe.ttf   （来自 /usr/share/fonts/truetype/nekro/emoji-segoe.ttf）
-彩色: True   已落地: True   标记: .emoji_font_pin.json  {"pinned":…,"source":…,"size":12934920}
-第二次调用: 同一文件、未被重写（不重复复制 12.9 MB）
-```

@@ -2830,17 +2830,66 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     def _cards_dir() -> Path:
         return plugin.get_plugin_data_dir() / "card_previews"
 
+    # (文件名, 大小, mtime) → 能力探测结果；字体文件没变就不重复渲染样本
+    _FONT_CAP_CACHE: Dict[tuple, Dict[str, Any]] = {}
+
+    # 正文字体的「同类优先级」：名字命中越靠前，越优先推荐（同覆盖率时用）
+    _TEXT_HINT_ORDER = (
+        "sourcehan", "source", "noto", "siyuan", "思源", "harmony", "misans",
+        "pingfang", "wenkai", "yahei", "hei", "sans", "song",
+    )
+
     def _font_files() -> List[Dict[str, Any]]:
+        """数据目录里的字体 + 实测能力（能不能当正文 / 能不能当 emoji / 是否彩色）。"""
         out: List[Dict[str, Any]] = []
         d = _font_dir()
         try:
-            if d.is_dir():
-                for f in sorted(d.iterdir()):
-                    if f.is_file() and f.suffix.lower() in (".ttf", ".ttc", ".otf"):
-                        out.append({"name": f.name, "size": f.stat().st_size})
+            if not d.is_dir():
+                return out
+            for f in sorted(d.iterdir()):
+                if not (f.is_file() and f.suffix.lower() in (".ttf", ".ttc", ".otf")):
+                    continue
+                st = f.stat()
+                key = (f.name, st.st_size, int(st.st_mtime))
+                caps = _FONT_CAP_CACHE.get(key)
+                if caps is None:
+                    try:
+                        caps = _card.probe_font_capabilities(str(f))
+                    except Exception:  # noqa: BLE001
+                        caps = {"ok": False, "roles": [], "kind": "other", "note": "探测异常"}
+                        plugin.logger.debug(f"字体能力探测失败: {f.name}", exc_info=True)
+                    _FONT_CAP_CACHE.clear()   # 只留最新一批，避免长期占用
+                    _FONT_CAP_CACHE[key] = caps
+                out.append({"name": f.name, "size": st.st_size, "caps": caps})
         except Exception:  # noqa: BLE001
             pass
         return out
+
+    def _font_recommend(fonts: List[Dict[str, Any]]) -> Dict[str, str]:
+        """按能力给「推荐正文 / 推荐 emoji」各挑一个。"""
+        def roles(f: Dict[str, Any]) -> List[str]:
+            return list(((f.get("caps") or {}).get("roles") or []))
+
+        text_cands = [f for f in fonts if "text" in roles(f)]
+        text_cands.sort(
+            key=lambda f: (
+                next(
+                    (i for i, h in enumerate(_TEXT_HINT_ORDER) if h in f["name"].lower()),
+                    len(_TEXT_HINT_ORDER),
+                ),
+                -float((f.get("caps") or {}).get("cjk") or 0),
+                -f["size"],
+            ),
+        )
+        color_cands = [f for f in fonts if "emoji" in roles(f)]
+        color_cands.sort(key=lambda f: (-float((f.get("caps") or {}).get("emoji") or 0), -f["size"]))
+        mono_cands = [f for f in fonts if "emoji-mono" in roles(f)]
+        return {
+            "text": text_cands[0]["name"] if text_cands else "",
+            "emoji": (color_cands[0]["name"] if color_cands
+                      else (mono_cands[0]["name"] if mono_cands else "")),
+            "emojiColor": color_cands[0]["name"] if color_cands else "",
+        }
 
     def _font_state() -> Dict[str, Any]:
         """当前字体：配置值 / 实际解析到的路径 / 是否已落地 / 数据目录里的可选字体。"""
@@ -2896,6 +2945,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "pinned": str(pin_info.get("pinned") or ""),
             "pinSource": str(pin_info.get("source") or ""),
             "fonts": _font_files(),
+            "recommend": _font_recommend(_font_files()),
             "emoji": emoji,
             "pinEnabled": str(os.environ.get("NEKRO_PERSONA_FONT_PIN", "1")).strip().lower()
             not in ("0", "false", "no", "off"),
@@ -3047,6 +3097,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 setattr(cfg, "RANK_CARD_FONT", "")
                 plugin.save_config(cfg)
                 _card.reset_font_caches()
+                _FONT_CAP_CACHE.clear()
                 return {"ok": True, "font": _font_state()}
             if "emoji" in body:
                 # emoji 字体：空串 = 恢复自动探测，否则必须是数据目录里存在的字体
