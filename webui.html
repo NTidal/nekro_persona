@@ -2180,6 +2180,10 @@ body.is-scrolling .dialog-foot {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
         <span>注入预览</span>
       </button>
+      <button class="nav-item" type="button" data-tab="cards">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M3 9.5h18M8 14.5h6"/></svg>
+        <span>卡片预览</span>
+      </button>
       <button class="nav-item" type="button" data-tab="memo">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3.5h9.5L19 8v12.5H5z"/><path d="M8.5 12h7M8.5 15.5h4.5"/></svg>
         <span>频道笔记</span>
@@ -2469,6 +2473,82 @@ body.is-scrolling .dialog-foot {
     </section>
 
     <!-- 频道笔记 -->
+    <!-- 卡片预览 -->
+    <section class="page" id="page-cards" data-page="cards">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">卡片预览</h1>
+          <p class="page-desc">模拟渲染三张卡片，并查看／更换当前使用的字体（改动立即生效，无需重启）。</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">当前字体</h2>
+            <div class="card-subtitle" id="cardFontSub">读取中…</div>
+          </div>
+          <span class="badge" id="cardFontBadge">—</span>
+        </div>
+        <div class="card-body">
+          <div class="preview-control">
+            <div class="field-label">选择数据目录里的字体
+              <select class="select" id="cardFontSelect"></select>
+            </div>
+            <div class="field-label">渲染精度
+              <select class="select" id="cardScale"></select>
+            </div>
+            <div class="row-end">
+              <button class="btn" type="button" id="cardFontApply">设为当前字体</button>
+              <button class="btn" type="button" id="cardFontUploadBtn">上传自定义字体</button>
+              <button class="btn" type="button" id="cardFontClear">恢复自动探测</button>
+              <input type="file" id="cardFontFile" accept=".ttf,.ttc,.otf" hidden>
+            </div>
+          </div>
+          <p class="hint" id="cardFontHint">
+            上传的字体写入插件数据目录 fonts/ 并立即启用；开关口径见下。
+          </p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div><h2 class="card-title">渲染参数</h2><div class="card-subtitle">示例数据不碰真实档案，可直接看效果</div></div>
+        </div>
+        <div class="card-body">
+          <div class="preview-control">
+            <div class="field-label">卡片
+              <select class="select" id="cardKind"></select>
+            </div>
+            <div class="field-label">数据来源
+              <select class="select" id="cardSource">
+                <option value="sample">示例数据（4 位虚构用户）</option>
+                <option value="channel">真实频道</option>
+              </select>
+            </div>
+            <div class="field-label" id="cardChannelWrap" hidden>频道
+              <select class="select" id="cardChannel"></select>
+            </div>
+            <div class="row-end">
+              <button class="btn primary" type="button" id="cardRunBtn">生成预览</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div><h2 class="card-title">预览</h2><div class="card-subtitle" id="cardPreviewMeta">点「生成预览」渲染</div></div>
+        </div>
+        <div class="card-body">
+          <div id="cardPreviewWrap" style="overflow:auto;max-height:70vh;border-radius:14px">
+            <p class="hint" id="cardPreviewEmpty">还没有生成预览。</p>
+            <img id="cardPreviewImg" alt="卡片预览" hidden style="max-width:100%;display:block;border-radius:14px">
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section class="page" id="page-memo" data-page="memo">
       <div class="page-head">
         <div>
@@ -3471,10 +3551,10 @@ const MOCK = (() => {
 })();
 
 /* ---------------- 导航 ---------------- */
-const PAGES = ['overview', 'memory', 'favor', 'rules', 'preview', 'memo', 'anchor', 'memlog', 'trash', 'transfer', 'settings'];
+const PAGES = ['overview', 'memory', 'favor', 'rules', 'preview', 'cards', 'memo', 'anchor', 'memlog', 'trash', 'transfer', 'settings'];
 const LOADERS = {
   overview: loadOverview, memory: loadMemory, favor: loadFavor, rules: loadRules,
-  preview: loadPreview, memo: loadMemo, anchor: loadAnchor, memlog: loadMemlog,
+  preview: loadPreview, cards: loadCards, memo: loadMemo, anchor: loadAnchor, memlog: loadMemlog,
   trash: loadTrash, transfer: loadTransfer, settings: loadSettings,
 };
 /* 未保存表单跟踪：规则页 / 运行参数页改动会置脏，切页前确认。
@@ -4651,6 +4731,138 @@ $('#rulesSaveBtn').addEventListener('click', async () => {
 });
 
 /* ---------------- 注入预览 ---------------- */
+/* ---------------- 卡片渲染预览 ---------------- */
+state.cardInfo = null;
+
+function fmtBytes(n) {
+  const v = Number(n) || 0;
+  if (v >= 1048576) return (v / 1048576).toFixed(1) + ' MB';
+  if (v >= 1024) return Math.round(v / 1024) + ' KB';
+  return v + ' B';
+}
+
+async function loadCards(opts = {}) {
+  if (!state.channels.length) { try { await loadChannels(); } catch (e) { /* 忽略 */ } }
+  let info = state.cardInfo;
+  if (!info || opts.fresh) {
+    info = await load('card_preview', () => null);
+    if (!info) return;
+    state.cardInfo = info;
+  }
+  const font = info.font || {};
+  $('#cardFontSub').textContent = font.name
+    ? `${font.name}　·　${font.inDataDir ? '已在插件数据目录' : '数据目录之外'}${font.pinned ? '（已落地副本）' : ''}`
+    : '未找到中文字体（卡片会回退成文本）';
+  const badge = $('#cardFontBadge');
+  badge.textContent = font.exists ? '出图可用' : '无字体';
+  badge.className = 'badge' + (font.exists ? '' : ' warn');
+
+  const sel = $('#cardFontSelect');
+  const fonts = font.fonts || [];
+  sel.innerHTML = fonts.length
+    ? fonts.map((f) => `<option value="${esc(f.name)}"${f.name === font.name ? ' selected' : ''}>${esc(f.name)}（${fmtBytes(f.size)}）</option>`).join('')
+    : '<option value="">（数据目录 fonts/ 里没有字体）</option>';
+
+  const kindSel = $('#cardKind');
+  if (!kindSel.options.length) {
+    kindSel.innerHTML = (info.cards || []).map((c) => `<option value="${c.id}">${esc(c.label)} — ${esc(c.desc)}</option>`).join('');
+    $('#cardScale').innerHTML = (info.scales || []).map((s) => `<option value="${s.value}"${s.value === 0 ? ' selected' : ''}>${esc(s.label)}</option>`).join('');
+  }
+
+  const chSel = $('#cardChannel');
+  chSel.innerHTML = (info.channels || []).map((c) => `<option value="${esc(c.chat_key)}">${esc(c.chat_key)}（${c.count} 人）</option>`).join('')
+    || '<option value="">（没有可用频道）</option>';
+  const wrap = $('#cardChannelWrap');
+  wrap.hidden = $('#cardSource').value !== 'channel';
+  $('#cardFontHint').innerHTML = font.pinEnabled
+    ? '上传／选择的字体会写入插件数据目录 fonts/ 并立即启用；系统字体首次被探测到时会自动复制一份进去（<code>.font_pin.json</code> 记录来源）。'
+    : '⚠️ 已通过 <code>NEKRO_PERSONA_FONT_PIN=0</code> 关闭字体落地，系统字体不会被复制。';
+}
+
+$('#cardSource').addEventListener('change', () => {
+  $('#cardChannelWrap').hidden = $('#cardSource').value !== 'channel';
+});
+
+$('#cardFontApply').addEventListener('click', async () => {
+  const name = $('#cardFontSelect').value;
+  if (!name) { toast('数据目录里没有可选字体，先上传一个', 'warning'); return; }
+  const ok = await postAction('font', { name });
+  if (ok !== null) {
+    state.cardInfo = null;
+    toast('字体已切换', 'success');
+    await loadCards({ fresh: true });
+  }
+});
+
+$('#cardFontClear').addEventListener('click', async () => {
+  const ok = await postAction('font', { clear: true });
+  if (ok !== null) {
+    state.cardInfo = null;
+    toast('已恢复自动探测', 'info');
+    await loadCards({ fresh: true });
+  }
+});
+
+$('#cardFontUploadBtn').addEventListener('click', () => $('#cardFontFile').click());
+$('#cardFontFile').addEventListener('change', async (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  if (!/\.(ttf|ttc|otf)$/i.test(file.name)) { toast('只支持 .ttf / .ttc / .otf', 'warning'); return; }
+  if (file.size > 60 * 1024 * 1024) { toast('字体超过 60 MB', 'warning'); return; }
+  let buf;
+  try { buf = await file.arrayBuffer(); } catch (err) { toast('读取文件失败', 'error'); return; }
+  const btn = $('#cardFontUploadBtn');
+  btn.classList.add('is-loading');
+  try {
+    const res = await fetch('./api/font?name=' + encodeURIComponent(file.name), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', ...(state.key ? { 'X-WebUI-Key': state.key } : {}) },
+      body: buf,
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error((data && (data.message || data.detail)) || `HTTP ${res.status}`);
+    toast('字体已上传并启用', 'success');
+    state.cardInfo = null;
+    await loadCards({ fresh: true });
+  } catch (err) {
+    toast('上传失败：' + err.message, 'error');
+  } finally {
+    btn.classList.remove('is-loading');
+    e.target.value = '';
+  }
+});
+
+async function runCardPreview() {
+  const btn = $('#cardRunBtn');
+  btn.classList.add('is-loading');
+  try {
+    const body = {
+      card: $('#cardKind').value,
+      source: $('#cardSource').value,
+      scale: parseFloat($('#cardScale').value) || 0,
+    };
+    if (body.source === 'channel') {
+      body.chat_key = $('#cardChannel').value;
+      if (!body.chat_key) { toast('先选一个频道', 'warning'); return; }
+    }
+    const data = await postAction('card_preview', body);
+    if (!data) return;
+    const img = $('#cardPreviewImg');
+    img.src = data.image;
+    img.hidden = false;
+    $('#cardPreviewEmpty').hidden = true;
+    const m = data.meta || {};
+    $('#cardPreviewMeta').textContent =
+      `${m.card} · ${m.count} 条档案 · ${fmtBytes(m.bytes)}${m.font ? ' · 字体 ' + m.font : ''}`;
+  } catch (err) {
+    toast(err.message || '渲染失败', 'error');
+  } finally {
+    btn.classList.remove('is-loading');
+  }
+}
+
+$('#cardRunBtn').addEventListener('click', runCardPreview);
+
 async function loadPreview() {
   if (!state.channels.length) await loadChannels();
   if (!state.overview) {

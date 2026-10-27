@@ -219,6 +219,34 @@ def _pin_font(src: str, pin_dir: str) -> str:
         return src
 
 
+def reset_font_caches() -> None:
+    """清掉字体相关缓存，让下次渲染重新探测。
+
+    WebUI 里换字体 / 上传字体后必须调用：`_find_font_impl` 的缓存按 (font_path, font_dir)
+    命中，同一路径换了文件内容（例如重新上传同名字体）不会自动失效。
+    """
+    global _font_cache, _font_checked, _font_key
+    global _FALLBACK_READY, _emoji_font_checked, _emoji_font_key
+    with _FONT_LOCK:
+        _font_cache, _font_checked, _font_key = None, False, None
+        _FALLBACK_READY = False
+        try:
+            _FALLBACK_FONT_PATHS.clear()
+        except Exception:  # noqa: BLE001
+            pass
+        _emoji_font_checked = False
+        _emoji_font_key = None
+        try:
+            _emoji_font_cache.clear()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _cov_cache.clear()
+            _fallback_font_cache.clear()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _find_font(font_path: str = "", font_dir: str = "") -> str | None:
     """线程安全入口（实现见 _find_font_impl）。"""
     with _FONT_LOCK:

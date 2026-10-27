@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import glob
 import hmac
 import json
@@ -36,6 +38,58 @@ _TIERS = ("tier1", "tier2", "tier3")
 
 
 _NO_KEY_WARNED = False
+
+# 卡片预览用的示例档案（不碰真实数据，第一次打开就能看到效果）
+_PREVIEW_SAMPLES = (
+    {
+        "display_name": "示例·小满",
+        "user_id": "100001",
+        "score": 62,
+        "tags": ["熟客", "爱接梗", "深夜陪聊"],
+        "summary": "喜欢深夜聊吃的，不吃香菜；心情好会发一堆表情包。",
+        "updated_at": 1793000000,
+        "last_interaction_at": 1793000000,
+    },
+    {
+        "display_name": "示例·辰光归娅",
+        "user_id": "100002",
+        "score": 28,
+        "tags": ["熟客", "爱发图", "活跃互动"],
+        "summary": (
+            "第一次提到那件事是在下雨的傍晚，说小时候常一个人坐窗边等家里人回来，"
+            "雨声盖过楼道里的脚步声，所以到现在听见雨还是会下意识抬头看一眼门口。"
+            "后来熟了才知道，她不喜欢被问「今天过得怎么样」，更喜欢别人直接说「我给你带了热的」。"
+        ),
+        "updated_at": 1792900000,
+        "last_interaction_at": 1792900000,
+    },
+    {
+        "display_name": "⚽️🏀✨ 示例·emoji",
+        "user_id": "100003",
+        "score": 0,
+        "tags": ["新面孔", "偶尔冒泡"],
+        "summary": "只在群里发过几次运动表情，还没聊开。",
+        "updated_at": 1792800000,
+        "last_interaction_at": 1792800000,
+    },
+    {
+        "display_name": "示例·白露",
+        "user_id": "100004",
+        "score": -34,
+        "tags": ["冷淡", "已读不回"],
+        "summary": "连续几次都是敷衍两句就没了，最近一个月没再说话。",
+        "updated_at": 1792700000,
+        "last_interaction_at": 1792700000,
+    },
+)
+
+
+def _safe_font_name(name: str) -> str:
+    """字体文件名清洗：只取 basename，且必须是 .ttf/.ttc/.otf。"""
+    n = Path(str(name or "")).name.strip()
+    if not n or not n.lower().endswith((".ttf", ".ttc", ".otf")):
+        raise HTTPException(status_code=400, detail="只接受 .ttf / .ttc / .otf 字体文件")
+    return n
 
 
 async def _json_body(request: "Request") -> Dict[str, Any]:
@@ -2766,6 +2820,215 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         except Exception as exc:  # noqa: BLE001
             plugin.logger.warning(f"[persona] 重载命中统计失败（忽略）: {exc}")
         return {"ok": True, "status": memory.status()}
+
+    # ---------------- 卡片渲染预览（2.3.4） ----------------
+    from . import card as _card  # 局部导入：本模块加载时 card 可能尚未就绪
+
+    def _font_dir() -> Path:
+        return plugin.get_plugin_data_dir() / "fonts"
+
+    def _cards_dir() -> Path:
+        return plugin.get_plugin_data_dir() / "card_previews"
+
+    def _font_files() -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        d = _font_dir()
+        try:
+            if d.is_dir():
+                for f in sorted(d.iterdir()):
+                    if f.is_file() and f.suffix.lower() in (".ttf", ".ttc", ".otf"):
+                        out.append({"name": f.name, "size": f.stat().st_size})
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+    def _font_state() -> Dict[str, Any]:
+        """当前字体：配置值 / 实际解析到的路径 / 是否已落地 / 数据目录里的可选字体。"""
+        cfg = plugin.get_config()
+        cfg_path = str(getattr(cfg, "RANK_CARD_FONT", "") or "").strip()
+        font_dir = str(_font_dir())
+        resolved = ""
+        try:
+            resolved = _card._find_font(font_path=cfg_path, font_dir=font_dir) or ""
+        except Exception:  # noqa: BLE001
+            resolved = ""
+        pin_info: Dict[str, Any] = {}
+        try:
+            marker = Path(font_dir) / _card._FONT_PIN_MARKER
+            if marker.is_file():
+                pin_info = json.loads(marker.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001
+            pin_info = {}
+        in_data_dir = False
+        try:
+            in_data_dir = bool(resolved) and Path(resolved).parent == Path(font_dir)
+        except Exception:  # noqa: BLE001
+            in_data_dir = False
+        return {
+            "config": cfg_path,
+            "resolved": resolved,
+            "name": Path(resolved).name if resolved else "",
+            "exists": bool(resolved and Path(resolved).is_file()),
+            "inDataDir": in_data_dir,
+            "pinned": str(pin_info.get("pinned") or ""),
+            "pinSource": str(pin_info.get("source") or ""),
+            "fonts": _font_files(),
+            "pinEnabled": str(os.environ.get("NEKRO_PERSONA_FONT_PIN", "1")).strip().lower()
+            not in ("0", "false", "no", "off"),
+        }
+
+    @router.get("/api/card_preview", summary="卡片预览：当前字体 / 可选字体 / 频道列表")
+    async def api_card_preview_info(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        return {
+            "ok": True,
+            "font": _font_state(),
+            "channels": await _all_channels(),
+            "maxAbs": helpers["max_abs_score"](),
+            "cards": [
+                {"id": "single", "label": "单人印象卡", "desc": "查看好感度 / 查看<账号>印象 出的那张"},
+                {"id": "rank", "label": "好感度排行榜", "desc": "好感度总览（名次 + 金银铜）"},
+                {"id": "overview", "label": "印象总览", "desc": "自动分列网格，只收有标签的档案"},
+            ],
+            "scales": [
+                {"value": 0, "label": "跟随插件配置"},
+                {"value": 1.5, "label": "1.5×（省流）"},
+                {"value": 2.0, "label": "2.0×（推荐）"},
+                {"value": 3.0, "label": "3.0×（最清晰）"},
+            ],
+        }
+
+    @router.post("/api/card_preview", summary="渲染卡片预览（single / rank / overview）")
+    async def api_card_preview(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        body = await _json_body(request)
+        kind = str(body.get("card") or "single").strip()
+        if kind not in ("single", "rank", "overview"):
+            raise HTTPException(status_code=400, detail="card 只能是 single / rank / overview")
+        source = str(body.get("source") or "sample").strip()
+        chat_key = str(body.get("chat_key") or "").strip()
+        max_abs = helpers["max_abs_score"]()
+        cfg = plugin.get_config()
+        font_path = str(getattr(cfg, "RANK_CARD_FONT", "") or "")
+        font_dir = str(_font_dir())
+        try:
+            scale = float(body.get("scale") or 0.0)
+        except (TypeError, ValueError):
+            scale = 0.0
+        if scale and not (1.0 <= scale <= 4.0):
+            raise HTTPException(status_code=400, detail="scale 需在 1.0~4.0 之间（0 = 跟随配置）")
+
+        def _entry(p: Any) -> Dict[str, Any]:
+            score = int(getattr(p, "score", 0) or 0)
+            return {
+                "display_name": getattr(p, "display_name", "") or getattr(p, "user_id", ""),
+                "user_id": str(getattr(p, "user_id", "") or ""),
+                "score": score,
+                "stage": helpers["stage_info"](score)[0],
+                "tags": list(getattr(p, "tags", None) or []),
+                "summary": getattr(p, "summary", "") or "",
+                "updated_at": int(getattr(p, "updated_at", 0) or 0),
+                "last_interaction_at": int(getattr(p, "last_interaction_at", 0) or 0),
+            }
+
+        meta: Dict[str, Any] = {"card": kind, "source": source}
+        if source == "channel":
+            if not chat_key:
+                raise HTTPException(status_code=400, detail="选择「真实频道」时必须给 chat_key")
+            state = await helpers["load_state"](chat_key)
+            profs = list((getattr(state, "profiles", None) or {}).values())
+            if kind == "overview":
+                profs = [p for p in profs if list(getattr(p, "tags", None) or [])]
+            elif kind == "rank":
+                profs = [p for p in profs if getattr(p, "score", 0) or getattr(p, "updated_at", 0)]
+            profs.sort(
+                key=lambda p: (int(getattr(p, "score", 0) or 0), int(getattr(p, "updated_at", 0) or 0)),
+                reverse=True,
+            )
+            entries = [_entry(p) for p in profs]
+            meta["chat_key"] = chat_key
+        else:
+            entries = [dict(e) for e in _PREVIEW_SAMPLES]
+            for e in entries:
+                e["stage"] = helpers["stage_info"](int(e.get("score") or 0))[0]
+        meta["count"] = len(entries)
+        if not entries:
+            raise HTTPException(
+                status_code=400,
+                detail="这个频道没有可渲染的档案（换数据来源或换个频道试试）",
+            )
+
+        kwargs = {
+            "font_path": font_path,
+            "font_dir": font_dir,
+            "avatar_dir": str(plugin.get_plugin_data_dir() / "avatars"),
+            "scale": scale,
+        }
+        try:
+            if kind == "single":
+                png = await asyncio.to_thread(_card.render_profile_card, entries[0], max_abs, **kwargs)
+            elif kind == "rank":
+                png = await asyncio.to_thread(
+                    _card.render_favorability_rank, entries, max_abs, limit=0, **kwargs,
+                )
+            else:
+                png = await asyncio.to_thread(
+                    _card.render_impression_overview, entries, max_abs, limit=0, **kwargs,
+                )
+        except Exception as exc:  # noqa: BLE001
+            plugin.logger.exception("[persona] 卡片预览渲染失败")
+            raise HTTPException(status_code=500, detail=f"渲染异常：{exc}") from exc
+        if png is None:
+            raise HTTPException(
+                status_code=400,
+                detail="渲染不可用：没找到中文字体。把字体放到插件数据目录 fonts/，"
+                       "或用上面的「上传自定义字体」再试",
+            )
+        meta["bytes"] = len(png)
+        meta["font"] = _font_state()["name"]
+        meta["scale"] = scale or None
+        return {
+            "ok": True,
+            "meta": meta,
+            "image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+        }
+
+    @router.post("/api/font", summary="选择 / 上传卡片字体")
+    async def api_font(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        cfg = plugin.get_config()
+        fdir = _font_dir()
+        ctype = (request.headers.get("content-type") or "").lower()
+        if ctype.startswith("application/octet-stream"):
+            name = _safe_font_name(request.query_params.get("name") or "custom.ttf")
+            raw_bytes = await request.body()
+            if len(raw_bytes) < 4096:
+                raise HTTPException(status_code=400, detail="文件太小，不像是字体")
+            if len(raw_bytes) > 60 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail="字体文件超过 60 MB")
+            fdir.mkdir(parents=True, exist_ok=True)
+            dst = fdir / name
+            tmp = dst.with_name(dst.name + ".tmp")
+            tmp.write_bytes(raw_bytes)
+            tmp.replace(dst)
+            target = dst
+            plugin.logger.info(f"[persona] WebUI 上传字体 {name}（{len(raw_bytes):,} 字节）")
+        else:
+            body = await _json_body(request)
+            if body.get("clear"):
+                setattr(cfg, "RANK_CARD_FONT", "")
+                plugin.save_config(cfg)
+                _card.reset_font_caches()
+                return {"ok": True, "font": _font_state()}
+            name = _safe_font_name(str(body.get("name") or ""))
+            target = fdir / name
+            if not target.is_file():
+                raise HTTPException(status_code=404, detail=f"数据目录 fonts/ 里没有 {name}")
+        setattr(cfg, "RANK_CARD_FONT", str(target))
+        plugin.save_config(cfg)
+        _card.reset_font_caches()
+        plugin.logger.info(f"[persona] WebUI 切换卡片字体 → {target.name}")
+        return {"ok": True, "font": _font_state()}
 
     return router
 
