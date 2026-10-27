@@ -84,66 +84,117 @@ _PREVIEW_SAMPLES = (
 )
 
 
-# 推荐字体目录：**只给官方项目页链接**，插件本身不打包、不镜像、不提供直链下载。
-# 之所以敢列链接：超链接不是复制发行（没有产生副本），和「在文档里写一句网址」性质相同；
-# 风险只出现在「把字体文件塞进包里」或「指向第三方盗链站」这两种做法上。
-# 每一项都标清许可，让用户自己按各自许可使用。
+# 推荐字体目录。
+# 两件事分开看：
+#   · `url`     = 官方项目页（只是超链接，不侵权，也不产生副本）；
+#   · `install` = 官方**直链**，可一键安装 —— 只对 SIL OFL 1.1 字体开放：
+#       OFL 明确允许随软件再分发（需带许可文件），所以服务端下载 + 落盘是合规的；
+#       厂商自有许可（MiSans / 阿里 / 微软雅黑）即便有直链也不做，因为通常禁止再分发。
+# 直链都用「版本化资产路径」或 `releases/latest/download/<资产名>`，避免换版本就 404。
 _FONT_CATALOG = (
     {
-        "name": "思源黑体 / Source Han Sans",
+        "id": "source-han-sans",
+        "name": "思源黑体 / Source Han Sans SC",
         "license": "SIL OFL 1.1",
         "kind": "text",
         "url": "https://github.com/adobe-fonts/source-han-sans/releases",
         "note": "Adobe + Google 联合开源，可免费商用、可嵌入分发（保留许可文件）。",
+        "install": {
+            "url": "https://github.com/adobe-fonts/source-han-sans/releases/download/"
+                   "2.005R/09_SourceHanSansSC.zip",
+            "pick": "SourceHanSansSC-Regular.otf",
+            "as": "SourceHanSansSC-Regular.otf",
+            "size": 95_200_000,
+            "heavy": True,
+        },
     },
     {
-        "name": "思源宋体同源：Noto Sans CJK / Noto Serif CJK",
+        "id": "noto-sans-sc",
+        "name": "Noto Sans SC（与思源黑体同源）",
         "license": "SIL OFL 1.1",
         "kind": "text",
         "url": "https://github.com/notofonts/noto-cjk/releases",
-        "note": "与思源黑体同源，字形一致、分发包更全（含 .otf/.ttc 与可变字体）。",
+        "note": "和思源黑体同源同字形，官方包更小（47.8 MB，只取 Regular 8 MB）。",
+        "install": {
+            "url": "https://github.com/notofonts/noto-cjk/releases/download/"
+                   "Sans2.004/18_NotoSansSC.zip",
+            "pick": "NotoSansSC-Regular.otf",
+            "as": "NotoSansSC-Regular.otf",
+            "size": 50_100_000,
+        },
     },
     {
+        "id": "lxgw-wenkai",
         "name": "霞鹜文楷 LXGW WenKai",
         "license": "SIL OFL 1.1",
         "kind": "text",
         "url": "https://github.com/lxgw/LxgwWenKai/releases",
         "note": "楷体风格，卡片上观感偏手写；带单色 emoji 字形。",
+        "install": {
+            "url": "https://github.com/lxgw/LxgwWenKai/releases/latest/download/"
+                   "LXGWWenKai-Regular.ttf",
+            "pick": "",
+            "as": "LXGWWenKai-Regular.ttf",
+            "size": 25_900_000,
+        },
     },
     {
-        "name": "更纱黑体 Sarasa Gothic",
-        "license": "SIL OFL 1.1",
-        "kind": "text",
-        "url": "https://github.com/be5invis/Sarasa-Gothic/releases",
-        "note": "等宽/比例多版本，适合做对齐要求高的排版。",
-    },
-    {
+        "id": "smiley-sans",
         "name": "得意黑 Smiley Sans",
         "license": "SIL OFL 1.1",
         "kind": "text",
         "url": "https://github.com/atelier-anchor/smiley-sans/releases",
         "note": "倾斜风格标题字，适合当标题、不适合长正文。",
+        "install": {
+            "url": "https://github.com/atelier-anchor/smiley-sans/releases/latest/download/"
+                   "smiley-sans-v2.0.1.zip",
+            "pick": "SmileySans-Oblique.ttf",
+            "as": "SmileySans-Oblique.ttf",
+            "size": 5_800_000,
+        },
     },
     {
+        "id": "noto-color-emoji",
         "name": "Noto Color Emoji（彩色 emoji）",
         "license": "SIL OFL 1.1",
         "kind": "emoji",
         "url": "https://github.com/googlefonts/noto-emoji",
         "note": "Google 官方彩色 emoji，CBDT 位图；Linux 容器里最常用。",
+        "install": {
+            "url": "https://github.com/google/fonts/raw/main/ofl/notocoloremoji/"
+                   "NotoColorEmoji-Regular.ttf",
+            "pick": "",
+            "as": "NotoColorEmoji-Regular.ttf",
+            "size": 25_400_000,
+        },
     },
     {
+        "id": "sarasa-gothic",
+        "name": "更纱黑体 Sarasa Gothic",
+        "license": "SIL OFL 1.1",
+        "kind": "text",
+        "url": "https://github.com/be5invis/Sarasa-Gothic/releases",
+        "note": "等宽/比例多版本；官方包 395 MB 起（TTF 只有 .7z），不值得一键装，建议手动下。",
+        "install": None,
+    },
+    {
+        "id": "misans",
         "name": "MiSans（小米）",
         "license": "小米 MiSans 字体许可",
         "kind": "text",
         "url": "https://hyperos.mi.com/font/zh/download/",
-        "note": "官方声明免费商用；但**再分发字体文件**要按小米的条款来，别打包进二次分发包。",
+        "note": "官方声明免费商用；但**再分发字体文件**要按小米条款来，且官方页是 JS 下载页无稳定直链"
+                " —— 因此不提供一键安装。",
+        "install": None,
     },
     {
+        "id": "alibaba-puhuiti",
         "name": "阿里妈妈普惠体 / 东方大楷（阿里巴巴）",
         "license": "阿里巴巴字体许可",
         "kind": "text",
         "url": "https://fonts.alibabagroup.com/",
-        "note": "官方声明免费商用；同样限制把字体文件本身再分发。",
+        "note": "官方声明免费商用；同样限制把字体文件本身再分发，且无稳定直链 —— 不提供一键安装。",
+        "install": None,
     },
 )
 
@@ -3135,6 +3186,114 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "meta": meta,
             "image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
         }
+
+    @router.post("/api/font/install", summary="一键安装推荐字体（仅 OFL 字体、官方直链）")
+    async def api_font_install(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        body = await _json_body(request)
+        fid = str(body.get("id") or "").strip()
+        item = next((x for x in _FONT_CATALOG if x["id"] == fid), None)
+        if item is None:
+            raise HTTPException(status_code=404, detail=f"没有这个推荐字体: {fid}")
+        spec = item.get("install")
+        if not spec:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{item['name']} 不提供一键安装（许可或直链限制），请到官方页面手动下载后上传",
+            )
+        if str(os.environ.get("NEKRO_PERSONA_FONT_INSTALL", "1")).strip().lower() in (
+            "0", "false", "no", "off",
+        ):
+            raise HTTPException(status_code=400, detail="已通过 NEKRO_PERSONA_FONT_INSTALL=0 关闭一键安装")
+
+        fdir = _font_dir()
+        fdir.mkdir(parents=True, exist_ok=True)
+        target = fdir / str(spec["as"])
+        tmp = fdir / (str(spec["as"]) + ".download")
+
+        def _fetch() -> None:
+            import urllib.request
+
+            req = urllib.request.Request(
+                str(spec["url"]),
+                headers={"User-Agent": "nekro_persona-font-installer/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp, tmp.open("wb") as fp:
+                total = 0
+                while True:
+                    chunk = resp.read(262_144)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > 400 * 1024 * 1024:
+                        raise ValueError("下载超过 400 MB，已中止")
+                    fp.write(chunk)
+
+        def _extract() -> None:
+            pick = str(spec.get("pick") or "")
+            if not pick:
+                tmp.replace(target)
+                return
+            import zipfile
+
+            with zipfile.ZipFile(tmp) as z:
+                names = z.namelist()
+                member = next(
+                    (n for n in names if n.split("/")[-1] == pick),
+                    None,
+                )
+                if member is None:
+                    raise ValueError(f"压缩包里没有 {pick}")
+                with z.open(member) as src, target.open("wb") as dst:
+                    dst.write(src.read())
+                # OFL 要求随字体保留许可文件
+                lic = next((n for n in names if n.split("/")[-1].lower() in
+                            ("license", "license.txt", "ofl.txt", "license.otf.txt")), None)
+                lic_path = fdir / (target.stem + ".LICENSE.txt")
+                try:
+                    if lic:
+                        lic_path.write_bytes(z.read(lic))
+                    else:
+                        # 压缩包里没带许可文件（得意黑这种就是）→ 自己写一份指向说明，
+                        # OFL 1.1 要求随字体保留许可，别让落地后的字体"无证裸奔"。
+                        lic_path.write_text(
+                            f"{item['name']}\n许可: {item['license']}\n"
+                            f"官方来源: {spec['url']}\n项目页: {item['url']}\n\n"
+                            "本文件由插件自动生成，仅记录来源与许可；字体本身的许可条款见上游"
+                            " LICENSE / OFL.txt。\n",
+                            encoding="utf-8",
+                        )
+                except Exception:  # noqa: BLE001
+                    plugin.logger.debug("许可文件写出失败（忽略）", exc_info=True)
+            tmp.unlink(missing_ok=True)
+
+        try:
+            plugin.logger.info(f"[persona] 一键安装字体 {item['name']} ← {spec['url']}")
+            await asyncio.to_thread(_fetch)
+            await asyncio.to_thread(_extract)
+            caps = await asyncio.to_thread(_card.probe_font_capabilities, str(target))
+            if not caps.get("ok") or not (caps.get("roles") or []):
+                target.unlink(missing_ok=True)
+                raise ValueError("下载到的文件不是可用字体（能力探测无结果）")
+        except Exception as exc:  # noqa: BLE001
+            tmp.unlink(missing_ok=True)
+            plugin.logger.warning(f"[persona] 一键安装失败: {exc}")
+            raise HTTPException(status_code=502, detail=f"安装失败：{exc}") from exc
+
+        cfg = plugin.get_config()
+        if item["kind"] == "emoji":
+            setattr(cfg, "RANK_CARD_EMOJI_FONT", str(target))
+        else:
+            setattr(cfg, "RANK_CARD_FONT", str(target))
+        plugin.save_config(cfg)
+        _card.reset_font_caches()
+        _card.set_emoji_font_override(str(getattr(cfg, "RANK_CARD_EMOJI_FONT", "") or ""))
+        _FONT_CAP_CACHE.clear()
+        plugin.logger.info(
+            f"[persona] 字体已安装并启用: {target.name}（{caps.get('kind')} / "
+            f"汉字 {(caps.get('cjk') or 0) * 100:.0f}%）",
+        )
+        return {"ok": True, "installed": target.name, "caps": caps, "font": _font_state()}
 
     @router.post("/api/font", summary="选择 / 上传卡片字体")
     async def api_font(request: Request) -> Dict[str, Any]:

@@ -338,6 +338,7 @@ def reset_font_caches() -> None:
             pass
         try:
             _cov_cache.clear()
+            _cmap_cache.clear()
             _fallback_font_cache.clear()
         except Exception:  # noqa: BLE001
             pass
@@ -654,30 +655,70 @@ _cov_cache: dict = {}               # (path, ch) -> bool
 _unresolved_chars: set = set()      # 主字体+备选都没字形的字（只警告一次/字）
 
 
-def _char_in_font(path: str, ch: str) -> bool:
-    """该字体是否含这个字的字形（按 (路径, 字) 缓存，字号无关）。
+# path → cmap 码点集合（读不到时为 None，表示要用兜底判定）
+_cmap_cache: dict = {}
 
-    ⚠️ 不能用 `font.getmask(ch).getbbox()` 判断：带 .notdef 轮廓的字体（pyftsubset 的
-       --notdef-outline 就会生成）对**任何**字都返回非空 mask，判断全部失真 —— 2.3.0 的
-       emoji 不生效正是栽在这里（所有字都被判定「有字形」，于是从不切到 emoji 字体）。
-       改用 FreeType 的字形索引：0 表示这个码点在该字体里没有映射。
+
+def _font_cmap(path: str):
+    """读字体的 cmap 码点集合（TTC 取第一个）；读不到返回 None。
+
+    ⚠️ 2.3.10 之前这里用 `ImageFont` 的 `get_char_index()` —— 本项目的 Pillow 构建里
+       `FreeTypeFont.font` **根本没有这个方法**（新版 Pillow 把它去掉了），异常被吞进兜底
+       分支后又拿 `getmask()` 判断，而带 `.notdef` 轮廓的字体对任何码点都返回非空 mask，
+       于是「有字形」恒为真：能力探测把 Noto Color Emoji 判成「汉字 100%、emoji 0%」，
+       逐字借字回退也一直是死的。改用 fontTools 直接读 cmap，准确且与字号无关。
     """
+    key = str(path)
+    if key in _cmap_cache:
+        return _cmap_cache[key]
+    cmap = None
+    try:
+        from fontTools.ttLib import TTCollection, TTFont
+
+        if key.lower().endswith(".ttc"):
+            fonts = list(TTCollection(key, lazy=True).fonts[:1])
+        else:
+            fonts = [TTFont(key, lazy=True)]
+        acc = set()
+        for f in fonts:
+            try:
+                acc.update(f.getBestCmap().keys())
+            except Exception:  # noqa: BLE001
+                continue
+        cmap = frozenset(acc) if acc else None
+    except Exception:  # noqa: BLE001
+        cmap = None
+    _cmap_cache[key] = cmap
+    return cmap
+
+
+def _char_in_font(path: str, ch: str) -> bool:
+    """该字体是否含这个字的字形（按 (路径, 字) 缓存，字号无关）。"""
     key = (path, ch)
     hit = _cov_cache.get(key)
     if hit is not None:
         return hit
-    ok = False
-    try:
-        from PIL import ImageFont
 
-        probe = _fallback_font_cache.get((path, 16))
-        if probe is None:
-            probe = ImageFont.truetype(path, 16)
-            _fallback_font_cache[(path, 16)] = probe
-        ok = probe.font.get_char_index(ord(ch)) != 0
-    except Exception:  # noqa: BLE001
+    ok = False
+    cmap = _font_cmap(path)
+    if cmap is not None:
+        ok = ord(ch) in cmap
+    else:
+        # 兜底：把目标字与「私有区未映射字」（必然落到 .notdef）的 mask 比一比。
+        # 只判断「非空」是不够的 —— 那正是之前恒为真的原因。
         try:
-            ok = probe.getmask(ch).getbbox() is not None  # 兜底（老版本 Pillow）
+            from PIL import ImageFont
+
+            probe = _fallback_font_cache.get((path, 16))
+            if probe is None:
+                probe = ImageFont.truetype(path, 16)
+                _fallback_font_cache[(path, 16)] = probe
+            try:
+                mine = probe.getmask(ch).getbbox()
+                notdef = probe.getmask("\ufffe").getbbox()
+                ok = mine is not None and mine != notdef
+            except Exception:  # noqa: BLE001
+                ok = False
         except Exception:  # noqa: BLE001
             ok = False
     _cov_cache[key] = ok

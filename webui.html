@@ -4851,11 +4851,18 @@ async function loadCards(opts = {}) {
   const catBox = $('#cardFontCatalogList');
   if (catBox) {
     catBox.innerHTML = cat.length
-      ? `<ul style="margin:0;padding-left:18px">` + cat.map((x) =>
-          `<li style="margin:4px 0"><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.name)}</a>`
-          + ` <span class="badge" style="margin-left:6px">${esc(x.license)}</span>`
-          + `${x.kind === 'emoji' ? ' <span class="badge">emoji</span>' : ''}`
-          + `<br><span style="color:var(--text-soft)">${esc(x.note)}</span></li>`).join('')
+      ? `<ul style="margin:0;padding-left:18px">` + cat.map((x) => {
+          const inst = x.install;
+          const action = inst
+            ? `<button class="mini-btn" type="button" data-install="${esc(x.id)}">`
+              + `一键安装（${fmtBytes(inst.size)}${inst.heavy ? '，较大' : ''}）</button>`
+            : `<span style="color:var(--text-soft)">需到官方页面手动下载</span>`;
+          return `<li style="margin:4px 0"><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.name)}</a>`
+            + ` <span class="badge" style="margin-left:6px">${esc(x.license)}</span>`
+            + `${x.kind === 'emoji' ? ' <span class="badge">emoji</span>' : ''}`
+            + `　${action}`
+            + `<br><span style="color:var(--text-soft)">${esc(x.note)}</span></li>`;
+        }).join('')
         + `</ul>`
       : '（后端没有提供推荐目录）';
   }
@@ -4896,6 +4903,30 @@ $('#cardEmojiSelect').addEventListener('change', async (e) => {
     state.cardInfo = null;
     toast(name ? `emoji 已切换：${name}` : 'emoji 已恢复自动探测', 'success');
     await loadCards({ fresh: true });
+  }
+});
+
+$('#cardFontCatalogList').addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-install]');
+  if (!btn) return;
+  const id = btn.dataset.install;
+  const label = btn.textContent;
+  btn.classList.add('is-loading');
+  btn.disabled = true;
+  btn.textContent = '下载中…（' + label.replace(/^一键安装（|）$/g, '') + '）';
+  try {
+    const d = await postAction('font/install', { id });
+    if (d) {
+      toast(`已安装并启用：${d.installed}`, 'success', 4200);
+      state.cardInfo = null;
+      await loadCards({ fresh: true });
+    }
+  } catch (err) {
+    toast('安装失败：' + err.message, 'error', 5200);
+  } finally {
+    btn.classList.remove('is-loading');
+    btn.disabled = false;
+    btn.textContent = label;
   }
 });
 
