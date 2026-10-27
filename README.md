@@ -5,7 +5,7 @@
 > **2.0 起**：前 3 档是手工策划的「种子」（模型不可改）；**tier4 是「生长」**——角色在运行时自己沉淀的身份锚点（身份）与频道笔记（功能），
 > 并具备**种子包 / 生长包分离导出**：角色定义可公开版本化，「这一世活过的痕迹」可整体迁移备份。
 
-版本 **2.3.0**　作者 **NTidal**　许可 **GPLv3**
+版本 **2.3.1**　作者 **NTidal**　许可 **GPLv3**
 
 ---
 
@@ -621,6 +621,29 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
 
 > 本日志只保留**最近三个版本**的改动；更早的版本见 git 提交历史（`git log --oneline`）。
 
+### 2.3.1
+
+**不再内置字体（包体 9.4 MB → 1.2 MB），改为「用宿主字体 + 逐字借字」**
+
+2.3.0 往包里塞了 10.8 MB 的字体子集，安装包从 1.2 MB 涨到 9.4 MB —— 而绝大多数 NA 镜像本身
+就带中文字体（实测 NA1 用 `LXGWWenKai-Regular`、NA5 用 `msyh`）。这版把字体从包里删掉：
+
+- **字体查找顺序**：配置项 `RANK_CARD_FONT` → 插件数据目录 `fonts/` → 系统 CJK 候选
+  （Noto CJK / wqy / Droid / PingFang / msyh 等）。找到就用，找不到就**明确回退文本**，
+  并在日志里写清「把任意中文字体放到插件数据目录 fonts/ 即可开启卡片出图」。
+- **逐字借字回退保留**：主字体缺字 → 从数据目录/系统字体里找有该字的字体；emoji 码点优先
+  走彩色 emoji 字体；全都没有才 `logger.warning` 报字与码点。
+- 顺带修 2.3.0 的两个字体 bug：
+  1. **覆盖判定失真** —— 原来用 `getmask().getbbox()` 判断「字体有没有这个字」，而带
+     `.notdef` 轮廓的字体对任何字都返回非空 mask（pyftsubset 的 `--notdef-outline` 就会生成），
+     于是所有字都被判成「有字形」。改用 FreeType 字形索引（`get_char_index(ord(ch)) != 0`）。
+  2. **emoji 反而不生效** —— 上一条的直接后果：主字体「有」字形，就永远不切彩色 emoji 字体，
+     ⚽ 🏀 ✨ 全被画成黑白/空白。现在 emoji 码点**优先**走 emoji 字体，不看主字体覆盖。
+
+实测：生产环境（数据目录有字体）出图正常、emoji 彩色（高饱和像素 1906）、`娅/傩/喵/來/ー`
+正常；把系统候选清空 + 数据目录指向空目录模拟裸机 → 日志给出可操作提示、卡片回退文本
+（`【关系档案】⚽️🏀 辰光归娅 ✨`），不报错。
+
 ### 2.3.0
 
 **关系档案三张卡 + 多账号适配 + 字体兜底（把 2.2.18–2.2.32 的全部迭代合并成本版）**
@@ -652,20 +675,10 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
 - `/api/index` 按当前账号过滤（本账号行 + 本账号后缀频道 + 无后缀历史行）。
   实测：A 读 B 的频道 profiles 47 → 0，新写入落 `account_key='qq...'`。
 
-#### 三、字体：包内子集扩到 GB18030 双字节区全量
+#### 三、字体（**已被 2.3.1 取代**）
 
-`assets/fonts/NotoSansSC-Subset.otf` 从「GB2312 一级 3755 字」扩到
-**GB18030 双字节区全量 24954 字符**（GB2312 常用+次常用、GBK 增补、假名、全角、常用标点）
-+ 全 ASCII + 插件自身文案，体积 1.06 MB → **10.8 MB**。
-
-之前「娅 / 傩 / 喵 / 來 / ー」这类字印不出来，是因为子集没有字形而 PIL 没有字体回退能力。
-两层兜底：
-
-1. 主字体缺字 → **逐字借字**（数据目录 `fonts/` → 系统 CJK 候选 → 包内子集，emoji 码点优先走
-   彩色 emoji 字体）；
-2. 全都找不到 → `logger.warning` 报出字与码点（每字一次），不再静默画空白。
-
-实测：真实数据 447 个字符，包内字体缺 0 个（仅剩 8 个零宽格式控制符，本就无字形）。
+2.3.0 曾把包内 Noto Sans SC 子集从 GB2312 一级 3755 字扩到 GB18030 双字节区全量 24954 字符
+（1.06 MB → 10.8 MB）。2.3.1 起**不再内置字体**，见下一条版本说明。
 
 #### 四、其它修正
 
@@ -700,27 +713,3 @@ GPLv3 的 copyleft 能保证衍生版本同样保持开放。
   顺带补 `memory.reload_hit_stats()` 并接进 `/api/reload`：此前 `ensure_loaded(force=True)` 不会
   重读命中统计 sidecar，内存为空时「重载背景记忆」读不回来，而下一次去抖落盘又会用空内存
   覆盖文件。
-
-### 2.2.16
-
-**侧栏不再假设顶栏 67px / statusLine 默认转义 / 清死代码 / 门槛钳上限 / 热度重置加锁**
-
-- **侧栏 sticky 的 1px 硬编码**：`.sidebar { top: 67px }` 对应的前提是顶栏恒为 66px —— 窄屏 +
-  长插件名让顶栏换行后，侧栏会和顶栏重叠或露缝。现在改用 `top: var(--topbar-h, 67px)` /
-  `height: calc(100vh - var(--topbar-h, 67px))`（桌面与移动端两处），`--topbar-h` 由
-  `initTopbarHeight()` 用 `ResizeObserver` 实测顶栏高度写入，窗口 resize 也重算。
-- **`statusLine(name, value)` 的 value 不转义**：以前由调用方自己 `esc`，是「漏一处就成注入点」
-  的埋雷式 API。现在 `statusLine` 内部转义，需要放标记的地方显式用新增的 `statusLineHtml`
-  ——「要 HTML」成为一个看得见的决定。顺带把 `防白嫖护栏` 那处调用方 `esc` 去掉，避免双重转义。
-- **死代码清理**：`.rubric-row` / `.rubric-row-head` / `.rubric-dot` / `.rubric-key` /
-  `.rubric-desc` 在标记里早已不存在（实际用 `.rubric-item`），连 `rubricDotPulse` 关键帧一起删
-  （选择器组、玻璃层列表、`no-ambient-fx` 列表里的引用同步清掉）。`withBusy` 里恢复文本的条件
-  `if (textContent !== oldText && textContent === '')` 恒假（loading 是 CSS `::after` 画的，
-  没人改 textContent），改成 `if (!btn.textContent)`。
-- **`POST /api/entry` 的 min_favor 只钳 ≥0**：前端钳了上限，直接调 API 可以写入超过
-  `MAX_ABS_SCORE` 的门槛 —— 这种条目**永远不会解锁**。现在 modify 与 `/api/entry/new` 两处都
-  钳到 `helpers["max_abs_score"]()`（实测 9999 → 100），并删掉已被 `max(0,…)` 覆盖的死校验。
-- **`POST /api/heat/reset` 不持锁**：与检索路径的 `_bump_hits` 存在「刚累加的计数被空字典覆盖」
-  的理论竞态。现在 `memory` 侧新增 `_HIT_LOCK`（`RLock`，reset 持锁时会再进 `_save_hit_stats`）
-  与 `reset_hit_stats()`，WebUI 只调这个接口；`_bump_hits` 的读改写也在锁内
-  （实测 8 线程 × 20 条 × 1 次 = 160，一条不丢）。

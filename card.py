@@ -199,21 +199,14 @@ def _find_font_impl(font_path: str = "", font_dir: str = "") -> str | None:
                         if any(k in f.name.lower() for k in _hints):
                             _font_cache, _font_key, _font_checked = str(f), _key, True
                             return _font_cache
-    # 包内兜底字体（Noto Sans SC 子集，OFL 1.1，见 assets/fonts/OFL-LICENSE.txt）。
-    # ⚠️ 必须放在**最后**：系统字体 / 用户自备字体的观感优先，包内字体只在
-    #    「裸环境」（容器无 CJK 字体、数据目录也没放）时救场 —— 把「回退纯文本」
-    #    的失败模式变成「至少能出图」。
-    #    2.3.0 起子集口径扩到 **GB18030 双字节区全量（24954 字符：GB2312 常用+次常用、
-    #    GBK 增补、假名、全角、常用标点）+ 全 ASCII + 插件自身文案**，约 10.8 MB。
-    #    GB18030 之外的字（CJK 扩展 B 及以后）仍走下面的逐字借字回退；想彻底覆盖可把
-    #    完整字体放到插件数据目录 fonts/（检测顺序在包内字体之前）。
-    _bundled = Path(__file__).parent / "assets" / "fonts" / "NotoSansSC-Subset.otf"
-    if _bundled.is_file():
-        # 本项目的 logger 不做 %-参数替换（实测会把 "%s" 原样打出来），统一用 f-string
-        logger.info(f"使用包内兜底字体: {_bundled.name}")
-        _font_cache, _font_key, _font_checked = str(_bundled), _key, True
-        return _font_cache
-    logger.warning("未找到中文字体，好感度排行榜卡片将回退为文本")
+    # 2.3.1 起**不再内置字体**：包内那套 Noto Sans SC 子集（扩到 GB18030 后 10.8 MB）
+    # 让安装包从 1.2 MB 涨到 9.4 MB，而绝大多数 NA 镜像自带中文字体。
+    # 现在只按「配置指定 → 数据目录 fonts/ → 系统 CJK 候选」找；找不到就明确回退文本，
+    # 并把「怎么修」写进日志（而不是往包里塞一个巨大字体）。
+    logger.warning(
+        "未找到中文字体，关系档案/排行榜卡片将回退为文本；"
+        "把任意中文字体（.ttf/.ttc/.otf）放到插件数据目录 fonts/ 即可开启卡片出图",
+    )
     return None
 
 
@@ -392,7 +385,13 @@ _unresolved_chars: set = set()      # 主字体+备选都没字形的字（只�
 
 
 def _char_in_font(path: str, ch: str) -> bool:
-    """该字体是否含这个字的字形（按 (路径, 字) 缓存，字号无关）。"""
+    """该字体是否含这个字的字形（按 (路径, 字) 缓存，字号无关）。
+
+    ⚠️ 不能用 `font.getmask(ch).getbbox()` 判断：带 .notdef 轮廓的字体（pyftsubset 的
+       --notdef-outline 就会生成）对**任何**字都返回非空 mask，判断全部失真 —— 2.3.0 的
+       emoji 不生效正是栽在这里（所有字都被判定「有字形」，于是从不切到 emoji 字体）。
+       改用 FreeType 的字形索引：0 表示这个码点在该字体里没有映射。
+    """
     key = (path, ch)
     hit = _cov_cache.get(key)
     if hit is not None:
@@ -405,15 +404,18 @@ def _char_in_font(path: str, ch: str) -> bool:
         if probe is None:
             probe = ImageFont.truetype(path, 16)
             _fallback_font_cache[(path, 16)] = probe
-        ok = probe.getmask(ch).getbbox() is not None
+        ok = probe.font.get_char_index(ord(ch)) != 0
     except Exception:  # noqa: BLE001
-        ok = False
+        try:
+            ok = probe.getmask(ch).getbbox() is not None  # 兜底（老版本 Pillow）
+        except Exception:  # noqa: BLE001
+            ok = False
     _cov_cache[key] = ok
     return ok
 
 
 def _configure_fallback_fonts(font_dir: str = "") -> list:
-    """收集备选字体路径（数据目录 fonts/ → 系统 CJK 候选目录 → 包内 assets/fonts）。"""
+    """收集备选字体路径（数据目录 fonts/ → 系统 CJK 候选目录）。"""
     global _FALLBACK_FONT_PATHS, _FALLBACK_READY
     if _FALLBACK_READY:
         return _FALLBACK_FONT_PATHS
@@ -423,7 +425,7 @@ def _configure_fallback_fonts(font_dir: str = "") -> list:
     for cand in _FONT_CANDIDATES:
         p = Path(cand)
         roots.append(p if p.is_dir() else p.parent)
-    roots.append(Path(__file__).parent / "assets" / "fonts")
+    # 2.3.1 起包里不带字体，备选链只有数据目录 + 系统目录
     paths, seen = [], set()
     for root in roots:
         try:
@@ -505,22 +507,21 @@ class _EmojiDraw:
         changed = False
         for ch in text:
             f, is_e = font, False
-            if not self._covered(font, ch):
-                # emoji 先判：⚽ 🏀 这类符号在很多 CJK 字体里也有**单色**字形，
-                # 若先走备选字体会把彩色 emoji 变成黑白符号。
-                if ef is not None and _is_emoji_cp(ord(ch)) and self._covered(ef, ch):
-                    f, is_e, changed = ef, True, True
-                else:
-                    alt = _fallback_font_for(font, ch)
-                    if alt is not None:
-                        f, changed = alt, True
-                    elif ch not in _unresolved_chars:
-                        # 所有候选字体都没有这个字形 —— 以前会静默画成空白，无人知晓。
-                        _unresolved_chars.add(ch)
-                        logger.warning(
-                            f"字体缺字形且无备选可用: {ch!r} (U+{ord(ch):04X}) —— "
-                            f"把含该字的完整字体放到插件数据目录 fonts/ 即可修复",
-                        )
+            # emoji 先判，且**不看主字体有没有单色字形**：⚽ 🏀 ✨ 这类符号在 msyh/LXGW/
+            # 本包子集里都有黑白字形，若让主字体先命中，彩色 emoji 就全变成黑白或空白。
+            if ef is not None and _is_emoji_cp(ord(ch)):
+                f, is_e, changed = ef, True, True
+            elif not self._covered(font, ch):
+                alt = _fallback_font_for(font, ch)
+                if alt is not None:
+                    f, changed = alt, True
+                elif ch not in _unresolved_chars:
+                    # 所有候选字体都没有这个字形 —— 以前会静默画成空白，无人知晓。
+                    _unresolved_chars.add(ch)
+                    logger.warning(
+                        f"字体缺字形且无备选可用: {ch!r} (U+{ord(ch):04X}) —— "
+                        f"把含该字的完整字体放到插件数据目录 fonts/ 即可修复",
+                    )
             if cur_font is f and cur_emoji == is_e:
                 buf += ch
             else:
