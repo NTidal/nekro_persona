@@ -72,7 +72,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.2.17",
+    version="2.3.0",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -583,12 +583,444 @@ config = plugin.get_config(FavorabilityConfig)
 store = plugin.store
 STATE_KEY = "favorability_state"
 
+# ── 多账号分支适配（官方 NA 没有这些 API，全部走能力探测）─────────────────
+# NA 2.4.0 的多账号分支（如 NA5）给 plugin_data 加了 account_key 列，并提供
+# `plugin.get_account_store()`；`plugin.store` 在那里的语义是**共享/模板作用域**。
+# 实测（NA5，3 个账号）：只用 plugin.store 时 9 条档案全部落在 account_key=''
+# 的共享行上 —— 任意账号的 WebUI 都能读到别人的频道与档案，写也能跨账号写。
+_ACCOUNT_STORE = None          # 惰性缓存（返回的是「活视图」，不缓存账号本身）
+_ACCOUNT_STORE_PROBED = False
+
+
+def _account_store():
+    """账号作用域 store；官方 NA 没有该 API ⇒ 返回 None（调用方退回 plugin.store）。"""
+    global _ACCOUNT_STORE, _ACCOUNT_STORE_PROBED
+    if _ACCOUNT_STORE_PROBED:
+        return _ACCOUNT_STORE
+    _ACCOUNT_STORE_PROBED = True
+    getter = getattr(plugin, "get_account_store", None)
+    if not callable(getter):
+        return None
+    try:
+        _ACCOUNT_STORE = getter()
+        plugin.logger.info("[persona] 检测到多账号插件 store：关系档案将按账号作用域读写")
+    except Exception as exc:  # noqa: BLE001
+        plugin.logger.debug(f"[persona] get_account_store 不可用（忽略）: {exc}")
+        _ACCOUNT_STORE = None
+    return _ACCOUNT_STORE
+
+
+def _chat_key_account(chat_key: str) -> str:
+    """频道键里编码的账号（NA5 形如 ``<channel_id>@<account>``）；无后缀返回 ""。"""
+    key = str(chat_key or "")
+    try:
+        from nekro_agent.services.account.identity import account_scope_from_channel_id
+
+        return str(account_scope_from_channel_id(key) or "")
+    except Exception:  # noqa: BLE001
+        pass
+    return key.rsplit("@", 1)[1] if "@" in key else ""
+
+
+def _current_account_key() -> str:
+    """当前请求/消息所在的账号键；单账号部署与后台无上下文时返回 ""。"""
+    try:
+        from nekro_agent.services.account.context import get_current_instance_key
+
+        inst = str(get_current_instance_key() or "")
+    except Exception:  # noqa: BLE001
+        inst = ""
+    if inst:
+        # ⚠️ account_key_from_instance(adapter_key, instance_key) 是**两个**参数；
+        #    normalize_account_key(scope) 直接吃 instance_key 形态，用它更稳。
+        try:
+            from nekro_agent.services.account.identity import normalize_account_key
+
+            return str(normalize_account_key(inst) or "")
+        except Exception:  # noqa: BLE001
+            return inst
+    acct = _account_store()
+    if acct is not None:
+        try:
+            return str(getattr(acct, "account_key", "") or "")
+        except Exception:  # noqa: BLE001
+            pass
+    return ""
+
+
+def _archive_scope_ok(chat_key: str) -> bool:
+    """这条档案是否属于当前账号。
+
+    放行条件（任一）：没有账号上下文 / 键里没有 ``@账号`` 后缀 / 后缀 == 当前账号。
+    单账号部署恒为 True；NA5 实测的跨账号读写都会被拦在此处。
+    """
+    acct = _current_account_key()
+    if not acct:
+        return True
+    owner = _chat_key_account(chat_key)
+    return (not owner) or owner == acct
+
+
+async def _store_get(chat_key: str, store_key: str):
+    """读档案：账号作用域优先，共享作用域兜底（历史共享行还能读出来）。"""
+    acct = _account_store()
+    if acct is not None:
+        try:
+            got = await acct.get(chat_key=chat_key, store_key=store_key)
+            if got:
+                return got
+        except Exception as exc:  # noqa: BLE001
+            plugin.logger.debug(f"[存档] 账号 store 读取失败，退回共享: {exc}")
+    return await store.get(chat_key=chat_key, store_key=store_key)
+
+
+def _store_for_write():
+    """写档案：有账号作用域就写账号作用域（account_key 落列），否则共享。"""
+    return _account_store() or store
+
 # 排行榜卡片最多展示行数
 _RANK_LIMIT = 15   # ⚠️ 已废弃：多列布局后不再截断，保留仅为兼容
 _RANK_TARGET_PER_COL = 15   # 每列目标条数（card.py 内同名常量，此处仅供参考）
 
-# 无前缀触发「查看好感度」的指令词表
-_RANK_TRIGGERS = ("查看好感度", "好感度排行", "好感榜")
+# 无前缀触发词表：
+# 「查看好感度」→ **单人印象卡**（默认自己；回复了谁就看谁），与「查看<账号>印象」同一张卡
+_OVERVIEW_BY_SCORE_TRIGGERS = ("查看好感度",)
+# 「好感度总览」等 → 原来的排行榜卡片
+_RANK_TRIGGERS = ("好感度总览", "好感度排行", "好感榜")
+
+# 无前缀触发「印象总览」：只收录**有标签**的档案（2.2.23）
+_IMPRESSION_OVERVIEW_TRIGGERS = ("印象总览", "查看印象总览", "印象一览")
+
+# 无前缀触发「查看<账号>印象」——单人关系档案卡片（2.2.19）
+# 形如「查看198194468印象」。ID 允许 QQ 号、网页 ID、带 @ 的平台前缀。
+#
+# ⚠️ 2.2.20：QQ 里 @ 是**独立消息段**，纯文本里根本没有 ID。实测那两条消息是：
+#     content_text = "查看[@id:198194468;nickname:⚽️🏀🏈⚾️🎾🏐🏉🎱@] 印象"
+#     content_data = [text:"查看", at{target_platform_userid:"198194468"}, text:" 印象"]
+#   旧正则只吃纯文本，于是「查看@某人印象」永远没反应。现在先把消息段拼成一条
+#   「带 at 占位符」的串再匹配，命中占位符就取 target_platform_userid。
+_AT_PLACEHOLDER = "\x00at{}\x00"
+# content_text 里 at 段的渲染形态：[@id:<uid>;nickname:<昵称>@]
+_AT_TEXT_RE = re.compile(r"\[@id:(\d+);nickname:.*?@\]")
+_IMPRESSION_RE = re.compile(
+    r"^查看\s*(?:\x00at(\d+)\x00|([0-9A-Za-z_\-@.:]{1,40}))\s*印象$"
+)
+
+
+def _seg_type(seg: Any) -> str:
+    """消息段类型（兼容 dict 与 pydantic 实例；枚举取 .value）。"""
+    v = seg.get("type") if isinstance(seg, dict) else getattr(seg, "type", "")
+    return str(getattr(v, "value", v) or "").strip().lower()
+
+
+def _seg_field(seg: Any, name: str) -> str:
+    v = seg.get(name) if isinstance(seg, dict) else getattr(seg, name, "")
+    return str(v or "")
+
+
+_IMPRESSION_AT_ONLY_RE = re.compile(r"^查看\s*\x00at(\d+)\x00\s*印象$")
+_IMPRESSION_ANY_RE = re.compile(r"^查看\s*(.*?)\s*印象$")
+# 引用块形态（qqbot_openclaw 的 ref_store.format_for_context 就是这种）：
+#   引用消息开始
+#   <昵称或 openid>: <被引用内容>
+#   引用消息结束
+_REF_BLOCK_RE = re.compile(r"引用消息开始\s*\n\s*([^:\n]{1,60}?):")
+# 引用块整段（回复消息时 content_text 会被它前缀掉，指令在后面）
+_CITED_PREFIX_RE = re.compile(r"^\s*引用消息开始[\s\S]*?引用消息结束\s*")
+
+
+def _drop_leading_placeholders(woven: str, ids: List[str]) -> tuple[str, List[str]]:
+    """去掉**前导**的 @ 占位符与对应 id，并把后面的编号前移。
+
+    群聊里必须先 @ 机器人它才收得到消息，于是正文几乎总是以「@机器人 指令」开头；
+    这个前导 @ 不能算成「目标」——否则 `查看@某人印象` 会被解析成机器人自己。
+    """
+    m = re.match(r"^(?:\x00at(\d+)\x00\s*)+", woven)
+    if not m:
+        return woven, ids
+    head = m.group(0)
+    dropped = len(re.findall(r"\x00at\d+\x00", head))
+    rest = re.sub(
+        r"\x00at(\d+)\x00",
+        lambda mm: _AT_PLACEHOLDER.format(int(mm.group(1)) - dropped)
+        if int(mm.group(1)) >= dropped else "",
+        woven[len(head):],
+    )
+    return rest, ids[dropped:]
+
+
+def _text_variants(txt: str) -> List[str]:
+    """一条 content_text 的几种取用方式：原文 / 去引用块 / 末行 / 去引用块后的末行。
+
+    ⚠️ 回复消息时适配器会把「引用消息开始…引用消息结束」拼在指令前面（qqbot 就是这么做的），
+       只认原文开头 `^查看…` 会全部落空。
+    """
+    txt = str(txt or "")
+    seen: List[str] = []
+
+    def _push(v: str) -> None:
+        v = str(v or "").strip()
+        if v and v not in seen:
+            seen.append(v)
+
+    _push(txt)
+    stripped = _CITED_PREFIX_RE.sub("", txt, count=1)
+    if stripped != txt:
+        _push(stripped)
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+    if len(lines) > 1:
+        _push(lines[-1])
+    slines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    if len(slines) > 1:
+        _push(slines[-1])
+    return seen
+_REF_INLINE_RE = re.compile(r"\[回复\s*@?([^\]\s]{1,60})\]")
+# qqbot_openclaw（QQ 官方机器人）把 @ 直接写进文本：`<@E2B84EBF...>`（Discord 风格）
+_TEXT_MENTION_RE = re.compile(r"<@!?([0-9A-Za-z]{6,64})>")
+# 群聊里必须先 @ 机器人它才收得到消息，于是正文常以「<@机器人openid> 指令」开头 ——
+# 这个前导 @ 要丢掉，否则会被当成目标、也可能顶掉真正的指令匹配。
+_LEADING_MENTION_RE = re.compile(r"^\s*(?:<@!?[0-9A-Za-z]{6,64}>\s*)+")
+
+
+def _weave_text_into(txt: str, ids: List[str]) -> str:
+    """把一段文本里的 @ 形态织成占位符，id **追加进调用方给的 ids**（编号连续）。"""
+    def _swap(m: "re.Match[str]") -> str:
+        ids.append(m.group(1))
+        return _AT_PLACEHOLDER.format(len(ids) - 1)
+
+    woven = _AT_TEXT_RE.sub(_swap, str(txt or ""))
+    return _TEXT_MENTION_RE.sub(_swap, woven)
+
+
+def _weave_text_mentions(txt: str) -> tuple[str, List[str]]:
+    """把文本里的 @ 形态（`[@id:..;nickname:..@]` 与 `<@openid>`）换成占位符。"""
+    ids: List[str] = []
+    return _weave_text_into(txt, ids), ids
+
+
+def _reply_sender(message: ChatMessage) -> str:
+    """消息若是「回复某条消息」，取被回复者（平台 ID 或昵称）。
+
+    ⚠️ QQ 官方机器人（NA5 的 qqbot_openclaw）拿不到 QQ 号，只给 openid；
+       而群里的 @ 也不进消息段。所以「回复 + 查看印象」是最现实的一条路：
+       ext_data.ref_sender_id 有值就用它，否则从 content_text 的引用块里取昵称。
+    """
+    ext = getattr(message, "ext_data", None)
+    if isinstance(ext, dict):
+        for key in ("ref_sender_id", "refer_sender_id", "quote_sender_id", "ref_user_id"):
+            val = str(ext.get(key) or "").strip()
+            if val:
+                return val
+    txt = str(getattr(message, "content_text", "") or "")
+    if txt:
+        m = _REF_BLOCK_RE.search(txt)
+        if m:
+            return m.group(1).strip()
+        m = _REF_INLINE_RE.search(txt)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _impression_request(message: ChatMessage) -> tuple[str, str] | None:
+    """解析「查看<X>印象」，返回 (kind, value)：
+
+    - ("at", uid)      @ 了某个人（onebot v11）
+    - ("token", text)  写了账号或昵称
+    - ("self", "")     什么都没写（`查看印象`）：回复了别人就是别人，否则是自己
+    不是这条指令时返回 None。
+    """
+    at_ids: List[str] = []
+    parts: List[str] = []
+    for seg in (getattr(message, "content_data", None) or []):
+        if _seg_type(seg) == "at":
+            at_ids.append(_seg_field(seg, "target_platform_userid"))
+            parts.append(_AT_PLACEHOLDER.format(len(at_ids) - 1))
+        else:
+            # 文本段里可能就藏着 `<@openid>`（qqbot 的 @ 就是文本形态）
+            parts.append(_weave_text_into(_seg_field(seg, "text"), at_ids))
+    candidates: List[tuple[str, List[str]]] = []
+    if parts:
+        joined, joined_ids = _drop_leading_placeholders("".join(parts).strip(), at_ids)
+        for variant in _text_variants(joined):
+            # ⚠️ 变体（比如「取末行」）可能已经把 @ 所在的那行丢掉：
+            #    这时不能继续带着那份 ids，否则「@机器人（抱住）\n查看印象」会被当成
+            #    「查看<机器人>印象」。只有当变体里真的还有占位符，才带上 ids。
+            use_ids = joined_ids if re.search(r"\x00at\d+\x00", variant) else []
+            candidates.append((variant, use_ids))
+
+    spoken = (getattr(message, "content_text", "") or "").strip()
+    if spoken:
+        for variant in _text_variants(spoken):
+            variant = _LEADING_MENTION_RE.sub("", variant).strip()
+            if not variant:
+                continue
+            woven, seen = _weave_text_mentions(variant)
+            candidates.append((woven.strip(), seen))
+
+    for woven, ids in candidates:
+        if not woven:
+            continue
+        m = _IMPRESSION_AT_ONLY_RE.match(woven)
+        if m:
+            idx = int(m.group(1))
+            if 0 <= idx < len(ids) and ids[idx]:
+                return ("at", ids[idx])
+            continue
+        stripped = re.sub(r"\x00at\d+\x00", "", woven).strip()
+        m2 = _IMPRESSION_ANY_RE.match(stripped)
+        if not m2:
+            continue
+        token = (m2.group(1) or "").strip()
+        uniq = {u for u in ids if u}
+        if not token:
+            if len(uniq) == 1:
+                return ("at", next(iter(uniq)))
+            return ("self", "")
+        if len(uniq) == 1:
+            # 「查看@某人 印象」这类：占位符剥掉后还可能残留 `@`，以 @ 到的人为准
+            if not re.search(r"[0-9A-Za-z_\u4e00-\u9fff]", token):
+                return ("at", next(iter(uniq)))
+        return ("token", token)
+    return None
+
+
+async def _resolve_by_name(chat_key: str, name: str) -> tuple[str | None, str | None]:
+    """按昵称在频道档案里找人：先精确、再包含；多人都算歧义，给候选让人改用 @/回复。"""
+    state = await _open_archive(chat_key)
+    profiles = getattr(state, "profiles", None) or {}
+    if not isinstance(profiles, dict):
+        return None, "这个频道还没有任何档案。"
+    want = str(name or "").strip().lower()
+    if not want:
+        return None, None
+    exact: List[tuple] = []
+    partial: List[tuple] = []
+    for uid, prof in profiles.items():
+        disp = str(getattr(prof, "display_name", "") or "").strip()
+        if not disp:
+            continue
+        low = disp.lower()
+        if low == want:
+            exact.append((str(uid), disp))
+        elif want in low:
+            partial.append((str(uid), disp))
+    for pool in (exact, partial):
+        if len(pool) == 1:
+            return pool[0][0], None
+        if len(pool) > 1:
+            def _short(uid: str) -> str:
+                return uid[-4:] if (uid.isdigit() and len(uid) > 4) else uid[:8]
+
+            names = "、".join(f"{disp}（{_short(uid)}）" for uid, disp in pool[:3])
+            more = f" 等 {len(pool)} 人" if len(pool) > 3 else ""
+            return None, (
+                f"「{name}」匹配到 {len(pool)} 个档案：{names}{more}。"
+                f"请 @ 对方或回复 TA 的消息再发一次。"
+            )
+    return None, f"这个频道里没有昵称含「{name}」的档案。想看看都有谁，可以发「查看好感度」。"
+
+
+async def _resolve_impression_target(
+    message: ChatMessage, kind: str, value: str,
+) -> tuple[str | None, str | None]:
+    """把 (kind, value) 解析成具体账号；失败时第二项是给用户看的提示。"""
+    chat_key = message.chat_key
+
+    async def _id_or_name(token: str) -> tuple[str | None, str | None]:
+        if await _find_profile_entry(chat_key, token) is not None:
+            return token, None
+        return await _resolve_by_name(chat_key, token)
+
+    if kind == "at":
+        if value:
+            return value, None
+        return None, "没能从 @ 里取到账号，请改用「回复 TA 的消息 + 查看印象」。"
+
+    if kind == "token":
+        return await _id_or_name(value)
+
+    # kind == "self"：回复了别人就是别人，否则是自己
+    ref = _reply_sender(message)
+    if ref:
+        uid, hint = await _id_or_name(ref)
+        if uid or hint:
+            return uid, hint
+    who = str(getattr(message, "platform_userid", "") or getattr(message, "sender_id", "") or "").strip()
+    if who and who != "-1":
+        if await _find_profile_entry(chat_key, who) is not None:
+            return who, None
+        return None, "你在这个频道还没有关系档案。想看看都有谁，可以发「查看好感度」。"
+    return None, "没认出你是谁（平台没给用户 ID）。请 @ 对方或回复 TA 的消息再发一次。"
+
+
+def _match_impression(woven: str, at_ids: List[str]) -> str | None:
+    """在「已织入 at 占位符」的文本上匹配指令，返回目标账号。"""
+    m = _IMPRESSION_RE.match(str(woven or "").strip())
+    if not m:
+        return None
+    if m.group(1) is not None:
+        idx = int(m.group(1))
+        return (at_ids[idx] or None) if 0 <= idx < len(at_ids) else None
+    gid = m.group(2)
+    # 纯标点不算账号：`查看@@印象` 里的 `@@` 会落进第二分支，别把它当成 ID 发出去
+    return gid if gid and re.search(r"[0-9A-Za-z]", gid) else None
+
+
+def _match_impression_loose(woven: str, at_ids: List[str]) -> str | None:
+    """多个 @ 混排时的兜底：剥掉全部占位符后仍是「查看 印象」，且只提到一个人，就用他。
+
+    「查看@A@A印象」这种重复 @ 是常见误操作；两个人以上则视为歧义，返回 None
+    （宁可让模型正常回一句，也不要猜错人把别人的档案发到群里）。
+    """
+    stripped = re.sub(r"\x00at\d+\x00", "", str(woven or "")).strip()
+    if re.match(r"^查看\s*印象$", stripped):
+        uniq = {u for u in at_ids if u}
+        if len(uniq) == 1:
+            return next(iter(uniq))
+    return None
+
+
+def _message_impression_target(message: ChatMessage) -> str | None:
+    """从一条消息里解析「查看<账号>印象」的目标账号；不是这条指令就返回 None。
+
+    三条取数路径（按可靠性排序）：
+      1. content_data 逐段拼接，at 段换成占位符 —— QQ 群里的正常形态；
+      2. content_text 里 `[@id:xxx;nickname:yyy@]` 形态（部分链路只给文本）；
+      3. content_text 里的裸账号（`查看198194468印象`、WebUI/网页会话）。
+    """
+    segs = getattr(message, "content_data", None) or []
+    at_ids: List[str] = []
+    parts: List[str] = []
+    for seg in segs:
+        if _seg_type(seg) == "at":
+            at_ids.append(_seg_field(seg, "target_platform_userid"))
+            parts.append(_AT_PLACEHOLDER.format(len(at_ids) - 1))
+        else:
+            parts.append(_seg_field(seg, "text"))
+    if parts:
+        woven_seg = "".join(parts)
+        hit = _match_impression(woven_seg, at_ids) or _match_impression_loose(woven_seg, at_ids)
+        if hit:
+            return hit
+
+    spoken = (getattr(message, "content_text", "") or "").strip()
+    if not spoken:
+        return None
+    if _AT_TEXT_RE.search(spoken):
+        ids_txt = [m.group(1) for m in _AT_TEXT_RE.finditer(spoken)]
+        seen: List[str] = []
+
+        def _swap(m: "re.Match[str]") -> str:
+            uid = m.group(1)
+            seen.append(uid)
+            return _AT_PLACEHOLDER.format(len(seen) - 1)
+
+        woven = _AT_TEXT_RE.sub(_swap, spoken)
+        hit = _match_impression(woven, seen or ids_txt) or _match_impression_loose(woven, seen or ids_txt)
+        if hit:
+            return hit
+    return _match_impression(spoken, [])
 
 from . import card  # noqa: E402  # 依赖上方 plugin/config 完成初始化后再导入渲染模块
 from . import memory as persona_memory  # noqa: E402  # 阶梯记忆与好感度门控
@@ -1687,7 +2119,12 @@ _CORRUPT_BACKED: Dict[str, str] = {}
 
 async def _open_archive(chat_key: str) -> ChannelArchive:
     """读频道档案。解析失败时告警并返回空档案，不让一轮对话因此崩掉。"""
-    blob = await store.get(chat_key=chat_key, store_key=STATE_KEY)
+    if not _archive_scope_ok(chat_key):
+        plugin.logger.warning(
+            f"[存档] 跨账号读取已拦截：当前账号 {_current_account_key()!r} 读取 "
+            f"{_chat_key_account(chat_key)!r} 的档案（{chat_key}）")
+        return ChannelArchive()
+    blob = await _store_get(chat_key, STATE_KEY)
     if not blob:
         return ChannelArchive()
     try:
@@ -1703,7 +2140,7 @@ async def _open_archive(chat_key: str) -> ChannelArchive:
         else:
             bak_key = f"{STATE_KEY}.corrupt_{int(_ts_now())}"
             try:
-                await store.set(chat_key=chat_key, store_key=bak_key, value=blob)
+                await _store_for_write().set(chat_key=chat_key, store_key=bak_key, value=blob)
                 _CORRUPT_BACKED[chat_key] = digest
                 where = f"已备份到 store_key={bak_key}"
             except Exception as bexc:  # noqa: BLE001
@@ -1716,8 +2153,13 @@ async def _open_archive(chat_key: str) -> ChannelArchive:
 
 async def _store_archive(chat_key: str, state: ChannelArchive) -> None:
     """写回频道档案。"""
-    await store.set(chat_key=chat_key, store_key=STATE_KEY,
-                    value=json.dumps(state.to_raw(), ensure_ascii=False))
+    if not _archive_scope_ok(chat_key):
+        plugin.logger.warning(
+            f"[存档] 跨账号写入已拦截：当前账号 {_current_account_key()!r} 试图写 "
+            f"{_chat_key_account(chat_key)!r} 的档案（{chat_key}）")
+        return
+    await _store_for_write().set(chat_key=chat_key, store_key=STATE_KEY,
+                                 value=json.dumps(state.to_raw(), ensure_ascii=False))
     # 为阶段 C 的生长包导出铺路：把见过的频道去重记入自维护索引
     # （PluginStore 不能枚举 chat_key）。best-effort，失败绝不影响本次写档。
     try:
@@ -2294,6 +2736,177 @@ async def _send_via_adapter(chat_key: str, png: bytes | None, text: str) -> None
     await adapter.forward_message(PlatformSendRequest(chat_key=chat_key, segments=segments))
 
 
+def _overview_profiles(state: ChannelArchive) -> List[UserArchive]:
+    """印象总览的收录规则：**必须有标签**；按好感度降序，同分看最近更新。"""
+    picked = [p for p in state.profiles.values() if list(getattr(p, "tags", None) or [])]
+    return sorted(picked, key=lambda p: (p.score, p.updated_at), reverse=True)
+
+
+async def _render_impression_overview_card(entries: List[dict], max_abs: int) -> bytes | None:
+    """渲染印象总览卡片；不可用返回 None。"""
+    try:
+        return await asyncio.to_thread(
+            card.render_impression_overview,
+            entries,
+            max_abs,
+            limit=0,
+            font_path=str(getattr(config, "RANK_CARD_FONT", "") or ""),
+            font_dir=str(plugin.get_plugin_data_dir() / "fonts"),
+            avatar_dir=str(plugin.get_plugin_data_dir() / "avatars"),
+            scale=_rank_card_scale(),
+        )
+    except Exception:  # noqa: BLE001
+        plugin.logger.exception("印象总览卡片渲染失败，回退为文本")
+        return None
+
+
+def _render_impression_overview_text(entries: List[dict], total: int) -> str:
+    """文本兜底：标签 + 完整印象（不走卡片时也不能丢信息）。"""
+    lines = [f"【印象总览】共 {total} 人（有标签）："]
+    for i, entry in enumerate(entries, 1):
+        tags = "、".join(str(t) for t in (entry.get("tags") or []))
+        summ = str(entry.get("summary") or "").strip() or "（暂无稳定印象）"
+        lines.append(
+            f"{i}. {entry.get('display_name') or entry.get('user_id')} | "
+            f"{_delta_text(_as_int_local(entry.get('score'), 0))} | {entry.get('stage') or '—'} | "
+            f"标签：{tags} | 印象：{summ}",
+        )
+    return "\n".join(lines)
+
+
+async def _handle_impression_overview(_ctx: schemas.AgentCtx, message: ChatMessage) -> MsgSignal | None:
+    """「印象总览」：把本频道所有**有标签**的档案铺成一张卡片。"""
+    try:
+        state = await _open_archive(message.chat_key)
+        picked = _overview_profiles(state)
+        if not picked:
+            tip = (
+                "这个频道还没有带标签的关系档案。标签会在互动里自动积累，稍后再试试。"
+                if state.profiles
+                else "当前会话还没有建立任何好感度档案。"
+            )
+            await _send_plain_text(_ctx, message.chat_key, tip)
+            return MsgSignal.BLOCK_TRIGGER
+        max_abs = _score_cap()
+        entries = [_profile_to_entry(p) for p in picked]
+        png = await _render_impression_overview_card(entries, max_abs)
+        if getattr(_ctx, "adapter_key", "") == "onebot_v11":
+            bot = await _ctx.get_onebot_v11_bot()
+            if png is not None:
+                await _send_chat_image(bot, message.chat_key, png)
+            else:
+                await _send_chat_text(bot, message.chat_key,
+                                      _render_impression_overview_text(entries, len(entries)))
+        else:
+            await _send_via_adapter(
+                message.chat_key, png,
+                "" if png is not None else _render_impression_overview_text(entries, len(entries)),
+            )
+        return MsgSignal.BLOCK_TRIGGER
+    except Exception:  # noqa: BLE001
+        plugin.logger.exception("印象总览发送失败（已放行给模型）")
+        return None
+
+
+async def _render_profile_card_bytes(entry: dict, max_abs: int) -> bytes | None:
+    """渲染单人关系档案卡片；不可用返回 None（调用方回退文本）。"""
+    try:
+        return await asyncio.to_thread(
+            card.render_profile_card,
+            entry,
+            max_abs,
+            font_path=str(getattr(config, "RANK_CARD_FONT", "") or ""),
+            font_dir=str(plugin.get_plugin_data_dir() / "fonts"),
+            avatar_dir=str(plugin.get_plugin_data_dir() / "avatars"),
+            scale=_rank_card_scale(),
+        )
+    except Exception:  # noqa: BLE001
+        plugin.logger.exception("关系档案卡片渲染失败，回退为文本")
+        return None
+
+
+def _render_profile_text(entry: dict, max_abs: int) -> str:
+    """卡片不可用时的文本兜底（稳定印象照样给全，不做截断）。"""
+    score = _as_int_local(entry.get("score"), 0)
+    lines = [
+        f"【关系档案】{entry.get('display_name') or entry.get('user_id') or '未知'}",
+        f"ID：{entry.get('user_id') or '—'}",
+        f"好感度：{_delta_text(score)}/{max_abs}（{entry.get('stage') or '—'}）",
+    ]
+    tags = [str(t) for t in (entry.get("tags") or []) if str(t).strip()]
+    if tags:
+        lines.append("标签：" + "、".join(tags))
+    summ = str(entry.get("summary") or "").strip()
+    lines.append("稳定印象：" + (summ if summ else "（暂无）"))
+    return "\n".join(lines)
+
+
+def _as_int_local(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+async def _find_profile_entry(chat_key: str, uid: str) -> dict | None:
+    """取某用户的档案摘要；**找不到就返回 None**（绝不 profile_for 现建一份）。"""
+    state = await _open_archive(chat_key)
+    profiles = getattr(state, "profiles", None) or {}
+    if not isinstance(profiles, dict):
+        return None
+    target = str(uid).strip()
+    prof = profiles.get(target)
+    if prof is None:
+        _low = target.lower()
+        for key, cand in profiles.items():
+            if str(key).strip().lower() == _low:
+                prof = cand
+                break
+    return _profile_to_entry(prof) if prof is not None else None
+
+
+async def _send_profile_card(_ctx, chat_key: str, entry: dict, max_abs: int) -> None:
+    """发档案卡片：图优先，渲染失败回文本。"""
+    png = await _render_profile_card_bytes(entry, max_abs)
+    is_onebot = getattr(_ctx, "adapter_key", "") == "onebot_v11"
+    if is_onebot:
+        bot = await _ctx.get_onebot_v11_bot()
+        if png is not None:
+            await _send_chat_image(bot, chat_key, png)
+        else:
+            await _send_chat_text(bot, chat_key, _render_profile_text(entry, max_abs))
+    else:
+        await _send_via_adapter(
+            chat_key, png, "" if png is not None else _render_profile_text(entry, max_abs),
+        )
+
+
+async def _send_plain_text(_ctx, chat_key: str, text: str) -> None:
+    """发一段纯文本（onebot 走 bot，其它适配器走 adapter 发送）。"""
+    if getattr(_ctx, "adapter_key", "") == "onebot_v11":
+        bot = await _ctx.get_onebot_v11_bot()
+        await _send_chat_text(bot, chat_key, text)
+    else:
+        await _send_via_adapter(chat_key, None, text)
+
+
+async def _handle_impression_trigger(
+    _ctx: schemas.AgentCtx, message: ChatMessage, uid: str,
+) -> MsgSignal | None:
+    """「查看<账号>印象」：只渲染这一个用户，不排名。"""
+    try:
+        entry = await _find_profile_entry(message.chat_key, uid)
+        if entry is None:
+            tip = f"当前频道没有 {uid} 的关系档案。想看看都有谁，可以发「查看好感度」。"
+            await _send_plain_text(_ctx, message.chat_key, tip)
+            return MsgSignal.BLOCK_TRIGGER
+        await _send_profile_card(_ctx, message.chat_key, entry, _score_cap())
+        return MsgSignal.BLOCK_TRIGGER
+    except Exception:  # noqa: BLE001
+        plugin.logger.exception("「查看…印象」卡片发送失败（已放行给模型）")
+        return None
+
+
 async def _handle_rank_trigger(_ctx: schemas.AgentCtx, message: ChatMessage) -> MsgSignal | None:
     """无前缀触发「查看好感度」：优先发排行榜图片，失败回退文本。
 
@@ -2355,8 +2968,26 @@ async def _handle_rank_trigger(_ctx: schemas.AgentCtx, message: ChatMessage) -> 
 async def sync_user_profile(_ctx: schemas.AgentCtx, message: ChatMessage):
     """在用户消息进入时同步当前用户档案；同时支持无前缀「查看好感度」指令。"""
     spoken = (getattr(message, "content_text", "") or "").strip()
+    if spoken in _OVERVIEW_BY_SCORE_TRIGGERS:
+        # 2.2.31：查看好感度 = **单人印象卡**（默认看自己；回复了别人就看对方）
+        _self_uid, _self_hint = await _resolve_impression_target(message, "self", "")
+        if _self_hint:
+            await _send_plain_text(_ctx, message.chat_key, _self_hint)
+            return MsgSignal.BLOCK_TRIGGER
+        if _self_uid:
+            return await _handle_impression_trigger(_ctx, message, _self_uid)
     if spoken in _RANK_TRIGGERS:
         return await _handle_rank_trigger(_ctx, message)
+    if spoken in _IMPRESSION_OVERVIEW_TRIGGERS:
+        return await _handle_impression_overview(_ctx, message)
+    _imp = _impression_request(message)
+    if _imp:
+        _imp_uid, _imp_hint = await _resolve_impression_target(message, _imp[0], _imp[1])
+        if _imp_hint:
+            await _send_plain_text(_ctx, message.chat_key, _imp_hint)
+            return MsgSignal.BLOCK_TRIGGER
+        if _imp_uid:
+            return await _handle_impression_trigger(_ctx, message, _imp_uid)
 
     # 平台 ID 优先，其次兜底用 sender_id；机器人自己的消息（-1）不建档
     who = (message.platform_userid or message.sender_id or "").strip()
@@ -3409,7 +4040,7 @@ async def favor_status_cmd(
 @plugin.mount_command(
     name="favor_rank",
     description="查看当前会话的好感度排行榜（按分值从高到低渲染为图片）",
-    aliases=["查看好感度", "好感度排行", "好感榜"],
+    aliases=["好感度排行", "好感榜", "好感度总览"],
     permission=CommandPermission.USER,
     usage="favor_rank",
     category="关系管理",
@@ -3441,6 +4072,100 @@ async def favor_rank_cmd(context: CommandExecutionContext) -> CommandResponse:
             CommandOutputSegment(
                 type=CommandOutputSegmentType.TEXT,
                 text=f"当前会话好感度排行榜（共 {total} 位）：",
+            ),
+            CommandOutputSegment(
+                type=CommandOutputSegmentType.IMAGE,
+                file_path=str(file_path),
+            ),
+        ]
+    )
+
+
+@plugin.mount_command(
+    name="favor_impression_overview",
+    description="把本频道所有带标签的关系档案渲染成一张印象总览卡片",
+    aliases=["印象总览", "印象一览", "查看印象总览"],
+    permission=CommandPermission.USER,
+    usage="印象总览",
+    category="关系管理",
+)
+async def favor_impression_overview_cmd(context: CommandExecutionContext) -> CommandResponse:
+    state = await _open_archive(context.chat_key)
+    picked = _overview_profiles(state)
+    if not picked:
+        return CmdCtl.failed(
+            "这个频道还没有带标签的关系档案。"
+            if state.profiles
+            else "当前会话还没有建立任何好感度档案。",
+        )
+    max_abs = _score_cap()
+    entries = [_profile_to_entry(p) for p in picked]
+    png = await _render_impression_overview_card(entries, max_abs)
+    if png is None:
+        return CmdCtl.success(_render_impression_overview_text(entries, len(entries)))
+    out_dir = plugin.get_plugin_data_dir() / "impression_overviews"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in context.chat_key)[:60]
+    file_path = out_dir / f"overview_{safe}_{int(time.time() * 1000)}.png"
+    file_path.write_bytes(png)
+    return CmdCtl.success(
+        [
+            CommandOutputSegment(
+                type=CommandOutputSegmentType.TEXT,
+                text=f"印象总览（{len(entries)} 位有标签）：",
+            ),
+            CommandOutputSegment(
+                type=CommandOutputSegmentType.IMAGE,
+                file_path=str(file_path),
+            ),
+        ]
+    )
+
+
+@plugin.mount_command(
+    name="favor_impression",
+    description="查看某个用户在本频道的关系档案卡片（含完整稳定印象，不排名）",
+    aliases=["查看印象", "印象卡片", "查看好感度"],
+    permission=CommandPermission.USER,
+    usage="查看印象 <账号>",
+    category="关系管理",
+)
+async def favor_impression_cmd(
+    context: CommandExecutionContext,
+    target_user_id: Annotated[
+        str, Arg("目标用户的平台 ID 或昵称；留空则看你自己", positional=True),
+    ] = "",
+) -> CommandResponse:
+    token = str(target_user_id or "").strip()
+    if not token:
+        # 留空 = 看自己（QQ 官方机器人拿不到 QQ 号，用户没法自报 ID）
+        uid = str(context.user_id or "").strip()
+        if not uid:
+            return CmdCtl.failed("没拿到你的平台 ID，请改用「查看印象 <昵称>」。")
+    else:
+        uid = token
+        if await _find_profile_entry(context.chat_key, token) is None:
+            resolved, hint = await _resolve_by_name(context.chat_key, token)
+            if hint:
+                return CmdCtl.failed(hint)
+            uid = resolved or token
+    entry = await _find_profile_entry(context.chat_key, uid)
+    if entry is None:
+        return CmdCtl.failed(f"当前频道没有 {uid} 的关系档案。")
+    max_abs = _score_cap()
+    png = await _render_profile_card_bytes(entry, max_abs)
+    if png is None:
+        return CmdCtl.success(_render_profile_text(entry, max_abs))
+    out_dir = plugin.get_plugin_data_dir() / "profile_cards"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in context.chat_key)[:60]
+    file_path = out_dir / f"profile_{safe}_{int(time.time() * 1000)}.png"
+    file_path.write_bytes(png)
+    return CmdCtl.success(
+        [
+            CommandOutputSegment(
+                type=CommandOutputSegmentType.TEXT,
+                text=f"{entry.get('display_name') or uid} 的关系档案：",
             ),
             CommandOutputSegment(
                 type=CommandOutputSegmentType.IMAGE,
@@ -3612,6 +4337,9 @@ def _persona_webui_router():
             "favor_scale_presets": FAVOR_SCALE_PRESETS,
             "favor_scale": favor_scale,
             "load_state": _open_archive,
+            # 多账号分支：WebUI 按账号过滤索引；官方 NA 恒返回 "" / 恒放行
+            "account_key": _current_account_key,
+            "chat_key_account": _chat_key_account,
             "save_state": _store_archive,
             # per-chat 读写锁：WebUI 的读-改-写必须和消息处理/衰减循环共用同一把锁，
             # 否则并发时 last-writer-wins 会把分数丢掉（锁本身的注释里就写了这个场景）。

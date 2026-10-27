@@ -23,7 +23,7 @@ import time
 import urllib.request
 import site
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Dict, List
 
 from nekro_agent.api.plugin import dynamic_import_pkg
 from nekro_agent.core.logger import get_sub_logger
@@ -202,9 +202,11 @@ def _find_font_impl(font_path: str = "", font_dir: str = "") -> str | None:
     # 包内兜底字体（Noto Sans SC 子集，OFL 1.1，见 assets/fonts/OFL-LICENSE.txt）。
     # ⚠️ 必须放在**最后**：系统字体 / 用户自备字体的观感优先，包内字体只在
     #    「裸环境」（容器无 CJK 字体、数据目录也没放）时救场 —— 把「回退纯文本」
-    #    的失败模式变成「至少能出图」。子集按 GB2312 一级常用字（3755）+ 全 ASCII
-    #    + 卡片固定文案裁剪：昵称里的二级生僻字会显示为方块，可自行放完整字体到
-    #    插件数据目录 fonts/ 覆盖（检测顺序在包内字体之前）。
+    #    的失败模式变成「至少能出图」。
+    #    2.3.0 起子集口径扩到 **GB18030 双字节区全量（24954 字符：GB2312 常用+次常用、
+    #    GBK 增补、假名、全角、常用标点）+ 全 ASCII + 插件自身文案**，约 10.8 MB。
+    #    GB18030 之外的字（CJK 扩展 B 及以后）仍走下面的逐字借字回退；想彻底覆盖可把
+    #    完整字体放到插件数据目录 fonts/（检测顺序在包内字体之前）。
     _bundled = Path(__file__).parent / "assets" / "fonts" / "NotoSansSC-Subset.otf"
     if _bundled.is_file():
         # 本项目的 logger 不做 %-参数替换（实测会把 "%s" 原样打出来），统一用 f-string
@@ -375,65 +377,191 @@ def _emoji_font_for(font: Any) -> Any | None:
     return _emoji_font_cache[key]
 
 
+# ============ 缺字回退（按字借字体）============
+# 场景：包里自带的是 NotoSansSC **子集**（2.3.0 起已扩到 GB18030 双字节区全量）。
+# 2.2.32 之前它只有 GB2312 一级 3755 字，昵称里的二级字（娅 / 傩 / 喵 / 來 / ー …）
+# 没有字形、PIL 直接画空白，于是「辰光归娅」印成「辰光归」——用户看到的就是
+# 「有些字没渲染出来」。GB18030 之外的生僻字仍靠这里的逐字借字兜底。
+# 这里做逐字回退：主字体缺哪个字，就从备选字体（数据目录 fonts/、系统 CJK 字体、
+# 包内子集）里找有这个字的来画；emoji 仍走彩色 emoji 字体。
+_FALLBACK_FONT_PATHS: list = []
+_FALLBACK_READY = False
+_fallback_font_cache: dict = {}     # (path, size) -> font
+_cov_cache: dict = {}               # (path, ch) -> bool
+_unresolved_chars: set = set()      # 主字体+备选都没字形的字（只警告一次/字）
+
+
+def _char_in_font(path: str, ch: str) -> bool:
+    """该字体是否含这个字的字形（按 (路径, 字) 缓存，字号无关）。"""
+    key = (path, ch)
+    hit = _cov_cache.get(key)
+    if hit is not None:
+        return hit
+    ok = False
+    try:
+        from PIL import ImageFont
+
+        probe = _fallback_font_cache.get((path, 16))
+        if probe is None:
+            probe = ImageFont.truetype(path, 16)
+            _fallback_font_cache[(path, 16)] = probe
+        ok = probe.getmask(ch).getbbox() is not None
+    except Exception:  # noqa: BLE001
+        ok = False
+    _cov_cache[key] = ok
+    return ok
+
+
+def _configure_fallback_fonts(font_dir: str = "") -> list:
+    """收集备选字体路径（数据目录 fonts/ → 系统 CJK 候选目录 → 包内 assets/fonts）。"""
+    global _FALLBACK_FONT_PATHS, _FALLBACK_READY
+    if _FALLBACK_READY:
+        return _FALLBACK_FONT_PATHS
+    roots = []
+    if font_dir.strip():
+        roots.append(Path(font_dir))
+    for cand in _FONT_CANDIDATES:
+        p = Path(cand)
+        roots.append(p if p.is_dir() else p.parent)
+    roots.append(Path(__file__).parent / "assets" / "fonts")
+    paths, seen = [], set()
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            for ext in ("*.ttf", "*.ttc", "*.otf"):
+                for f in sorted(root.rglob(ext)):
+                    sp = str(f)
+                    if sp not in seen:
+                        seen.add(sp)
+                        paths.append(sp)
+        except Exception:  # noqa: BLE001
+            continue
+    _FALLBACK_FONT_PATHS = paths
+    _FALLBACK_READY = True
+    return paths
+
+
+def _fallback_font_for(font: Any, ch: str) -> Any | None:
+    """给某个字找个有字形的字体实例（与主字体同字号）；找不到返回 None。"""
+    size = getattr(font, "size", None)
+    if not size:
+        return None
+    primary = getattr(font, "path", None)
+    for path in _FALLBACK_FONT_PATHS:
+        if path == primary or not _char_in_font(path, ch):
+            continue
+        key = (path, int(size))
+        f = _fallback_font_cache.get(key)
+        if f is None:
+            try:
+                from PIL import ImageFont
+
+                f = ImageFont.truetype(path, int(size))
+            except Exception:  # noqa: BLE001
+                f = None
+            _fallback_font_cache[key] = f
+        if f is not None:
+            return f
+    return None
+
+
 # 渲染倍率：卡片按逻辑尺寸（680 宽设计稿）布局，再以此倍率超采样渲染输出。
 # 2.0 = Retina 级清晰度；调大更清晰但图片更大（3.0 时约 2.25 倍像素量）。
 _RENDER_SCALE = 1.5   # 超采样倍率（扩展：2.0→1.5，文件约降 40%；可被配置覆盖）
 
 
 class _EmojiDraw:
-    """包装 ImageDraw：text/textlength/textbbox 自动分段处理 emoji，其余方法透传。"""
+    """包装 ImageDraw：text/textlength/textbbox 自动按**字体覆盖**切段。
+
+    · emoji 段 → 彩色 emoji 字体（embedded_color 上色）
+    · 主字体缺字形的字 → 备选字体（逐字借字，解决子集字体印不出二级字）
+    · 其余 → 主字体
+    其余方法透传。
+    """
 
     def __init__(self, draw: Any, font_dir: str = ""):
         self._draw = draw
-        _find_emoji_font(font_dir)
+        self._font_dir = font_dir or ""
+        _find_emoji_font(self._font_dir)
+        _configure_fallback_fonts(self._font_dir)
 
-    def _emoji(self, text: Any, font: Any):
+    @staticmethod
+    def _covered(font: Any, ch: str) -> bool:
+        path = getattr(font, "path", None)
+        if not path:
+            return True
+        return _char_in_font(str(path), ch)
+
+    def _runs(self, text: Any, font: Any):
+        """切成 [(片段, 字体, 是否emoji)]；整段都用主字体时返回 None（走快路径）。"""
         if font is None or not isinstance(text, str) or not text:
             return None
-        return _emoji_font_for(font)
+        ef = _emoji_font_for(font)
+        out: list = []
+        buf = ""
+        cur_font = None
+        cur_emoji = False
+        changed = False
+        for ch in text:
+            f, is_e = font, False
+            if not self._covered(font, ch):
+                # emoji 先判：⚽ 🏀 这类符号在很多 CJK 字体里也有**单色**字形，
+                # 若先走备选字体会把彩色 emoji 变成黑白符号。
+                if ef is not None and _is_emoji_cp(ord(ch)) and self._covered(ef, ch):
+                    f, is_e, changed = ef, True, True
+                else:
+                    alt = _fallback_font_for(font, ch)
+                    if alt is not None:
+                        f, changed = alt, True
+                    elif ch not in _unresolved_chars:
+                        # 所有候选字体都没有这个字形 —— 以前会静默画成空白，无人知晓。
+                        _unresolved_chars.add(ch)
+                        logger.warning(
+                            f"字体缺字形且无备选可用: {ch!r} (U+{ord(ch):04X}) —— "
+                            f"把含该字的完整字体放到插件数据目录 fonts/ 即可修复",
+                        )
+            if cur_font is f and cur_emoji == is_e:
+                buf += ch
+            else:
+                if buf:
+                    out.append((buf, cur_font, cur_emoji))
+                buf, cur_font, cur_emoji = ch, f, is_e
+        if buf:
+            out.append((buf, cur_font, cur_emoji))
+        return out if changed else None
 
     def text(self, xy, text, fill=None, font=None, **kwargs):
-        ef = self._emoji(text, font)
-        runs = _split_emoji_runs(text) if ef else None
-        if not runs or not any(is_e for _s, is_e in runs):
+        runs = self._runs(text, font)
+        if not runs:
             return self._draw.text(xy, text, fill=fill, font=font, **kwargs)
         x = xy[0]
-        for seg, is_e in runs:
-            if is_e:
-                if _emoji_font_color:
-                    self._draw.text((x, xy[1]), seg, font=ef,
-                                    embedded_color=True, **kwargs)
-                else:
-                    # 单色 emoji 字体：embedded_color 无效（部分 Pillow 直接报错），
-                    # 退回用普通填充色绘制，至少字形可见。
-                    self._draw.text((x, xy[1]), seg, font=ef,
-                                    fill=fill, **kwargs)
-                x += self._draw.textlength(seg, font=ef)
+        for seg, f, is_e in runs:
+            if is_e and _emoji_font_color:
+                self._draw.text((x, xy[1]), seg, font=f, embedded_color=True, **kwargs)
             else:
-                self._draw.text((x, xy[1]), seg, fill=fill, font=font, **kwargs)
-                x += self._draw.textlength(seg, font=font)
+                self._draw.text((x, xy[1]), seg, fill=fill, font=f, **kwargs)
+            x += self._draw.textlength(seg, font=f)
         return None
 
     def textlength(self, text, font=None, **kwargs):
-        ef = self._emoji(text, font)
-        runs = _split_emoji_runs(text) if ef else None
-        if not runs or not any(is_e for _s, is_e in runs):
+        runs = self._runs(text, font)
+        if not runs:
             return self._draw.textlength(text, font=font, **kwargs)
-        return sum(
-            self._draw.textlength(seg, font=ef if is_e else font, **kwargs) for seg, is_e in runs
-        )
+        return sum(self._draw.textlength(seg, font=f, **kwargs) for seg, f, _e in runs)
 
     def textbbox(self, xy, text, font=None, **kwargs):
-        ef = self._emoji(text, font)
-        runs = _split_emoji_runs(text) if ef else None
-        if not runs or not any(is_e for _s, is_e in runs):
+        runs = self._runs(text, font)
+        if not runs:
             return self._draw.textbbox(xy, text, font=font, **kwargs)
         box = None
         x = xy[0]
-        for seg, is_e in runs:
-            f = ef if is_e else font
+        for seg, f, _e in runs:
             bb = self._draw.textbbox((x, xy[1]), seg, font=f, **kwargs)
-            box = bb if box is None else (min(box[0], bb[0]), min(box[1], bb[1]), max(box[2], bb[2]), max(box[3], bb[3]))
+            box = bb if box is None else (
+                min(box[0], bb[0]), min(box[1], bb[1]),
+                max(box[2], bb[2]), max(box[3], bb[3]),
+            )
             x += self._draw.textlength(seg, font=f)
         return box
 
@@ -541,10 +669,11 @@ def _make_draw(img: Any, image_draw_mod: Any, font_dir: str = "", scale: float =
     """
     draw = image_draw_mod.Draw(img)
     try:
-        if _find_emoji_font(font_dir):
-            draw = _EmojiDraw(draw, font_dir)
+        # ⚠️ 必须**无条件**包装：以前只有找到 emoji 字体才包，于是「裸机上没有 emoji 字体」
+        #    连缺字回退也一起失效（两件事被绑在一起了）。
+        draw = _EmojiDraw(draw, font_dir)
     except Exception:  # noqa: BLE001
-        logger.debug("emoji 包装失败，回退原生 draw", exc_info=True)
+        logger.debug("draw 包装失败，回退原生 draw", exc_info=True)
     if scale and scale != 1:
         try:
             from PIL import ImageFont
@@ -1310,6 +1439,768 @@ def _render_favorability_rank_impl(
     # 玻璃边缘（描边 + 顶部高光）最后统一合成：返回新图像，之后不再绘制
     img = _glass_edges(PIL, img, _edge_panels, scale=S)
 
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# ==================== 单人关系档案卡片（2.2.19） ====================
+
+
+def _wrap_text(draw: Any, text: str, font: Any, max_w: float) -> List[str]:
+    """按像素宽度折行：保留原有换行；ASCII 连续串整体不拆，CJK 逐字。
+
+    排行榜的行内「印象记录」只能截断成一句话，这条路径要把**完整**文本铺开，
+    所以必须真的按宽度折行（不能靠 truncate）。
+    """
+    out: List[str] = []
+    for para in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not para.strip():
+            out.append("")
+            continue
+        buf = ""
+        i, n = 0, len(para)
+        while i < n:
+            ch = para[i]
+            ascii_word = ch.isascii() and (ch.isalnum() or ch in "_-@./:%+")
+            if ascii_word:
+                j = i
+                while j < n and para[j].isascii() and (para[j].isalnum() or para[j] in "_-@./:%+"):
+                    j += 1
+                token = para[i:j]
+            else:
+                token, j = ch, i + 1
+            if buf and draw.textlength(buf + token, font=font) > max_w:
+                out.append(buf)
+                buf = token if token.strip() else token.lstrip()
+            else:
+                buf += token
+            i = j
+        out.append(buf)
+    return out or [""]
+
+
+def render_profile_card(
+    entry: Dict[str, Any],
+    max_abs_score: int,
+    *,
+    font_path: str = "",
+    font_dir: str = "",
+    avatar_dir: str = "",
+    scale: float = 0.0,
+) -> bytes | None:
+    """渲染**单人**关系档案卡片，返回 PNG 字节；不可用返回 None。
+
+    与排行榜同款视觉（竖向渐变 + 暖色光斑 + 毛玻璃面板 + 玻璃边缘高光），差别：
+      · 没有名次、没有列表；
+      · 「稳定印象」按卡片宽度折行**完整渲染**，不截断（排行榜行内只放得下一句话，
+        长印象在列表里永远显示不全，这张卡片就是为看全它而存在）。
+
+    entry 字段：display_name / user_id / score / stage / tags / summary /
+                updated_at / last_interaction_at
+    """
+    try:
+        return _render_profile_card_impl(
+            entry, max_abs_score, font_path=font_path, font_dir=font_dir,
+            avatar_dir=avatar_dir, scale=scale,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("关系档案卡片渲染异常，回退为文本")
+        return None
+
+
+def _render_profile_card_impl(
+    entry: Dict[str, Any],
+    max_abs_score: int,
+    *,
+    font_path: str = "",
+    font_dir: str = "",
+    avatar_dir: str = "",
+    scale: float = 0.0,
+) -> bytes | None:
+    PIL = _load_pil()
+    if PIL is None:
+        return None
+    try:
+        from PIL import ImageDraw, ImageFont
+    except Exception:  # noqa: BLE001
+        logger.warning("Pillow 子模块导入失败，档案卡片回退为文本", exc_info=True)
+        return None
+
+    fp = _find_font(font_path=font_path, font_dir=font_dir)
+    if not fp:
+        return None
+    try:
+        f_title = ImageFont.truetype(fp, 27)
+        f_name = ImageFont.truetype(fp, 25)
+        f_meta = ImageFont.truetype(fp, 13)
+        f_id = ImageFont.truetype(fp, 13)
+        f_score = ImageFont.truetype(fp, 32)
+        f_unit = ImageFont.truetype(fp, 14)
+        f_tag = ImageFont.truetype(fp, 12)
+        f_label = ImageFont.truetype(fp, 14)
+        f_body = ImageFont.truetype(fp, 16)
+        f_avatar = ImageFont.truetype(fp, 32)
+        f_foot = ImageFont.truetype(fp, 11)
+    except Exception:  # noqa: BLE001
+        logger.exception("字体加载失败（档案卡片）")
+        return None
+
+    # ---------------- 取数（展示层不抛异常）----------------
+    score = _as_int(entry.get("score"), 0)
+    uid = str(entry.get("user_id") or "").strip()
+    _disp = str(entry.get("display_name") or "").strip()
+    display_name = _disp or uid or "未知"
+    stage = str(entry.get("stage") or "").strip()
+    summary = _clean_summary(entry.get("summary")) or ""
+    raw_tags = entry.get("tags") or []
+    if isinstance(raw_tags, str):      # 历史数据可能是逗号分隔字符串
+        raw_tags = raw_tags.replace("，", ",").replace("、", ",").split(",")
+    tags = [str(t).strip() for t in raw_tags if str(t).strip()][:12]
+    updated_at = _as_int(entry.get("updated_at"), 0)
+    last_at = _as_int(entry.get("last_interaction_at"), 0)
+
+    MARGIN = 18
+    CARD_W = 724
+    pad = 28
+    header_h = 64
+    AV_R = 44
+    S = float(scale) if scale and scale > 0 else _RENDER_SCALE
+    inner_w = CARD_W - pad * 2
+
+    # 先按逻辑坐标量出所有文本，再算卡片高度（完整印象决定高度）
+    _measure_img = PIL.Image.new("RGB", (10, 10))
+    mdraw = _make_draw(_measure_img, ImageDraw, font_dir, 1.0)
+
+    body_lines = _wrap_text(mdraw, summary, f_body, inner_w) if summary else []
+    line_h = 27
+    if not body_lines:
+        body_lines = ["（这个频道还没有关于 TA 的稳定印象）"]
+    body_h = len(body_lines) * line_h
+
+    # 标签折行（整行铺开，不省略）
+    tag_rows: List[List[str]] = []
+    _cur: List[str] = []
+    _cur_w = 0.0
+    for tg in tags:
+        w = float(mdraw.textlength(tg, font=f_tag)) + 20
+        if _cur and _cur_w + 8 + w > inner_w:
+            tag_rows.append(_cur)
+            _cur, _cur_w = [tg], w
+        else:
+            _cur.append(tg)
+            _cur_w += (8 if _cur[:-1] else 0) + w
+    if _cur:
+        tag_rows.append(_cur)
+    tags_h = len(tag_rows) * 28 if tag_rows else 0
+
+    profile_h = AV_R * 2 + 18
+    sum_label_h = 36          # 「稳定印象」标题 + 与正文的呼吸
+    foot_h = 30
+    card_h = (pad + header_h + profile_h + (tags_h + 8 if tags_h else 0)
+              + sum_label_h + body_h + foot_h + pad)
+    img_w = CARD_W + MARGIN * 2
+    img_h = card_h + MARGIN * 2
+
+    img = _vertical_bg(PIL, int(img_w * S), int(img_h * S))
+    try:
+        img = PIL.Image.alpha_composite(
+            img.convert("RGBA"), _decorative_blobs(PIL, img.width, img.height)
+        ).convert("RGB")
+    except Exception:  # noqa: BLE001
+        logger.debug("档案卡背景光斑绘制失败，已跳过", exc_info=True)
+
+    try:
+        from PIL import ImageFilter
+
+        shadow = PIL.Image.new("RGBA", img.size, (0, 0, 0, 0))
+        PIL.ImageDraw.Draw(shadow).rounded_rectangle(
+            [int(MARGIN * S), int((MARGIN + 6) * S),
+             int((MARGIN + CARD_W) * S), int((MARGIN + card_h + 6) * S)],
+            radius=int(26 * S), fill=(96, 64, 40, 70),
+        )
+        img = PIL.Image.alpha_composite(
+            img.convert("RGBA"), shadow.filter(ImageFilter.GaussianBlur(radius=10 * S))
+        ).convert("RGB")
+    except Exception:  # noqa: BLE001
+        logger.debug("档案卡投影绘制失败，已跳过", exc_info=True)
+
+    card_box = [MARGIN, MARGIN, MARGIN + CARD_W, MARGIN + card_h]
+    # tint 比排行榜略薄（62 vs 80）：这张卡只有一列，面板占画面比例大，
+    # 80 会把底下的暖色渐变糊成一片灰米色，看不出「焦糖奶油」的层次。
+    img = _frosted_panel(PIL, img, card_box, 24, blur=12, tint_alpha=62, scale=S)
+    draw = _make_draw(img, ImageDraw, font_dir, S)
+
+    hx = MARGIN + pad
+    right_edge = MARGIN + CARD_W - pad
+
+    # ---------------- 标题：赤陶渐变竖条 + 「关系档案」 ----------------
+    hy = MARGIN + pad
+    _ink = draw.textbbox((0, 0), "关系档案", font=f_title)
+    _ink_top, _ink_bot = _ink[1], _ink[3]
+    _ink_h = max(1, _ink_bot - _ink_top)
+    try:
+        _bw, _bh = max(1, int(5 * S)), max(1, int(_ink_h * S))
+        grad = PIL.Image.new("RGB", (_bw, _bh))
+        gpx = grad.load()
+        for yy in range(_bh):
+            k = yy / max(_bh - 1, 1)
+            col = tuple(int(_ACCENT[i] + (_ACCENT_LIGHT[i] - _ACCENT[i]) * k) for i in range(3))
+            for xx in range(_bw):
+                gpx[xx, yy] = col
+        gmask = PIL.Image.new("L", (_bw, _bh), 0)
+        PIL.ImageDraw.Draw(gmask).rounded_rectangle(
+            [0, 0, _bw - 1, _bh - 1], radius=max(1, int(2.5 * S)), fill=255,
+        )
+        img.paste(grad, (int(hx * S), int((hy + 2 + _ink_top) * S)), gmask)
+    except Exception:  # noqa: BLE001
+        draw.rounded_rectangle([hx, hy + 2 + _ink_top, hx + 5, hy + 2 + _ink_top + _ink_h],
+                               radius=2.5, fill=_ACCENT)
+    draw.text((hx + 15, hy + 2), "关系档案", font=f_title, fill=_TEXT)
+
+    # 右上：最近互动 / 更新时间（弱化）
+    _meta_bits = []
+    if last_at:
+        _meta_bits.append("最近互动 " + time.strftime("%m-%d %H:%M", time.localtime(last_at)))
+    elif updated_at:
+        _meta_bits.append("更新于 " + time.strftime("%m-%d %H:%M", time.localtime(updated_at)))
+    if max_abs_score:
+        # 时间戳缺失时也要给一行右上角信息，否则标题右侧空一大块
+        _meta_bits.append(f"上限 ±{max_abs_score}")
+    meta_text = " · ".join(_meta_bits)
+    if meta_text:
+        _mw = int(draw.textlength(meta_text, font=f_meta))
+        _mk = draw.textbbox((0, 0), meta_text, font=f_meta)
+        _mcy = hy + 2 + (_ink_top + _ink_bot) / 2
+        draw.text((right_edge - _mw, _mcy - (_mk[1] + _mk[3]) / 2),
+                  meta_text, font=f_meta, fill=_MUTED)
+
+    # 标题区分隔线
+    _line_y = hy + header_h - 14
+    draw.rectangle([hx, _line_y, right_edge, _line_y], fill=(244, 236, 226))
+
+    # ---------------- 档案主体：头像 + 昵称 + ID + 阶段 + 分数 ----------------
+    py = hy + header_h
+    score_color = _ACCENT if score > 0 else (_COOL if score < 0 else _NEUTRAL)
+
+    ax, ay = hx + AV_R, py + AV_R
+    av_img = None
+    if avatar_dir and uid.isdigit():
+        av_img = _load_avatar_image(PIL, uid, avatar_dir)
+    if av_img is not None:
+        side = int(AV_R * 2 * S)
+        try:
+            thumb = av_img.resize((side, side), PIL.Image.LANCZOS)
+            mask = PIL.Image.new("L", (side, side), 0)
+            PIL.ImageDraw.Draw(mask).ellipse([0, 0, side, side], fill=255)
+            img.paste(thumb, (int((ax - AV_R) * S), int((ay - AV_R) * S)), mask)
+            draw.ellipse([ax - AV_R, ay - AV_R, ax + AV_R, ay + AV_R],
+                         outline=(255, 250, 243), width=2)
+        except Exception:  # noqa: BLE001
+            av_img = None
+    if av_img is None:
+        av_fill, av_fg = _avatar_color(uid or display_name)
+        draw.ellipse([ax - AV_R, ay - AV_R, ax + AV_R, ay + AV_R], fill=av_fill)
+        f_av = _fit_font(draw, _avatar_initial(display_name), f_avatar,
+                         AV_R * 2 - 10, AV_R * 2 - 12)
+        _draw_centered(draw, [ax - AV_R, ay - AV_R, ax + AV_R, ay + AV_R],
+                       _avatar_initial(display_name), f_av, av_fg)
+
+    text_x = ax + AV_R + 18
+    score_text = f"{score:+d}" if score != 0 else "0"
+    _sw = int(draw.textlength(score_text, font=f_score))
+    _uw = int(draw.textlength(f"/{max_abs_score}", font=f_unit)) if max_abs_score else 0
+    score_x = right_edge - _sw - _uw
+    draw.text((score_x, py - 4), score_text, font=f_score, fill=score_color)
+    if max_abs_score:
+        draw.text((score_x + _sw + 2, py + 18), f"/{max_abs_score}", font=f_unit, fill=_MUTED)
+
+    # 双向进度条（以 0 为中点；与排行榜同款语义）
+    bar_w, bar_h = 200, 6
+    bar_x = right_edge - bar_w
+    bar_y = py + 40
+    mid_x = bar_x + bar_w // 2
+    draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=3,
+                           fill=(243, 235, 226))
+    if max_abs_score:
+        ratio = max(0.0, min(1.0, abs(score) / max_abs_score))
+        fw = int((bar_w // 2) * ratio)
+        if fw >= 2:
+            if score >= 0:
+                draw.rounded_rectangle([mid_x, bar_y, mid_x + fw, bar_y + bar_h],
+                                       radius=3, fill=score_color)
+            else:
+                draw.rounded_rectangle([mid_x - fw, bar_y, mid_x, bar_y + bar_h],
+                                       radius=3, fill=score_color)
+    draw.rectangle([mid_x, bar_y - 1, mid_x + 1, bar_y + bar_h], fill=(224, 210, 194))
+
+    # 昵称
+    name_max_w = max(80, score_x - text_x - 16)
+    draw.text((text_x, py - 6), _truncate(draw, display_name, f_name, name_max_w),
+              font=f_name, fill=_TEXT)
+
+    # ID 胶囊 + 阶段胶囊
+    pill_y = py + 30
+    pill_h = 22
+    tx = text_x
+    if uid:
+        _id_txt = f"ID {uid}"
+        _w = int(draw.textlength(_id_txt, font=f_id)) + 20
+        draw.rounded_rectangle([tx, pill_y, tx + _w, pill_y + pill_h], radius=9.5,
+                               fill=(244, 238, 230))
+        _draw_centered(draw, [tx, pill_y, tx + _w, pill_y + pill_h], _id_txt, f_id,
+                       (140, 118, 98))
+        tx += _w + 8
+    if stage:
+        stage_bg, stage_fg = _STAGE_STYLES.get(stage, _STAGE_STYLES["中立"])
+        _w = int(draw.textlength(stage, font=f_tag)) + 20
+        if tx + _w <= right_edge:
+            draw.rounded_rectangle([tx, pill_y, tx + _w, pill_y + pill_h], radius=9.5,
+                                   fill=stage_bg)
+            _draw_centered(draw, [tx, pill_y, tx + _w, pill_y + pill_h], stage, f_tag, stage_fg)
+
+    y = py + profile_h
+
+    # ---------------- 标签（全部铺开、按宽度折行）----------------
+    if tag_rows:
+        for row in tag_rows:
+            tx = hx
+            for tg in row:
+                _w = int(draw.textlength(tg, font=f_tag)) + 20
+                draw.rounded_rectangle([tx, y, tx + _w, y + pill_h], radius=9.5,
+                                       fill=_ACCENT_SOFT)
+                _draw_centered(draw, [tx, y, tx + _w, y + pill_h], tg, f_tag, _ACCENT)
+                tx += _w + 8
+            y += 28
+        y += 14
+
+    # ---------------- 稳定印象（完整渲染）----------------
+    # 「稳定印象」前的赤陶色块：按**字形实际墨迹**对齐，而不是拍脑袋给 y+9。
+    # ⚠️ 14px 字体的 textbbox 顶部有 ~3px ascender 空隙，按逻辑 y 偏移画条子会明显偏下
+    #    （实测肉眼就是「色块没跟标题齐平」）。与排行榜标题红标同款处理：取 ink 上下沿。
+    _lb = draw.textbbox((0, 0), "稳定印象", font=f_label)
+    _lab_top, _lab_bot = _lb[1], _lb[3]
+    # textbbox 给的是排版墨盒，14px 下比实际笔画略矮（实测条子明显短一截），
+    # 这里上下各放 1~2px 让色块把整行字的视觉高度盖住，与标题红标观感一致。
+    _lab_h = max(9, _lab_bot - _lab_top + 1)
+    draw.rounded_rectangle(
+        [hx, y + _lab_top, hx + 4, y + _lab_top + _lab_h], radius=2, fill=_ACCENT,
+    )
+    draw.text((hx + 12, y), "稳定印象", font=f_label, fill=_SUBTEXT)
+    y += sum_label_h
+
+    _empty = not summary
+    for line in body_lines:
+        draw.text((hx, y), line, font=f_body, fill=(_MUTED if _empty else (88, 68, 52)))
+        y += line_h
+
+    # ---------------- 页脚 ----------------
+    fy = MARGIN + card_h - pad - foot_h + 10
+    draw.text((hx, fy), "nekro_persona · 关系档案", font=f_foot, fill=_MUTED)
+
+    img = _glass_edges(PIL, img, [(card_box, 24, (255, 255, 255, 150), (255, 255, 255, 210))], scale=S)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# ==================== 印象总览卡片（2.2.23） ====================
+
+# 总览里每人最多给几行印象（超出打省略号）：单张卡片要能一屏看完，
+# 想看全请用「查看@TA印象」那张单人卡。
+_OVERVIEW_SUMMARY_LINES = 2        # 总览里每人最多 2 行印象（看全用单人卡）
+_OVERVIEW_MAX_ITEMS = 14           # 人数上限（高度预算之外的第二道闸）
+# 高度预算（逻辑像素）：QQ 里长图会被缩到看不清，所以按预算收人而不是固定人数。
+# 实测 3000px 左右（scale 2.0 下 1500 逻辑像素）在手机上仍能滚着看清。
+_OVERVIEW_HEIGHT_BUDGET = 1900
+# 每列目标人数（与排行榜的 TARGET_PER_COL 同义）：超过它就开始并列，最多 3 列
+_OVERVIEW_TARGET_PER_COL = 4
+
+
+def render_impression_overview(
+    entries: List[dict],
+    max_abs_score: int,
+    *,
+    limit: int = 0,
+    font_path: str = "",
+    font_dir: str = "",
+    avatar_dir: str = "",
+    scale: float = 0.0,
+) -> bytes | None:
+    """渲染「印象总览」：每人一行，带头像/昵称/ID/标签/稳定印象/好感度。不可用返回 None。"""
+    try:
+        return _render_impression_overview_impl(
+            entries, max_abs_score, limit=limit, font_path=font_path,
+            font_dir=font_dir, avatar_dir=avatar_dir, scale=scale,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("印象总览卡片渲染异常，回退为文本")
+        return None
+
+
+def _render_impression_overview_impl(
+    entries: List[dict],
+    max_abs_score: int,
+    *,
+    limit: int = 0,
+    font_path: str = "",
+    font_dir: str = "",
+    avatar_dir: str = "",
+    scale: float = 0.0,
+) -> bytes | None:
+    """印象总览：按人数自动分列，**每格竖向节奏与「查看印象」单人卡一致**。
+
+    单人卡的节奏（2.2.26 抄过来）：内边距 16 / 头像直径 44 / 名字块 30 /
+    标签高 20 行距 6 / 「稳定印象」标题 30 / 正文 15px·25px 行距 / 底部内边距 16。
+    上一版把这些数压成 14/26/18/24/13·20，中文行被压到字脚贴边，看着像被盖住。
+    """
+    PIL = _load_pil()
+    if PIL is None:
+        return None
+    try:
+        from PIL import ImageDraw, ImageFont
+    except Exception:  # noqa: BLE001
+        logger.warning("Pillow 子模块导入失败，印象总览回退为文本", exc_info=True)
+        return None
+
+    fp = _find_font(font_path=font_path, font_dir=font_dir)
+    if not fp:
+        return None
+    try:
+        f_title = ImageFont.truetype(fp, 27)
+        f_meta = ImageFont.truetype(fp, 13)
+        f_name = ImageFont.truetype(fp, 23)
+        f_id = ImageFont.truetype(fp, 12)
+        f_score = ImageFont.truetype(fp, 26)
+        f_unit = ImageFont.truetype(fp, 12)
+        f_tag = ImageFont.truetype(fp, 12)
+        f_label = ImageFont.truetype(fp, 13)
+        f_body = ImageFont.truetype(fp, 15)
+        f_avatar = ImageFont.truetype(fp, 26)
+        f_foot = ImageFont.truetype(fp, 11)
+    except Exception:  # noqa: BLE001
+        logger.exception("字体加载失败（印象总览）")
+        return None
+
+    # ── 竖向节奏（与单人卡对齐）──────────────────────────────────────
+    MARGIN = 18
+    pad = 26
+    COL_W = 528                    # 与排行榜一致
+    COL_GAP = 16
+    header_h = 62
+    cell_pad = 16
+    AV_R = 22                      # 头像直径 44
+    name_h = 56                     # 名字块 = 名字 30 + 胶囊 20 + 间距 6
+    pill_h = 20
+    tag_h = 20
+    tag_gap = 6
+    label_h = 30
+    body_line_h = 25
+    head_gap = 12                  # 名字块与标签之间
+    tag_gap_after = 8              # 标签与「稳定印象」之间
+    cell_gap = 14
+    S = float(scale) if scale and scale > 0 else _RENDER_SCALE
+
+    cap = int(limit) if limit and limit > 0 else _OVERVIEW_MAX_ITEMS
+    pool = list(entries)[:cap]
+
+    _measure = _make_draw(PIL.Image.new("RGB", (10, 10)), ImageDraw, font_dir, 1.0)
+    inner_w = COL_W - cell_pad * 2
+    text_x_off = AV_R * 2 + 14
+
+    # ── 量每一格 ────────────────────────────────────────────────────
+    cells = []
+    for entry in pool:
+        uid = str(entry.get("user_id") or "").strip()
+        name = str(entry.get("display_name") or "").strip() or uid or "未知"
+        if not any(ch.isalnum() or "\u4e00" <= ch <= "\u9fff" for ch in name):
+            name = (uid[-8:] if uid else "") or name
+        score = _as_int(entry.get("score"), 0)
+        stage = str(entry.get("stage") or "").strip()
+        raw_tags = entry.get("tags") or []
+        if isinstance(raw_tags, str):
+            raw_tags = raw_tags.replace("，", ",").replace("、", ",").split(",")
+        tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+
+        tag_rows: List[List[str]] = []
+        cur: List[str] = []
+        cur_w = 0.0
+        overflow = 0
+        for tg in tags:
+            w = float(_measure.textlength(tg, font=f_tag)) + 18
+            if cur and cur_w + tag_gap + w > inner_w:
+                tag_rows.append(cur)
+                cur, cur_w = [tg], w
+            else:
+                cur.append(tg)
+                cur_w += (tag_gap if cur[:-1] else 0) + w
+        if cur:
+            tag_rows.append(cur)
+        if len(tag_rows) > 2:
+            overflow = sum(len(r) for r in tag_rows[2:])
+            tag_rows = tag_rows[:2]
+
+        summary = _clean_summary(entry.get("summary")) or ""
+        body_lines = _wrap_text(_measure, summary, f_body, inner_w) if summary else []
+        if len(body_lines) > _OVERVIEW_SUMMARY_LINES:
+            body_lines = body_lines[:_OVERVIEW_SUMMARY_LINES]
+            body_lines[-1] = _truncate(_measure, body_lines[-1] + "…", f_body, inner_w)
+        if not body_lines:
+            body_lines = ["（暂无稳定印象）"]
+
+        # ⚠️ 每格高度**固定**：预留 2 行标签 + 2 行正文。
+        #    按实际内容算高度会让同一张卡里格子高低不一（用户反馈「高度不一样」），
+        #    分列后列与列的行也对不齐，看着很乱。
+        h = (
+            cell_pad + name_h + head_gap
+            + (2 * tag_h + tag_gap + tag_gap_after)      # 预留两行标签
+            + label_h
+            + _OVERVIEW_SUMMARY_LINES * body_line_h      # 预留两行正文
+            + cell_pad
+        )
+        cells.append({
+            "entry": entry, "uid": uid, "name": name, "score": score, "stage": stage,
+            "tags": tag_rows, "overflow": overflow, "body": body_lines,
+            "empty_body": not summary, "h": h,
+        })
+
+    if not cells:
+        return None
+
+    # ── 分列 + 高度预算 ────────────────────────────────────────────
+    import math as _math
+
+    def layout(items: List[dict], cols: int) -> List[List[dict]]:
+        n = len(items)
+        base, rem = divmod(n, cols)
+        out, idx = [], 0
+        for c in range(cols):
+            size = base + (1 if c < rem else 0)
+            out.append(items[idx:idx + size])
+            idx += size
+        return out
+
+    def max_col_h(grid: List[List[dict]]) -> int:
+        return max(
+            (sum(c["h"] for c in col) + cell_gap * max(len(col) - 1, 0)) for col in grid
+        ) if grid else 0
+
+    shown = list(cells)
+    while True:
+        cols = max(1, min(3, _math.ceil(len(shown) / _OVERVIEW_TARGET_PER_COL)))
+        grid = layout(shown, cols)
+        if max_col_h(grid) <= _OVERVIEW_HEIGHT_BUDGET or len(shown) <= cols:
+            break
+        shown.pop()
+    cols = max(1, min(3, _math.ceil(len(shown) / _OVERVIEW_TARGET_PER_COL)))
+    grid = layout(shown, cols)
+    omitted = len(entries) - len(shown)
+
+    content_w = cols * COL_W + (cols - 1) * COL_GAP
+    card_w = content_w + pad * 2
+    rows_h = max_col_h(grid)
+    foot_h = 26
+    card_h = pad + header_h + max(rows_h, 60) + foot_h + pad
+    img_w = card_w + MARGIN * 2
+    img_h = card_h + MARGIN * 2
+
+    img = _vertical_bg(PIL, int(img_w * S), int(img_h * S))
+    try:
+        img = PIL.Image.alpha_composite(
+            img.convert("RGBA"), _decorative_blobs(PIL, img.width, img.height)
+        ).convert("RGB")
+    except Exception:  # noqa: BLE001
+        logger.debug("印象总览背景光斑绘制失败，已跳过", exc_info=True)
+
+    try:
+        from PIL import ImageFilter
+
+        shadow = PIL.Image.new("RGBA", img.size, (0, 0, 0, 0))
+        PIL.ImageDraw.Draw(shadow).rounded_rectangle(
+            [int(MARGIN * S), int((MARGIN + 6) * S),
+             int((MARGIN + card_w) * S), int((MARGIN + card_h + 6) * S)],
+            radius=int(26 * S), fill=(96, 64, 40, 70),
+        )
+        img = PIL.Image.alpha_composite(
+            img.convert("RGBA"), shadow.filter(ImageFilter.GaussianBlur(radius=10 * S))
+        ).convert("RGB")
+    except Exception:  # noqa: BLE001
+        logger.debug("印象总览投影绘制失败，已跳过", exc_info=True)
+
+    card_box = [MARGIN, MARGIN, MARGIN + card_w, MARGIN + card_h]
+    img = _frosted_panel(PIL, img, card_box, 24, blur=12, tint_alpha=62, scale=S)
+    draw = _make_draw(img, ImageDraw, font_dir, S)
+
+    hx = MARGIN + pad
+    right_edge = MARGIN + card_w - pad
+
+    # ── 标题 ───────────────────────────────────────────────────────
+    hy = MARGIN + pad
+    _ink = draw.textbbox((0, 0), "印象总览", font=f_title)
+    _ink_top, _ink_bot = _ink[1], _ink[3]
+    _ink_h = max(1, _ink_bot - _ink_top)
+    try:
+        _bw, _bh = max(1, int(5 * S)), max(1, int(_ink_h * S))
+        grad = PIL.Image.new("RGB", (_bw, _bh))
+        gpx = grad.load()
+        for yy in range(_bh):
+            k = yy / max(_bh - 1, 1)
+            col = tuple(int(_ACCENT[i] + (_ACCENT_LIGHT[i] - _ACCENT[i]) * k) for i in range(3))
+            for xx in range(_bw):
+                gpx[xx, yy] = col
+        gmask = PIL.Image.new("L", (_bw, _bh), 0)
+        PIL.ImageDraw.Draw(gmask).rounded_rectangle(
+            [0, 0, _bw - 1, _bh - 1], radius=max(1, int(2.5 * S)), fill=255,
+        )
+        img.paste(grad, (int(hx * S), int((hy + 2 + _ink_top) * S)), gmask)
+    except Exception:  # noqa: BLE001
+        draw.rounded_rectangle([hx, hy + 2 + _ink_top, hx + 5, hy + 2 + _ink_top + _ink_h],
+                               radius=2.5, fill=_ACCENT)
+    draw.text((hx + 15, hy + 2), "印象总览", font=f_title, fill=_TEXT)
+
+    meta_text = f"共 {len(entries)} 人（有标签）"
+    if omitted:
+        meta_text += f" · 本张显示 {len(shown)} 位"
+    _mw = int(draw.textlength(meta_text, font=f_meta))
+    _mk = draw.textbbox((0, 0), meta_text, font=f_meta)
+    _mcy = hy + 2 + (_ink_top + _ink_bot) / 2
+    draw.text((right_edge - _mw, _mcy - (_mk[1] + _mk[3]) / 2), meta_text, font=f_meta, fill=_MUTED)
+
+    _line_y = hy + header_h - 14
+    draw.rectangle([hx, _line_y, right_edge, _line_y], fill=(244, 236, 226))
+
+    # ── 逐格 ───────────────────────────────────────────────────────
+    row_base_y = hy + header_h
+    _av_fail = [0]
+    _edges = [(card_box, 24, (255, 255, 255, 150), (255, 255, 255, 210))]
+    for c, col in enumerate(grid):
+        cx0 = hx + c * (COL_W + COL_GAP)
+        cx1 = cx0 + COL_W
+        y = row_base_y
+        for r in col:
+            box = [cx0, y, cx1, y + r["h"]]
+            img = _frosted_panel(PIL, img, box, 14, blur=10, tint_alpha=44, scale=S)
+            draw = _make_draw(img, ImageDraw, font_dir, S)
+
+            score = r["score"]
+            score_color = _ACCENT if score > 0 else (_COOL if score < 0 else _NEUTRAL)
+            draw.rounded_rectangle([cx0 + 7, y + 16, cx0 + 10, y + r["h"] - 16],
+                                   radius=2, fill=score_color)
+
+            # 头像
+            ax, ay = cx0 + cell_pad + AV_R, y + cell_pad + AV_R
+            av_img = None
+            if avatar_dir and r["uid"].isdigit() and _av_fail[0] < 3:
+                av_img = _load_avatar_image(PIL, r["uid"], avatar_dir)
+                _av_fail[0] = 0 if av_img is not None else _av_fail[0] + 1
+            if av_img is not None:
+                side = int(AV_R * 2 * S)
+                try:
+                    thumb = av_img.resize((side, side), PIL.Image.LANCZOS)
+                    mask = PIL.Image.new("L", (side, side), 0)
+                    PIL.ImageDraw.Draw(mask).ellipse([0, 0, side, side], fill=255)
+                    img.paste(thumb, (int((ax - AV_R) * S), int((ay - AV_R) * S)), mask)
+                    draw.ellipse([ax - AV_R, ay - AV_R, ax + AV_R, ay + AV_R],
+                                 outline=(255, 250, 243), width=2)
+                except Exception:  # noqa: BLE001
+                    av_img = None
+            if av_img is None:
+                av_fill, av_fg = _avatar_color(r["uid"] or r["name"])
+                draw.ellipse([ax - AV_R, ay - AV_R, ax + AV_R, ay + AV_R], fill=av_fill)
+                f_av = _fit_font(draw, _avatar_initial(r["name"]), f_avatar,
+                                 AV_R * 2 - 8, AV_R * 2 - 9)
+                _draw_centered(draw, [ax - AV_R, ay - AV_R, ax + AV_R, ay + AV_R],
+                               _avatar_initial(r["name"]), f_av, av_fg)
+
+            text_x = cx0 + cell_pad + text_x_off
+
+            # 分数 + 上限（右上）
+            score_text = f"{score:+d}" if score != 0 else "0"
+            _sw = int(draw.textlength(score_text, font=f_score))
+            _uw = int(draw.textlength(f"/{max_abs_score}", font=f_unit)) if max_abs_score else 0
+            score_x = cx1 - cell_pad - _sw - _uw
+            draw.text((score_x, y + cell_pad - 4), score_text, font=f_score, fill=score_color)
+            if max_abs_score:
+                draw.text((score_x + _sw + 1, y + cell_pad + 12), f"/{max_abs_score}",
+                          font=f_unit, fill=_MUTED)
+
+            # 昵称
+            name_max_w = max(70, score_x - text_x - 10)
+            draw.text((text_x, y + cell_pad - 6),
+                      _truncate(draw, r["name"], f_name, name_max_w), font=f_name, fill=_TEXT)
+
+            # ID / 阶段胶囊：顶边必须落在名字墨迹之下（23px 名字的 ink 底 ≈ cell_pad+28），
+            # 否则胶囊会盖住名字下半截（上一版就是这么糊的）。
+            pill_y = y + cell_pad + 30
+            tx = text_x
+            if r["uid"]:
+                _id_txt = f"ID {r['uid']}"
+                _w = int(draw.textlength(_id_txt, font=f_id)) + 16
+                if tx + _w <= cx1 - cell_pad:
+                    draw.rounded_rectangle([tx, pill_y, tx + _w, pill_y + pill_h], radius=9,
+                                           fill=(244, 238, 230))
+                    _draw_centered(draw, [tx, pill_y, tx + _w, pill_y + pill_h], _id_txt, f_id,
+                                   (140, 118, 98))
+                    tx += _w + 6
+            if r["stage"]:
+                stage_bg, stage_fg = _STAGE_STYLES.get(r["stage"], _STAGE_STYLES["中立"])
+                _w = int(draw.textlength(r["stage"], font=f_tag)) + 16
+                if tx + _w <= cx1 - cell_pad:
+                    draw.rounded_rectangle([tx, pill_y, tx + _w, pill_y + pill_h], radius=9,
+                                           fill=stage_bg)
+                    _draw_centered(draw, [tx, pill_y, tx + _w, pill_y + pill_h], r["stage"],
+                                   f_tag, stage_fg)
+
+            # 标签
+            ty = y + cell_pad + max(AV_R * 2, name_h) + head_gap
+            for trow in r["tags"]:
+                tx = cx0 + cell_pad
+                for tg in trow:
+                    _w = int(draw.textlength(tg, font=f_tag)) + 18
+                    draw.rounded_rectangle([tx, ty, tx + _w, ty + tag_h], radius=9,
+                                           fill=_ACCENT_SOFT)
+                    _draw_centered(draw, [tx, ty, tx + _w, ty + tag_h], tg, f_tag, _ACCENT)
+                    tx += _w + tag_gap
+                if r["overflow"]:
+                    _more = f"+{r['overflow']}"
+                    _w = int(draw.textlength(_more, font=f_tag)) + 18
+                    if tx + _w <= cx1 - cell_pad:
+                        draw.rounded_rectangle([tx, ty, tx + _w, ty + tag_h], radius=9,
+                                               fill=(244, 238, 230))
+                        _draw_centered(draw, [tx, ty, tx + _w, ty + tag_h], _more, f_tag,
+                                       (140, 118, 98))
+                ty += tag_h + tag_gap
+            if r["tags"]:
+                ty += tag_gap_after - tag_gap
+
+            # 「稳定印象」标题（色块按字形墨迹对齐）
+            _lb = draw.textbbox((0, 0), "稳定印象", font=f_label)
+            _lab_top, _lab_bot = _lb[1], _lb[3]
+            _lab_h = max(9, _lab_bot - _lab_top + 1)
+            _lx = cx0 + cell_pad
+            draw.rounded_rectangle([_lx, ty + _lab_top, _lx + 4, ty + _lab_top + _lab_h],
+                                   radius=2, fill=_ACCENT)
+            draw.text((_lx + 11, ty), "稳定印象", font=f_label, fill=_SUBTEXT)
+            ty += label_h
+
+            for line in r["body"]:
+                draw.text((cx0 + cell_pad, ty), line, font=f_body,
+                          fill=(_MUTED if r["empty_body"] else (92, 72, 56)))
+                ty += body_line_h
+
+            _edges.append((box, 14, (255, 255, 255, 90), None))
+            y += r["h"] + cell_gap
+
+    # ── 页脚 ───────────────────────────────────────────────────────
+    fy = MARGIN + card_h - pad - foot_h + 8
+    if omitted:
+        draw.text((hx, fy), f"另有 {omitted} 位有标签的人未显示（按好感度取前 {len(shown)} 位）",
+                  font=f_foot, fill=_MUTED)
+    _wm = "nekro_persona · 印象总览"
+    draw.text((right_edge - int(draw.textlength(_wm, font=f_foot)), fy), _wm,
+              font=f_foot, fill=_MUTED)
+
+    img = _glass_edges(PIL, img, _edges, scale=S)
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
     return buf.getvalue()

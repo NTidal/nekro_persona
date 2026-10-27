@@ -1121,6 +1121,23 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         from nekro_agent.models.db_plugin_data import DBPluginData
 
         rows = await DBPluginData.filter(plugin_key=plugin.key).all()
+        # ⚠️ 多账号分支：以前这里把**所有账号**的档案行都列出来（NA5 实测三个账号都看到
+        #    同样的 173 人 / 9 频道）。现在按当前账号过滤：
+        #      · 行 account_key == 当前账号（新写入的权威形态）；
+        #      · 键带 @账号 后缀且等于当前账号（NA5 频道键自带账号）；
+        #      · 无后缀的共享/历史行仍然都可见（单账号部署与历史数据不能凭空消失）。
+        acct = helpers.get("account_key", lambda: "")()
+        if acct:
+            def _row_in_scope(r) -> bool:
+                if str(getattr(r, "account_key", "") or "") == acct:
+                    return True
+                owner = helpers["chat_key_account"](str(getattr(r, "target_chat_key", "") or ""))
+                return (not owner) or owner == acct
+            before = len(rows)
+            rows = [r for r in rows if _row_in_scope(r)]
+            if before != len(rows):
+                plugin.logger.debug(
+                    f"[persona] 索引按账号 {acct} 过滤：{before} → {len(rows)} 行")
         all_items: List[Dict[str, Any]] = []
         chan: Dict[str, Dict[str, Any]] = {}
         for r in rows:
