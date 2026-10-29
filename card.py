@@ -35,18 +35,38 @@ from nekro_agent.core.os_env import PLUGIN_DYNAMIC_PACKAGE_DIR
 logger = get_sub_logger("nekro_persona")
 
 # MomoTune 暖色配色 v2「焦糖奶油」：赤陶橙 + 暖棕 + 奶油米黄
-_ACCENT = (196, 106, 74)         # #c46a4a 赤陶橙（主强调）
-_ACCENT_LIGHT = (224, 148, 92)   # #e0945c 琥珀（渐变亮端）
-_ACCENT_SOFT = (252, 240, 228)    # #fcf0e4 浅杏（标签底）
-_TEXT = (74, 55, 40)              # #4a3728 暖棕（主文字）
-_SUBTEXT = (140, 110, 88)         # #8c6e58 驼色（次级文字）
-_MUTED = (176, 152, 132)          # #b09884 沙色（弱化文字）
-_NEUTRAL = (160, 140, 122)        # 0 分中性色（避免把 0 渲染成"正分"赤陶色）
-_COOL = (110, 128, 138)           # #6e808a 灰蓝（负分，暖调体系里的冷色对照）
+# ── 文字配色：浅底用深墨、深底用浅墨（2.4.10）──────────────────────────
+# 以前这些是写死的深色，照片底一压暗（或毛玻璃调到很透）字就和背景糊在一起。
+# 现在按「卡片面板的实际亮度」在两张调色板之间自动切换，代码里统一用 _pal("text") 取色。
+_INK_DARK = {
+    "accent": (196, 106, 74),        # #c46a4a 赤陶橙（主强调）
+    "accent_light": (224, 148, 92),  # #e0945c 琥珀（渐变亮端）
+    "accent_soft": (252, 240, 228),   # #fcf0e4 浅杏（标签底）
+    "text": (74, 55, 40),             # #4a3728 暖棕（主文字）
+    "subtext": (140, 110, 88),        # #8c6e58 驼色（次级文字）
+    "muted": (176, 152, 132),         # #b09884 沙色（弱化文字）
+    "neutral": (160, 140, 122),       # 0 分中性色
+    "cool": (110, 128, 138),          # #6e808a 灰蓝（负分）
+    "border": (232, 190, 160),
+    "body": (88, 68, 52),             # 「稳定印象」正文
+    "divider": (244, 236, 226),        # 分隔线
+}
+_INK_LIGHT = {
+    "accent": (255, 178, 128),        # 深底上的强调：亮琥珀更跳
+    "accent_light": (255, 205, 160),
+    "accent_soft": (62, 50, 42),       # 深底上的标签底：改用深色块
+    "text": (248, 244, 238),           # 米白正文
+    "subtext": (224, 216, 205),
+    "muted": (186, 178, 167),
+    "neutral": (208, 200, 190),
+    "cool": (178, 200, 216),
+    "border": (255, 242, 224),
+    "body": (232, 224, 212),           # 深底上的正文
+    "divider": (150, 140, 128),        # 深底上的分隔线
+}
 _BG_TOP = (253, 246, 236)         # #fdf6ec 奶油白
 _BG_MID = (251, 233, 210)         # #fbe9d2 杏黄
 _BG_BOTTOM = (246, 213, 184)      # #f6d5b8 蜜桃
-_BORDER = (232, 190, 160)
 _WHITE = (255, 255, 255)
 
 # 毛玻璃背景装饰光斑 (cx_frac_w, cy_frac_h, r_frac_min, RGBA)
@@ -66,11 +86,11 @@ _BLOB_SPECS = [
 # 旧配色有两组撞色：①「排斥」浅底 + 深赤陶字与「特别亲密」赤陶实底同色相，
 # 只差明度；②「偏爱 / 保留 / 中立」三个浅暖底饱和度接近，并排要仔细看。
 # 现在按**色相家族**分开，明度也排成阶梯：
-#   排斥（冷灰蓝，呼应负分 _COOL，六个浅底里最暗）
+#   排斥（冷灰蓝，呼应负分 _pal("cool")，六个浅底里最暗）
 #   → 中立（无彩中性灰）→ 亲近（鼠尾草绿）→ 保留（暖沙黄）→ 偏爱（蜜桃橙，提饱和）
 #   → 特别亲密（唯一实底，保持最高层级）
 _STAGE_STYLES = {
-    "排斥": ((188, 210, 236), (36, 66, 102)),       # 冷蓝（与负分 _COOL 同族，色相与其余五档都不同）
+    "排斥": ((188, 210, 236), (36, 66, 102)),       # 冷蓝（与负分 _pal("cool") 同族，色相与其余五档都不同）
     "保留": ((252, 243, 196), (108, 84, 16)),       # 暖沙黄（纯黄相）
     "中立": ((233, 232, 235), (80, 82, 90)),        # 中性灰（无彩色）
     "亲近": ((212, 239, 204), (46, 98, 46)),        # 鼠尾草绿（暖体系里的自然色）
@@ -110,6 +130,26 @@ _FONT_CANDIDATES = [
 
 _PIL_MIRRORS = ["https://mirrors.aliyun.com/pypi/simple/", "https://pypi.org/simple", None]
 
+# Pillow 可用性状态（2.5.8）：给 WebUI 与文本兜底用，让"没装 Pillow"不再静默
+_PIL_STATE: dict = {"ok": None, "reason": "", "version": ""}
+
+
+def pil_status(probe: bool = True) -> dict:
+    """当前进程里 Pillow 是否可用。
+
+    返回 {"ok": True|False|None, "reason": str, "version": str}：
+      ok=False 时 reason 是给人看的中文原因（WebUI 与文本兜底直接展示）。
+    probe=True 且还没试过（ok=None）时，只做一次轻量的 `import PIL`
+    （**不**触发 pip 安装），这样 WebUI 一进来就能报出后端版本。
+    """
+    if probe and _PIL_STATE["ok"] is None:
+        try:
+            mod = importlib.import_module("PIL")
+            _PIL_STATE.update(ok=True, reason="", version=str(getattr(mod, "__version__", "")))
+        except Exception:  # noqa: BLE001
+            _PIL_STATE.update(ok=False, reason="未检测到 Pillow（import PIL 失败）", version="")
+    return dict(_PIL_STATE)
+
 _font_cache: str | None = None
 _font_checked = False
 _font_key: tuple | None = None
@@ -128,18 +168,32 @@ def _load_pil() -> Any | None:
     except Exception:  # noqa: BLE001
         pass
     try:
-        return importlib.import_module("PIL")
+        mod = importlib.import_module("PIL")
+        _PIL_STATE.update(ok=True, reason="", version=str(getattr(mod, "__version__", "")))
+        return mod
     except ImportError:
         pass
     for mirror in _PIL_MIRRORS:
         try:
-            return dynamic_import_pkg("pillow>=10.0.0", "PIL", mirror=mirror)
+            mod = dynamic_import_pkg("pillow>=10.0.0", "PIL", mirror=mirror)
+            _PIL_STATE.update(ok=True, reason="", version=str(getattr(mod, "__version__", "")))
+            return mod
         except Exception:  # noqa: BLE001
             try:
-                return importlib.import_module("PIL")
+                mod = importlib.import_module("PIL")
+                _PIL_STATE.update(ok=True, reason="", version=str(getattr(mod, "__version__", "")))
+                return mod
             except ImportError:
                 continue
-    logger.error("PIL 不可用，好感度排行榜卡片将回退为文本")
+    _PIL_STATE.update(
+        ok=False,
+        reason="未检测到 Pillow（主环境没装，NA 的动态安装也没成功）",
+        version="",
+    )
+    logger.error(
+        "PIL 不可用：图片卡片（排行榜 / 关系档案 / 印象总览）会回退为文字版。"
+        "在容器里执行 pip install pillow 后重试，或检查出网是否被拦。",
+    )
     return None
 
 
@@ -200,7 +254,8 @@ def _pin_font(src: str, pin_dir: str, marker_name: str = _FONT_PIN_MARKER) -> st
             # 同名但内容不同（比如换了个同名系统字体）→ 加后缀区分
             if dst.stat().st_size != src_path.stat().st_size:
                 dst = pin_root / f"{src_path.stem}-pinned{src_path.suffix}"
-        tmp = dst.with_name(dst.name + ".tmp")
+        # tmp 带 pid/tid：并发落地同一字体时固定名会互相截断（2.4.3 修）
+        tmp = dst.with_name(f"{dst.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         shutil.copyfile(src_path, tmp)
         if tmp.stat().st_size != src_path.stat().st_size:
             tmp.unlink(missing_ok=True)
@@ -614,7 +669,7 @@ def _scan_system_emoji_fonts() -> list:
 
 def set_emoji_font_override(path: str = "") -> None:
     """设置手动指定的 emoji 字体（空 = 自动探测）；值变了才清缓存。"""
-    global _emoji_font_override, _emoji_font_checked, _emoji_font_key
+    global _emoji_font_override, _emoji_font_checked, _emoji_font_key, _emoji_font_path
     new = str(path or "").strip()
     if new == _emoji_font_override:
         return
@@ -622,13 +677,17 @@ def set_emoji_font_override(path: str = "") -> None:
     with _FONT_LOCK:
         _emoji_font_checked = False
         _emoji_font_key = None
+        # 已解析的路径也必须重置：只清 checked/key 时，下一次调用命中
+        # “checked=False → 重查”没问题，但重查前若有其它路径直接读 _emoji_font_path
+        # 会拿到旧字体的路径（2.4.3 修）。
+        _emoji_font_path = None
         try:
             _emoji_font_cache.clear()
         except Exception:  # noqa: BLE001
             pass
 
 
-def _find_emoji_font(font_dir: str = "") -> str | None:
+def _find_emoji_font_impl(font_dir: str = "") -> str | None:
     """查找 emoji 字体：数据目录 fonts 下 *emoji* → 系统目录扫 *emoji* → 固定候选。
 
     找到后会像正文字体一样**落地**（复制进插件数据目录 + 写 `.emoji_font_pin.json`），
@@ -676,6 +735,15 @@ def _find_emoji_font(font_dir: str = "") -> str | None:
     if not _emoji_font_color:
         logger.info(f"emoji 字体为单色（{Path(found).name}），将按单色渲染")
     return _emoji_font_path
+
+
+def _find_emoji_font(font_dir: str = "") -> str | None:
+    """加锁入口（2.4.3）：emoji 探测链会写 _emoji_font_path/_emoji_font_color 等
+    模块级缓存，渲染线程与 WebUI 探测并发时必须在锁内做，否则可能读到
+    “新路径 + 旧颜色位”的组合——单色字体走 embedded_color=True 直接抛异常，
+    整张卡报废。_FONT_LOCK 是可重入锁，impl 内部的 _pin_font 等再入不会死锁。"""
+    with _FONT_LOCK:
+        return _find_emoji_font_impl(font_dir)
 
 
 # 散布在"非 emoji 区"里、但确实算 emoji 的孤立符号
@@ -834,7 +902,19 @@ def _char_in_font(path: str, ch: str) -> bool:
 
 
 def _configure_fallback_fonts(font_dir: str = "") -> list:
-    """收集备选字体路径（数据目录 fonts/ → 系统 CJK 候选目录）。"""
+    """收集备选字体路径（数据目录 fonts/ → 系统 CJK 候选目录）。
+
+    整段在 _FONT_LOCK 内：写 _FALLBACK_FONT_PATHS/_FALLBACK_READY 两个模块级
+    缓存，渲染线程并发首次调用时会重复扫目录并互相覆盖（2.4.3 修）。
+    """
+    global _FALLBACK_FONT_PATHS, _FALLBACK_READY
+    if _FALLBACK_READY:
+        return _FALLBACK_FONT_PATHS
+    with _FONT_LOCK:
+        return _configure_fallback_fonts_impl(font_dir)
+
+
+def _configure_fallback_fonts_impl(font_dir: str = "") -> list:
     global _FALLBACK_FONT_PATHS, _FALLBACK_READY
     if _FALLBACK_READY:
         return _FALLBACK_FONT_PATHS
@@ -889,6 +969,157 @@ def _fallback_font_for(font: Any, ch: str) -> Any | None:
 
 # 渲染倍率：卡片按逻辑尺寸（680 宽设计稿）布局，再以此倍率超采样渲染输出。
 # 2.0 = Retina 级清晰度；调大更清晰但图片更大（3.0 时约 2.25 倍像素量）。
+# ── DIY 配色 token（2.5.0）：只开放「颜色」，卡片框架（尺寸/间距/结构）不可改 ──
+# 值是解析默认；键名同时用于配置 RANK_CARD_STYLE 与 WebUI 的输入行。
+# (中文名, 默认色, 作用区域说明) —— 第三项用来在面板上写清"这个颜色会画在哪儿"
+STYLE_TOKENS = {
+    "text": ("标题与昵称", "#4a3728",
+             "三张卡的标题（关系档案 / 好感度排行榜 / 印象总览）、档案昵称、总览每格的昵称"),
+    "subtext": ("次要文字", "#8c6e58",
+                "「稳定印象」小标题、ID 胶囊里的 ID 文字、「+N」胶囊文字"),
+    "muted": ("弱化文字", "#b09884",
+              "页脚（nekro_persona · …）、右上「最近互动 · 上限 ±100」、分数分母 /100、排行榜底部提示"),
+    "body": ("稳定印象正文", "#584434",
+             "单人卡与总览的稳定印象正文、排行榜行内「印象」胶囊文字（含「暂无印象」占位）"),
+    "accent": ("强调色", "#c46a4a",
+               "标题左侧竖条、正分数字、进度条填充、关系标签文字、排行榜名次竖条"),
+    "accent_light": ("强调渐变亮端", "#e0945c",
+                     "只与「强调色」做线性渐变，出现在进度条/徽章的高亮一端"),
+    "chip_bg": ("标签底色", "#fcf0e4",
+                "所有胶囊底：关系标签、印象胶囊、ID 胶囊、「+N」胶囊"),
+    "panel_color": ("毛玻璃面板底色", "#fffaf2",
+                    "整张卡那片磨砂面板（排行榜每一行还有一块小面板）"),
+    "veil_color": ("背景薄纱色", "#fffcf6",
+                   "压在照片底图上的那层薄纱（22% 不透明）；填 #0 即关闭"),
+    "divider": ("分隔线", "#f4ece2",
+                "标题区下方那条细分隔线"),
+    "bg_top": ("内置渐变·上", "#fdf6ec", "没设背景图时，竖向渐变最上面的颜色"),
+    "bg_mid": ("内置渐变·中", "#fbe9d2", "竖向渐变中间那一档（约 49% 处）"),
+    "bg_bottom": ("内置渐变·下", "#f6d5b8", "竖向渐变最下面的颜色"),
+}
+
+
+class _Hidden:
+    """哨兵：该 token 被设为 #0 → 对应那块直接不渲染。"""
+
+    def __repr__(self) -> str:
+        return "<hidden>"
+
+
+_HIDDEN = _Hidden()
+_ZERO_VALUES = {"#0", "0", "none", "off", "hide", "hidden"}
+
+
+def _hex_to_rgb_soft(value, fallback=(0, 0, 0)):
+    """解析 #rgb / #rrggbb / #rrggbbaa（忽略 alpha），失败返回 fallback。"""
+    sval = str(value or "").strip().lstrip("#")
+    try:
+        if len(sval) == 3:
+            return tuple(int(c * 2, 16) for c in sval)
+        if len(sval) in (6, 8):
+            return (int(sval[0:2], 16), int(sval[2:4], 16), int(sval[4:6], 16))
+    except ValueError:
+        pass
+    return fallback
+
+
+def normalize_style(style) -> dict:
+    """把配置/接口给的值统一成 {token: (r,g,b)}；只认 STYLE_TOKENS 里的键。"""
+    if isinstance(style, str):
+        text = style.strip()
+        if not text:
+            return {}
+        try:
+            import json as _json
+
+            style = _json.loads(text)
+        except Exception:  # noqa: BLE001
+            return {}
+    if not isinstance(style, dict):
+        return {}
+    out = {}
+    for key, spec in STYLE_TOKENS.items():
+        if key not in style:
+            continue
+        val = style[key]
+        if val in (None, ""):
+            continue
+        # #0 = 不渲染：统一存成 "#0" 字符串（JSON 往返安全），取色时再变哨兵
+        if str(val).strip().lower() in _ZERO_VALUES:
+            out[key] = "#0"
+            continue
+        # 已经归一过的 (r,g,b) 也要接受：webui 预览会先 normalize 一次再传进来
+        if isinstance(val, (tuple, list)) and len(val) >= 3:
+            try:
+                out[key] = tuple(int(v) for v in list(val)[:3])
+                continue
+            except (TypeError, ValueError):
+                continue
+        rgb = _hex_to_rgb_soft(val, None)
+        if rgb is not None:
+            out[key] = tuple(rgb)
+    return out
+
+
+def _style_rgb(key: str):
+    """当前渲染线程的 DIY 覆盖色：正常返回 (r,g,b)，被设成 #0 时返回 _HIDDEN，未设置返回 None。"""
+    st = getattr(_bg_ctx, "style", None) or {}
+    val = st.get(key)
+    if val is None:
+        return None
+    if val == "#0":
+        return _HIDDEN
+    if isinstance(val, (tuple, list)) and len(val) >= 3:
+        return tuple(val)[:3]
+    return _hex_to_rgb_soft(val, None)
+
+
+def _pal(key: str):
+    """当前渲染线程的文字配色：_bg_ctx.palette 由各渲染实现在算完背景后设定。
+
+    DIY 覆盖（2.5.0）优先：accent_soft 可由 "chip_bg" 覆盖，其余同名覆盖。
+    """
+    _ov = _style_rgb(key if key != "accent_soft" else "chip_bg")
+    if _ov is not None:
+        return _ov          # 可能是 _HIDDEN（#0 = 不渲染）
+    pal = getattr(_bg_ctx, "palette", None)
+    if not pal:
+        return _INK_DARK.get(key, (0, 0, 0))
+    return pal.get(key, _INK_DARK.get(key, (0, 0, 0)))
+
+
+def _panel_luma_estimate(PIL, img, box, panel_alpha: int = -1, tint_luma: float = 0.98) -> float:
+    """估算「毛玻璃面板最终有多亮」：面板 = 背景在该区域的平均亮度与暖白纱的混合。
+
+    panel_alpha 手动指定时按它的百分比算；自动时按各面板预设 62/255(+16) 取一个代表值。
+    估不出来（空 box / 异常）就返回 0.5，让调用方按浅底处理，不至于突然反色。
+    """
+    try:
+        x0, y0, x1, y1 = [int(v) for v in box]
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(img.width, x1), min(img.height, y1)
+        if x1 <= x0 or y1 <= y0:
+            return 0.5
+        region = img.crop((x0, y0, x1, y1))
+        small = region.convert("L").resize((24, 24), PIL.Image.BILINEAR)
+        px = list(small.getdata())
+        bg_l = (sum(px) / len(px) / 255.0) if px else 0.5
+        a = 0.31 if panel_alpha < 0 else max(0.0, min(1.0, panel_alpha / 100.0))
+        return bg_l * (1.0 - a) + tint_luma * a
+    except Exception:  # noqa: BLE001
+        return 0.5
+
+
+def _pick_palette(mode: str, luma: float) -> dict:
+    """mode: auto / dark（浅底深字）/ light（深底浅字）；auto 按面板亮度选。"""
+    m = str(mode or "auto").strip().lower()
+    if m in ("light", "反色", "white"):
+        return _INK_LIGHT
+    if m in ("dark", "normal", "深色"):
+        return _INK_DARK
+    return _INK_LIGHT if luma < 0.46 else _INK_DARK
+
+
 _RENDER_SCALE = 1.5   # 超采样倍率（扩展：2.0→1.5，文件约降 40%；可被配置覆盖）
 
 
@@ -1096,6 +1327,39 @@ class _ScaledDraw:
         return getattr(self._draw, name)
 
 
+_DRAW_METHODS = frozenset({
+    "text", "multiline_text", "rectangle", "rounded_rectangle", "ellipse", "line",
+    "polygon", "pieslice", "arc", "chord", "regular_polygon", "point",
+})
+
+
+class _HiddenAwareDraw:
+    """最外层 draw 包装：fill / outline 是 _HIDDEN 时**整条绘制跳过**（2.5.1 的 #0 语义）。
+
+    放在最外层是为了"一处收口"：布局代码里 60 多个绘制点不用各自判空。
+    """
+
+    __slots__ = ("_draw",)
+
+    def __init__(self, draw: Any):
+        self._draw = draw
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._draw, name)
+        if name not in _DRAW_METHODS or not callable(attr):
+            return attr
+
+        def _wrapped(*args, **kwargs):
+            if kwargs.get("fill") is _HIDDEN or kwargs.get("outline") is _HIDDEN:
+                return None
+            for a in args:
+                if a is _HIDDEN:
+                    return None
+            return attr(*args, **kwargs)
+
+        return _wrapped
+
+
 def _make_draw(img: Any, image_draw_mod: Any, font_dir: str = "", scale: float = 1.0) -> Any:
     """创建支持 emoji + 高分辨率缩放（超采样）的 draw 对象。
 
@@ -1113,10 +1377,10 @@ def _make_draw(img: Any, image_draw_mod: Any, font_dir: str = "", scale: float =
         try:
             from PIL import ImageFont
 
-            return _ScaledDraw(draw, scale, ImageFont)
+            return _HiddenAwareDraw(_ScaledDraw(draw, scale, ImageFont))
         except Exception:  # noqa: BLE001
             logger.debug("缩放包装失败，回退原倍率", exc_info=True)
-    return draw
+    return _HiddenAwareDraw(draw)
 
 
 def _draw_centered(draw: Any, box: list, text: str, font: Any, fill: Any) -> None:
@@ -1150,12 +1414,19 @@ def _vertical_bg(PIL, width: int, height: int):
     先算 1px 宽的色列再 NEAREST 横向拉伸（每行是纯色，拉伸无损失），
     比逐像素双循环快约两个数量级。
     """
-    stops = [(0.0, _BG_TOP), (0.49, _BG_MID), (1.0, _BG_BOTTOM)]
+    def _pick(key, default):
+        v = _style_rgb(key)
+        return default if (v is None or v is _HIDDEN) else tuple(v)
+
+    _top = _pick("bg_top", _BG_TOP)
+    _mid = _pick("bg_mid", _BG_MID)
+    _bot = _pick("bg_bottom", _BG_BOTTOM)
+    stops = [(0.0, _top), (0.49, _mid), (1.0, _bot)]
     col = PIL.Image.new("RGB", (1, height))
     px = col.load()
     for y in range(height):
         t = y / max(height - 1, 1)
-        c = _BG_BOTTOM
+        c = _bot
         for i in range(len(stops) - 1):
             t0, c0 = stops[i]
             t1, c1 = stops[i + 1]
@@ -1181,17 +1452,110 @@ def reset_background_cache() -> None:
     _BG_CACHE.clear()
 
 
-def _cover_fit(PIL, img, width: int, height: int):
-    """等比铺满再居中裁剪（cover），保证不拉伸、不变形。"""
+def _cover_fit(PIL, img, width: int, height: int, anchor=(0.5, 0.5)):
+    """等比铺满再按锚点裁剪（cover），保证不拉伸、不变形。
+
+    anchor=(ax, ay)：0 = 贴左/贴上，0.5 = 居中（老行为），1 = 贴右/贴下。
+    只有**被裁掉的那个方向**会受锚点影响。
+    """
     iw, ih = img.size
     if iw <= 0 or ih <= 0:
         return img
     k = max(width / iw, height / ih)
     nw, nh = max(1, int(round(iw * k))), max(1, int(round(ih * k)))
     img = img.resize((nw, nh), PIL.Image.LANCZOS)
-    left = max(0, (nw - width) // 2)
-    top = max(0, (nh - height) // 2)
+    ax, ay = 0.5, 0.5
+    try:
+        if isinstance(anchor, (tuple, list)) and len(anchor) == 2:
+            ax = min(1.0, max(0.0, float(anchor[0])))
+            ay = min(1.0, max(0.0, float(anchor[1])))
+    except (TypeError, ValueError):
+        ax, ay = 0.5, 0.5
+    left = min(max(0, int(round(max(0, nw - width) * ax))), max(0, nw - width))
+    top = min(max(0, int(round(max(0, nh - height) * ay))), max(0, nh - height))
     return img.crop((left, top, left + width, top + height))
+
+
+# 裁剪锚点：命名预设 + "x,y" 自定义；"auto" = 按画面显著区自动选
+_ANCHOR_PRESETS = {
+    "center": (0.5, 0.5), "middle": (0.5, 0.5),
+    "top": (0.5, 0.0), "bottom": (0.5, 1.0),
+    "left": (0.0, 0.5), "right": (1.0, 0.5),
+    "top-left": (0.0, 0.0), "top-right": (1.0, 0.0),
+    "bottom-left": (0.0, 1.0), "bottom-right": (1.0, 1.0),
+    "up": (0.5, 0.25), "down": (0.5, 0.75),
+}
+
+
+def parse_bg_anchor(spec) -> tuple | None:
+    """配置里的锚点字符串 → (ax, ay)；"auto"/空/非法 → None（走自动）。"""
+    sval = str(spec if spec is not None else "").strip().lower()
+    if not sval or sval == "auto":
+        return None
+    if sval in _ANCHOR_PRESETS:
+        return _ANCHOR_PRESETS[sval]
+    parts = [x for x in sval.replace("，", ",").replace(" ", ",").split(",") if x]
+    if len(parts) == 2:
+        try:
+            ax, ay = float(parts[0]), float(parts[1])
+            if 0.0 <= ax <= 1.0 and 0.0 <= ay <= 1.0:
+                return (ax, ay)
+        except ValueError:
+            pass
+    return None
+
+
+def _salient_point(PIL, img) -> tuple:
+    """估画面「显著区」中心（0~1）：边缘能量加权质心，再与中心混一半。
+
+    照片主体（人脸/轮廓）通常落在高对比区；纯风光图的能量较均匀，所以混合中心
+    避免为几根树枝把构图裁飞，最后夹在 0.15~0.85。
+    """
+    try:
+        from PIL import ImageFilter
+
+        small = img.convert("L").resize((64, 64), PIL.Image.BILINEAR)
+        edges = small.filter(ImageFilter.FIND_EDGES)
+        px = list(edges.getdata())
+        total = sx = sy = 0.0
+        for idx, v in enumerate(px):
+            if v <= 8:                 # 噪声地板
+                continue
+            yy, xx = divmod(idx, 64)
+            total += v
+            sx += (xx + 0.5) / 64.0 * v
+            sy += (yy + 0.5) / 64.0 * v
+        if total <= 0:
+            return (0.5, 0.5)
+        # 不跟中心平均：平均会把「主体在偏上」拉回中间，自动锚点就白算了。
+        # 只夹在 0.1~0.9，避免主体贴着边时把构图裁到只剩一条缝。
+        cx = min(0.9, max(0.1, sx / total))
+        cy = min(0.9, max(0.1, sy / total))
+        return (cx, cy)
+    except Exception:  # noqa: BLE001
+        return (0.5, 0.5)
+
+
+def _auto_anchor(PIL, img, width: int, height: int) -> tuple:
+    """按「主体落在裁剪窗口正中」反算锚点。
+
+    先算 cover 之后的缩放后尺寸，再算各方向剩余可移动量（slack），
+    然后求「让显著点落在窗口中间」所需的偏移比例。没有可移动量（该方向不裁）就保持 0.5。
+    """
+    iw, ih = img.size
+    if iw <= 0 or ih <= 0:
+        return (0.5, 0.5)
+    cx, cy = _salient_point(PIL, img)
+    k = max(width / iw, height / ih)
+    nw, nh = iw * k, ih * k
+    ax = ay = 0.5
+    slack_x = nw - width
+    slack_y = nh - height
+    if slack_x > 0.5:
+        ax = min(1.0, max(0.0, (cx * nw - width / 2.0) / slack_x))
+    if slack_y > 0.5:
+        ay = min(1.0, max(0.0, (cy * nh - height / 2.0) / slack_y))
+    return (ax, ay)
 
 
 def _mean_luma(PIL, img) -> float:
@@ -1201,8 +1565,21 @@ def _mean_luma(PIL, img) -> float:
     return (sum(px) / len(px) / 255.0) if px else 0.5
 
 
+def _legacy_background(PIL, width: int, height: int, *, path: str = "", blur: float = 14.0,
+                       dim: int = 0, scale: float = 1.0, anchor="auto"):
+    """2.3.12 的默认外观：渐变/照片 **+ 光斑（只叠一次）**。
+
+    没配图层模板时走它，保证「升级后观感不变」。配了模板则由模板决定要不要光斑。
+    """
+    base = _background(PIL, width, height, path=path, blur=blur, dim=dim, scale=scale,
+                       anchor=anchor)
+    return PIL.Image.alpha_composite(
+        base.convert("RGBA"), _decorative_blobs(PIL, base.width, base.height),
+    ).convert("RGB")
+
+
 def _background(PIL, width: int, height: int, *, path: str = "", blur: float = 14.0,
-                dim: int = 0, scale: float = 1.0):
+                dim: int = 0, scale: float = 1.0, anchor="auto"):
     """卡片背景：有自定义图就「cover-fit + 模糊 + 压暗/提亮」，否则回落到暖色渐变。
 
     dim: 0 = 自动（按背景平均亮度往「浅底」方向调，专门保文字可读）；
@@ -1218,8 +1595,10 @@ def _background(PIL, width: int, height: int, *, path: str = "", blur: float = 1
         if not p.is_file():
             logger.warning(f"自定义背景不存在，回落到渐变: {src}")
             return _vertical_bg(PIL, width, height)
+        # 缓存键带锚点：同一张图不同锚点裁出来是不同的图
         key = (str(p), int(p.stat().st_mtime), int(width), int(height),
-               round(float(blur), 1), int(dim))
+               round(float(blur), 1), int(dim),
+               anchor if isinstance(anchor, str) else tuple(anchor))
         hit = _BG_CACHE.get(key)
         if hit is not None:
             _bg_ctx.is_image = True
@@ -1230,7 +1609,10 @@ def _background(PIL, width: int, height: int, *, path: str = "", blur: float = 1
         limit = max(width, height) * 2
         if max(img.size) > limit:          # 4K/8K 原图先缩，避免每帧 decode 大图
             img.thumbnail((limit, limit), PIL.Image.LANCZOS)
-        bg = _cover_fit(PIL, img, width, height)
+        _anc = parse_bg_anchor(anchor)
+        if _anc is None:
+            _anc = _auto_anchor(PIL, img, width, height)
+        bg = _cover_fit(PIL, img, width, height, _anc)
         radius = float(blur) * max(float(scale), 1.0)
         if radius > 0.4:
             bg = bg.filter(ImageFilter.GaussianBlur(radius=radius))
@@ -1245,8 +1627,8 @@ def _background(PIL, width: int, height: int, *, path: str = "", blur: float = 1
             bg = PIL.Image.blend(bg, overlay, min(abs(d), 100) / 250.0)
         # 全局薄纱（暖白）：标题/页脚这类**直接压在照片上**的文字不会带面板，
         # 光靠面板加厚救不了它们，所以整张图层再蒙一层薄纱保底对比
-        if _BG_VEIL_ALPHA > 0:
-            veil = PIL.Image.new("RGB", bg.size, (255, 252, 246))
+        if _BG_VEIL_ALPHA > 0 and _style_rgb("veil_color") is not _HIDDEN:
+            veil = PIL.Image.new("RGB", bg.size, _style_rgb("veil_color") or (255, 252, 246))
             bg = PIL.Image.blend(bg, veil, min(float(_BG_VEIL_ALPHA), 0.6))
         if len(_BG_CACHE) >= _BG_CACHE_MAX:
             try:
@@ -1271,373 +1653,6 @@ def _background(PIL, width: int, height: int, *, path: str = "", blur: float = 1
 #
 # 坐标约定：x/y/w/h 一律用 0~1 的相对值（跟渲染倍率、卡片尺寸无关），像素换算在合成时做。
 
-_LAYER_DEFAULT = [
-    {"type": "gradient", "stage": "back", "stops": [[0.0, "#fdf6ec"], [0.49, "#fbe9d2"], [1.0, "#f6d5b8"]]},
-    {"type": "blobs", "stage": "back", "alpha": 1.0},
-]
-# 用户自己写了 image 层但没写 veil 时，自动补这层薄纱（否则浅色面板上文字容易被照片纹路吃掉）
-_LAYER_AUTO_VEIL = {"type": "veil", "stage": "back", "color": "#fffcf6", "alpha": 0.18}
-_LAYER_TYPES = (
-    "gradient", "image", "veil", "scrim", "blobs", "tint",
-    "border", "text", "sticker", "grain",
-)
-
-
-def _hex_to_rgb(value, fallback=(255, 255, 255)):
-    """#rgb / #rrggbb / #rrggbbaa → (r,g,b,a)。解析失败回落 fallback（alpha=255）。"""
-    try:
-        t = str(value or "").strip().lstrip("#")
-        if len(t) == 3:
-            t = "".join(c * 2 for c in t)
-        if len(t) not in (6, 8):
-            return (fallback[0], fallback[1], fallback[2], 255)
-        r, g, b = int(t[0:2], 16), int(t[2:4], 16), int(t[4:6], 16)
-        a = int(t[6:8], 16) if len(t) == 8 else 255
-        return (r, g, b, a)
-    except Exception:  # noqa: BLE001
-        return (fallback[0], fallback[1], fallback[2], 255)
-
-
-def _alpha(value, default=1.0) -> float:
-    try:
-        return max(0.0, min(1.0, float(value)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _rel(value, total: int, default: float = 0.0) -> int:
-    """0~1 相对坐标 → 像素（也接受已经大于 1 的绝对像素值）。"""
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        v = default
-    return int(round(v * total)) if v <= 1.0 else int(round(v))
-
-
-def normalize_layers(layers) -> list:
-    """清洗层列表：丢掉不认识/结构不对的层，rest 用默认值补全。"""
-    out: list = []
-    if not isinstance(layers, (list, tuple)):
-        return out
-    for raw_layer in layers:
-        if not isinstance(raw_layer, dict):
-            continue
-        t = str(raw_layer.get("type") or "").strip().lower()
-        if t not in _LAYER_TYPES:
-            continue
-        layer = dict(raw_layer)
-        layer["type"] = t
-        layer["stage"] = "front" if str(raw_layer.get("stage") or "back").lower() == "front" else "back"
-        if not layer.get("enabled", True):
-            continue
-        out.append(layer)
-    return out
-
-
-def resolve_layer_sources(layers, base_dir: str = "") -> list:
-    """把 image / sticker 层的相对路径解析成绝对路径。
-
-    模板里只存「文件名」最稳（换机器、换挂载点都不怕），渲染前按数据目录解析：
-    先试 `<base>/<src>`，再试 `<base>/backgrounds_custom/<src>`。
-    """
-    out: list = []
-    base = str(base_dir or "").strip()
-    for layer in normalize_layers(layers):
-        item = dict(layer)
-        if item["type"] in ("image", "sticker"):
-            src = str(item.get("src") or "").strip()
-            if src and base and not Path(src).is_absolute():
-                for cand in (Path(base) / src, Path(base) / "backgrounds_custom" / src):
-                    if cand.is_file():
-                        item["src"] = str(cand)
-                        break
-        out.append(item)
-    return out
-
-
-def _layer_list(layers):
-    """把外部传进来的 layers 统一成「已清洗的列表」；None 表示调用方没给模板。
-
-    接受：None / list / {"layers": [...]} / JSON 字符串。
-    """
-    if layers is None:
-        return None
-    if isinstance(layers, str):
-        try:
-            layers = json.loads(layers or "[]")
-        except Exception:  # noqa: BLE001
-            return None
-    if isinstance(layers, dict):
-        layers = layers.get("layers") or []
-    if not isinstance(layers, (list, tuple)):
-        return None
-    return normalize_layers(layers)
-
-
-def _split_layers(layers, has_bg: bool = False):
-    """拆成 (back, front) 两份。
-
-    `layers=None`（没配模板）时用内置默认：有自定义背景图就只留空 back（照片本身就是背景），
-    否则沿用「暖色渐变 + 光斑」，保证老配置升级后观感不变。
-    """
-    lay = _layer_list(layers)
-    if lay is None:
-        return ([] if has_bg else [dict(x) for x in _LAYER_DEFAULT]), []
-    back = [x for x in lay if x["stage"] == "back"]
-    front = [x for x in lay if x["stage"] == "front"]
-    # 自己写了图片层却没写薄纱 → 自动补一层（可显式写 veil 覆盖/调淡）
-    if any(x["type"] == "image" for x in back) and not any(x["type"] == "veil" for x in back):
-        idx = max(i for i, x in enumerate(back) if x["type"] == "image")
-        back.insert(idx + 1, dict(_LAYER_AUTO_VEIL))
-    return back, front
-
-
-def _compose_layers(PIL, img, layers: list, *, stage: str, base_ctx: dict | None = None):
-    """把指定 stage 的图层按顺序叠到 img 上，返回新图。任何一层出错只跳过该层。"""
-    ctx = base_ctx or {}
-    for layer in layers:
-        if layer.get("stage") != stage:
-            continue
-        t = layer["type"]
-        try:
-            alpha = _alpha(layer.get("alpha"), 1.0)
-            if alpha <= 0:
-                continue
-            if t == "gradient":
-                stops = layer.get("stops") or [[0.0, "#fdf6ec"], [1.0, "#f6d5b8"]]
-                horizontal = bool(layer.get("horizontal"))
-                layer_img = _gradient_layer(PIL, img.size, stops, horizontal)
-                img = PIL.Image.blend(img, layer_img, alpha) if alpha < 1 else layer_img
-            elif t == "image":
-                src = str(layer.get("src") or "").strip()
-                if not src or not Path(src).is_file():
-                    continue
-                _bg_ctx.is_image = True   # 面板据此加厚 tint
-                lay = _image_layer(PIL, img.size, src, layer, ctx.get("scale", 1.0))
-                if lay is None:
-                    continue
-                img = PIL.Image.blend(img, lay, alpha) if alpha < 1 else lay
-            elif t == "veil":
-                color = _hex_to_rgb(layer.get("color") or "#fffcf6")
-                lay = PIL.Image.new("RGB", img.size, color[:3])
-                img = PIL.Image.blend(img, lay, _alpha(layer.get("alpha"), 0.22))
-            elif t == "scrim":
-                img = _scrim_layer(PIL, img, layer)
-            elif t == "blobs":
-                blobs = _decorative_blobs(PIL, img.size[0], img.size[1])
-                img = PIL.Image.blend(img, blobs, alpha) if alpha < 1 else blobs
-            elif t == "tint":
-                color = _hex_to_rgb(layer.get("color") or "#ffd9b0")
-                lay = PIL.Image.new("RGB", img.size, color[:3])
-                img = PIL.Image.blend(img, lay, _alpha(layer.get("alpha"), 0.1))
-            elif t == "border":
-                img = _border_layer(PIL, img, layer)
-            elif t == "text":
-                img = _text_layer(PIL, img, layer, ctx)
-            elif t == "sticker":
-                img = _sticker_layer(PIL, img, layer, ctx)
-            elif t == "grain":
-                img = _grain_layer(PIL, img, layer)
-        except Exception:  # noqa: BLE001
-            logger.warning(f"图层合成失败（已跳过该层）: {layer.get('type')}", exc_info=True)
-            continue
-    return img
-
-
-def _gradient_layer(PIL, size, stops, horizontal: bool = False):
-    """任意 stop 数的线性渐变（竖向或横向），先算 1px 再拉伸。"""
-    w, h = size
-    length = w if horizontal else h
-    parsed = []
-    for st in stops:
-        try:
-            pos = max(0.0, min(1.0, float(st[0])))
-            parsed.append((pos, _hex_to_rgb(st[1])[:3]))
-        except Exception:  # noqa: BLE001
-            continue
-    if not parsed:
-        parsed = [(0.0, (253, 246, 236)), (1.0, (246, 213, 184))]
-    parsed.sort(key=lambda x: x[0])
-    strip = PIL.Image.new("RGB", (1, length)) if not horizontal else PIL.Image.new("RGB", (length, 1))
-    px = strip.load()
-    for i in range(length):
-        t = i / max(length - 1, 1)
-        c = parsed[-1][1]
-        if t <= parsed[0][0]:
-            c = parsed[0][1]
-        else:
-            for k in range(len(parsed) - 1):
-                p0, c0 = parsed[k]
-                p1, c1 = parsed[k + 1]
-                if p0 <= t <= p1:
-                    f = (t - p0) / max(p1 - p0, 1e-9)
-                    c = tuple(int(c0[j] + (c1[j] - c0[j]) * f) for j in range(3))
-                    break
-        if horizontal:
-            px[i, 0] = c
-        else:
-            px[0, i] = c
-    return strip.resize((w, h), PIL.Image.NEAREST)
-
-
-def _image_layer(PIL, size, src: str, layer: dict, scale: float):
-    """图片层：cover/contain/stretch 三种填充 + 可选模糊。"""
-    from PIL import ImageFilter, ImageOps
-
-    w, h = size
-    img = ImageOps.exif_transpose(PIL.Image.open(src)).convert("RGB")
-    limit = max(w, h) * 2
-    if max(img.size) > limit:
-        img.thumbnail((limit, limit), PIL.Image.LANCZOS)
-    fit = str(layer.get("fit") or "cover").lower()
-    if fit == "stretch":
-        out = img.resize((w, h), PIL.Image.LANCZOS)
-    elif fit == "contain":
-        k = min(w / img.size[0], h / img.size[1])
-        nw, nh = max(1, int(img.size[0] * k)), max(1, int(img.size[1] * k))
-        out = PIL.Image.new("RGB", (w, h), _hex_to_rgb(layer.get("pad") or "#000000")[:3])
-        out.paste(img.resize((nw, nh), PIL.Image.LANCZOS), ((w - nw) // 2, (h - nh) // 2))
-    else:  # cover
-        out = _cover_fit(PIL, img, w, h)
-    radius = float(layer.get("blur") or 0) * max(float(scale), 1.0)
-    if radius > 0.4:
-        out = out.filter(ImageFilter.GaussianBlur(radius=radius))
-    # 图片层的明暗补偿：没写 dim 就自动（与 _background 的口径一致，保文字可读）
-    raw_dim = layer.get("dim")
-    if raw_dim is None or str(raw_dim).strip() == "":
-        weight = _mean_luma(PIL, out)
-        dim = int(round(max(-22.0, min(26.0, (0.72 - weight) * 100))))
-    else:
-        try:
-            dim = int(raw_dim)
-        except (TypeError, ValueError):
-            dim = 0
-    if dim:
-        over = PIL.Image.new("RGB", out.size, (255, 255, 255) if dim > 0 else (0, 0, 0))
-        out = PIL.Image.blend(out, over, min(abs(dim), 100) / 250.0)
-    return out
-
-
-def _scrim_layer(PIL, img, layer: dict):
-    """线性压暗/提亮带：从某一边往中间渐隐，用来压住标题/页脚。"""
-    w, h = img.size
-    color = _hex_to_rgb(layer.get("color") or "#000000")[:3]
-    strength = _alpha(layer.get("alpha"), 0.35)
-    where = str(layer.get("from") or "top").lower()
-    span = _alpha(layer.get("size"), 0.35)
-    mask = PIL.Image.new("L", (w, h), 0)
-    mpx = mask.load()
-    length = max(1, int((h if where in ("top", "bottom") else w) * span))
-    vert = where in ("top", "bottom")
-    for i in range(length):
-        f = 1.0 - (i / max(length - 1, 1))
-        v = int(255 * strength * f)
-        if vert:
-            y = i if where == "top" else h - 1 - i
-            for x in range(w):
-                mpx[x, y] = v
-        else:
-            x = i if where == "left" else w - 1 - i
-            for y in range(h):
-                mpx[x, y] = v
-    overlay = PIL.Image.new("RGB", (w, h), color)
-    # composite(image1, image2, mask)：mask=255 处取 image2（压暗带），0 处保留原图
-    return PIL.Image.composite(img, overlay, mask)
-
-
-def _border_layer(PIL, img, layer: dict):
-    """圆角描边层（画在卡片外框内侧）。"""
-    w, h = img.size
-    color = _hex_to_rgb(layer.get("color") or "#ffffff")
-    width = max(1, _rel(layer.get("width") or 2, w, 2))
-    radius = _rel(layer.get("radius") or 0.03, min(w, h), 24)
-    inset = _rel(layer.get("inset") or 0.011, min(w, h), 8)
-    overlay = PIL.Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    from PIL import ImageDraw
-
-    d = ImageDraw.Draw(overlay)
-    d.rounded_rectangle([inset, inset, w - 1 - inset, h - 1 - inset],
-                        radius=radius, outline=(color[0], color[1], color[2], int(color[3] * _alpha(layer.get("alpha"), 1.0))),
-                        width=width)
-    return PIL.Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-
-
-def _text_layer(PIL, img, layer: dict, ctx: dict):
-    """文字层（水印 / 角标）。x/y 是相对锚点，align 决定左右，font 取正文字体。"""
-    from PIL import ImageDraw, ImageFont
-
-    w, h = img.size
-    text = str(layer.get("text") or "").strip()
-    if not text:
-        return img
-    scale = float(ctx.get("scale") or 1.0)
-    size = int(round(float(layer.get("size") or 11) * scale))
-    font_path = ctx.get("font_path") or ""
-    try:
-        font = ImageFont.truetype(font_path, max(8, size)) if font_path else ImageFont.load_default()
-    except Exception:  # noqa: BLE001
-        font = ImageFont.load_default()
-    overlay = PIL.Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(overlay)
-    color = _hex_to_rgb(layer.get("color") or "#00000066")
-    fill = (color[0], color[1], color[2], int(color[3] * _alpha(layer.get("alpha"), 1.0)))
-    x = _rel(layer.get("x"), w, 0.5)
-    y = _rel(layer.get("y"), h, 0.97)
-    align = str(layer.get("align") or "center").lower()
-    try:
-        bw = d.textbbox((0, 0), text, font=font)[2]
-    except Exception:  # noqa: BLE001
-        bw = 0
-    if align == "center":
-        x -= bw // 2
-    elif align in ("right", "end"):
-        x -= bw
-    d.text((x, y), text, font=font, fill=fill)
-    return PIL.Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-
-
-def _sticker_layer(PIL, img, layer: dict, ctx: dict):
-    """贴图层：按相对矩形贴一张图（logo / 角标 / 水印图）。"""
-    from PIL import ImageOps
-
-    w, h = img.size
-    src = str(layer.get("src") or "").strip()
-    if not src or not Path(src).is_file():
-        return img
-    logo = ImageOps.exif_transpose(PIL.Image.open(src)).convert("RGBA")
-    tw = _rel(layer.get("w") or 0.08, w, 0.08)
-    if layer.get("h"):
-        th = _rel(layer.get("h"), h, tw)
-    else:
-        th = max(1, int(round(logo.size[1] * (tw / max(logo.size[0], 1)))))
-    logo = logo.resize((max(1, tw), max(1, th)), PIL.Image.LANCZOS)
-    alpha = _alpha(layer.get("alpha"), 1.0)
-    if alpha < 1:
-        r, g, b, a = logo.split()
-        a = a.point(lambda v: int(v * alpha))
-        logo = PIL.Image.merge("RGBA", (r, g, b, a))
-    base = img.convert("RGBA")
-    base.alpha_composite(logo, (_rel(layer.get("x"), w, 0.03), _rel(layer.get("y"), h, 0.03)))
-    return base.convert("RGB")
-
-
-def _grain_layer(PIL, img, layer: dict):
-    """噪点层（弱化的胶片颗粒，照片背景时能压住色带）。"""
-    import random as _random
-
-    w, h = img.size
-    strength = _alpha(layer.get("alpha"), 0.05)
-    noise = PIL.Image.new("L", (max(1, w // 3), max(1, h // 3)))
-    px = noise.load()
-    rnd = _random.Random(20260101)
-    for yy in range(noise.size[1]):
-        for xx in range(noise.size[0]):
-            px[xx, yy] = 128 + rnd.randint(-40, 40)
-    noise = noise.resize((w, h), PIL.Image.BILINEAR)
-    overlay = PIL.Image.merge("RGB", (noise, noise, noise))
-    return PIL.Image.blend(img, overlay, strength)
-
-
 def _decorative_blobs(PIL, width: int, height: int):
     """暖色装饰光斑层：给毛玻璃提供"可模糊"的背景内容。
 
@@ -1655,9 +1670,24 @@ def _decorative_blobs(PIL, width: int, height: int):
 
 
 def _frosted_panel(PIL, base, box, radius, *, blur=14, tint=(255, 250, 242), tint_alpha=70, scale=1.0):
-    # 图片背景比渐变「花」，面板要更实一点，否则浅色面板上的深色字会被背景纹路吃掉
-    if getattr(_bg_ctx, "is_image", False):
+    # 手动指定的「毛玻璃不透明度」（0~100 → 0~255）优先，且不再叠加图片加成：
+    # 用户既然明确要某个浓度，就不该再偷偷加厚。0 = 全透（只剩模糊），100 = 几乎不透。
+    _tint_ov = _style_rgb("panel_color")
+    if _tint_ov is _HIDDEN:
+        return base          # #0 = 毛玻璃面板整块不渲染
+    if _tint_ov is not None:
+        tint = tuple(_tint_ov)
+    _panel_ov = getattr(_bg_ctx, "panel_alpha", -1)
+    if isinstance(_panel_ov, int) and _panel_ov >= 0:
+        tint_alpha = int(round(max(0, min(100, _panel_ov)) * 2.55))
+    elif getattr(_bg_ctx, "is_image", False):
+        # 图片背景比渐变「花」，面板要更实一点，否则浅色面板上的深色字会被背景纹路吃掉
         tint_alpha = min(255, int(tint_alpha) + 16)
+    # 面板背后的模糊半径同样可覆盖（逻辑像素，内部 × scale）：
+    # 0 = 面板里就是清晰底图（只有那层白纱），越大越糊；-1 = 各面板预设值。
+    _panel_blur = getattr(_bg_ctx, "panel_blur", -1)
+    if isinstance(_panel_blur, int) and _panel_blur >= 0:
+        blur = float(max(0, min(60, _panel_blur)))
     """毛玻璃面板：裁剪背后区域 → 高斯模糊 → 暖白半透明叠加 → 圆角遮罩贴回。
 
     box 为逻辑坐标 [x0, y0, x1, y1]（内部 × scale 转设备像素）。
@@ -1811,6 +1841,7 @@ def _fit_font(draw: Any, text: str, font: Any, max_w: float, max_h: float) -> An
 
 _AVATAR_TTL = 7 * 24 * 3600   # 头像磁盘缓存 7 天
 _AVATAR_TIMEOUT = 4           # 单次抓取超时（秒）
+_AVATAR_MAX_BYTES = 2 * 1024 * 1024   # 单张头像读取上限（防超清/恶意大图，2.4.3）
 
 
 def _load_avatar_image(PIL: Any, user_id: str, avatar_dir: str):
@@ -1838,15 +1869,19 @@ def _load_avatar_image(PIL: Any, user_id: str, avatar_dir: str):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=_AVATAR_TIMEOUT) as resp:
-                data = resp.read()
+                # 限长读取：无上限时一张“超大头像”能把渲染线程卡住（2.4.3）
+                data = resp.read(_AVATAR_MAX_BYTES + 1)
             if len(data) < 100:
+                continue
+            if len(data) > _AVATAR_MAX_BYTES:
                 continue
             # 先解析再落盘：下载到半张图/错误页时直接当失败（旧实现先 write_bytes，
             # 坏文件会一直留在缓存里，之后 7 天内每次打开都失败）。
             img = PIL.Image.open(io.BytesIO(data)).convert("RGB")
             Path(avatar_dir).mkdir(parents=True, exist_ok=True)
-            # 原子写：并发渲染同一用户时不会互相截断
-            tmp = fp.with_suffix(".jpg.tmp")
+            # 原子写；tmp 带 tid：并发渲染同一用户（排行榜+总览）时固定名会互相
+            # 截断，replace 可能把半张图发布成缓存（2.4.3 修）。
+            tmp = fp.with_suffix(f".jpg.{threading.get_ident()}.tmp")
             try:
                 tmp.write_bytes(data)
                 tmp.replace(fp)
@@ -1874,7 +1909,11 @@ def render_favorability_rank(
     bg_path: str = "",
     bg_blur: float = 14.0,
     bg_dim: int = 0,
-    layers: Any = None,
+    panel_alpha: int = -1,
+    panel_blur: int = -1,
+    bg_anchor: str = "auto",
+    ink: str = "auto",
+    style=None,
 ) -> bytes | None:
     """渲染好感度排行榜为 PNG 卡片，返回字节；不可用时返回 None。
 
@@ -1888,7 +1927,12 @@ def render_favorability_rank(
         return _render_favorability_rank_impl(
             entries, max_abs_score, limit=limit, font_path=font_path,
             font_dir=font_dir, avatar_dir=avatar_dir, scale=scale,
-            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim, layers=layers,
+            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim,
+            panel_alpha=panel_alpha,
+            panel_blur=panel_blur,
+            bg_anchor=bg_anchor,
+            ink=ink,
+            style=style,
         )
     except Exception:  # noqa: BLE001
         logger.exception("好感度排行榜卡片渲染异常，回退为文本")
@@ -1907,7 +1951,11 @@ def _render_favorability_rank_impl(
     bg_path: str = "",
     bg_blur: float = 14.0,
     bg_dim: int = 0,
-    layers: Any = None,
+    panel_alpha: int = -1,
+    panel_blur: int = -1,
+    bg_anchor: str = "auto",
+    ink: str = "auto",
+    style=None,
 ) -> bytes | None:
     """真正的渲染实现（由 render_favorability_rank 兜底调用）。
 
@@ -1919,7 +1967,6 @@ def _render_favorability_rank_impl(
         font_path: 配置指定的中文字体文件路径。
         font_dir: 插件数据目录中的字体目录。
     """
-    back_layers, front_layers = _split_layers(layers, has_bg=bool(str(bg_path or "").strip()))
     PIL = _load_pil()
     if PIL is None:
         return None
@@ -2001,21 +2048,28 @@ def _render_favorability_rank_impl(
     img_h = card_h + MARGIN * 2
     S = float(scale) if scale and scale > 0 else _RENDER_SCALE
 
+    # 背景：自定义图片（cover 裁剪 + 模糊 + 明暗）或内置暖色渐变，再叠一层装饰光斑。
     _bg_ctx.is_image = bool(str(bg_path or "").strip())
-    img = _compose_layers(
-        PIL,
-        _background(PIL, int(img_w * S), int(img_h * S),
-                    path=bg_path, blur=bg_blur, dim=bg_dim, scale=S),
-        back_layers, stage="back", base_ctx={"scale": S, "font_path": font_path_resolved},
+    try:
+        _bg_ctx.panel_alpha = int(panel_alpha)
+    except (TypeError, ValueError):
+        _bg_ctx.panel_alpha = -1
+    try:
+        _bg_ctx.panel_blur = int(panel_blur)
+    except (TypeError, ValueError):
+        _bg_ctx.panel_blur = -1
+    _bg_ctx.style = normalize_style(style)
+    img = _legacy_background(
+        PIL, int(img_w * S), int(img_h * S),
+        path=bg_path, blur=bg_blur, dim=bg_dim, scale=S, anchor=bg_anchor,
     )
 
-    # 暖色装饰光斑：毛玻璃的"可模糊内容"（纯平渐变上看不出磨砂感）
-    try:
-        img = PIL.Image.alpha_composite(
-            img.convert("RGBA"), _decorative_blobs(PIL, img.width, img.height)
-        ).convert("RGB")
-    except Exception:  # noqa: BLE001
-        logger.debug("背景光斑绘制失败，已跳过", exc_info=True)
+    # 文字配色：按「这张卡的面板最终有多亮」在深浅两套墨色之间切换（2.4.10）
+    _bg_ctx.palette = _pick_palette(ink, _panel_luma_estimate(
+        PIL, img,
+        (MARGIN * S, MARGIN * S, (MARGIN + card_w) * S, (MARGIN + card_h) * S),
+        panel_alpha,
+    ))
 
     # 卡片柔和投影（独立图层 + 高斯模糊；失败则静默跳过）
     # ⚠️ 这里必须用 card_w：旧代码误写成未定义的 `width`，一旦本 except
@@ -2065,7 +2119,7 @@ def _render_favorability_rank_impl(
         gpx = grad.load()
         for yy in range(_bh):
             k = yy / max(_bh - 1, 1)
-            col = tuple(int(_ACCENT[j] + (_ACCENT_LIGHT[j] - _ACCENT[j]) * k) for j in range(3))
+            col = tuple(int(_pal("accent")[j] + (_pal("accent_light")[j] - _pal("accent")[j]) * k) for j in range(3))
             for xx in range(_bw):
                 gpx[xx, yy] = col
         gmask = PIL.Image.new("L", (_bw, _bh), 0)
@@ -2077,9 +2131,9 @@ def _render_favorability_rank_impl(
         logger.debug("标题渐变条绘制失败，回退纯色", exc_info=True)
         draw.rounded_rectangle(
             [_bar_x, _bar_top, _bar_x + _bar_w, _bar_top + _ink_h],
-            radius=2.5, fill=_ACCENT,
+            radius=2.5, fill=_pal("accent"),
         )
-    draw.text((hx + 15, hy + 2), "好感度排行榜", font=f_title, fill=_TEXT)
+    draw.text((hx + 15, hy + 2), "好感度排行榜", font=f_title, fill=_pal("text"))
 
     # 头部统计：填补原先空荡的标题右侧，同时让卡片一眼有"榜"的感觉
     if shown:
@@ -2097,12 +2151,12 @@ def _render_favorability_rank_impl(
     _mcy = hy + 2 + (_ink_top + _ink_bot) / 2
     draw.text(
         (hx + card_w - pad * 2 - _mw, _mcy - (_mk[1] + _mk[3]) / 2),
-        meta_text, font=f_meta, fill=_MUTED,
+        meta_text, font=f_meta, fill=_pal("muted"),
     )
 
     # 标题区分隔线（暖米色）
     _line_y = hy + header_h - 16
-    draw.rectangle([hx, _line_y, hx + card_w - pad * 2, _line_y], fill=(244, 236, 226))
+    draw.rectangle([hx, _line_y, hx + card_w - pad * 2, _line_y], fill=_pal("divider"))
 
     _av_fail = [0]   # 头像抓取连续失败计数（断网保护）
     row_base_y = hy + header_h
@@ -2140,11 +2194,11 @@ def _render_favorability_rank_impl(
         score = _as_int(entry.get("score"), 0)
         # 0 分走中性色：旧实现 score>=0 一律珊瑚色，把 0 画成了"正分"
         if score > 0:
-            score_color = _ACCENT
+            score_color = _pal("accent")
         elif score < 0:
-            score_color = _COOL
+            score_color = _pal("cool")
         else:
-            score_color = _NEUTRAL
+            score_color = _pal("neutral")
 
         # 左侧竖条：前三名用名次金/银/铜，其余按分数正负着色。
         # 旧实现用三层偏移的"假阴影"叠出行卡片，边缘发灰且各行不一致。
@@ -2230,7 +2284,7 @@ def _render_favorability_rank_impl(
         raw_name = display_name
         name = _truncate(draw, str(raw_name), f_name, name_max_w)
         nb = draw.textbbox((0, 0), name, font=f_name)
-        draw.text((text_x, y + 11 - nb[1]), name, font=f_name, fill=_TEXT)
+        draw.text((text_x, y + 11 - nb[1]), name, font=f_name, fill=_pal("text"))
 
         # ---------- 右上：好感度 ----------
         score_text = f"{score:+d}" if score != 0 else "0"
@@ -2338,12 +2392,16 @@ def _render_favorability_rank_impl(
             #   ID   → 中性灰（辅助信息，弱化）
             #   关系 → 珊瑚（分类标签，强调）
             #   印象 → 淡青（一句话描述，与标签区分）
+            # 底色统一 accent_soft（标签底色可 DIY），层级靠**文字色**区分：
+            #   ID   → subtext（弱化）
+            #   关系 → accent（强调）
+            #   印象 → body（「稳定印象正文」这一项，排行榜里也生效）
             if kind == "ID":
-                tag_bg, tag_fg = (244, 238, 230), (140, 118, 98)
+                tag_bg, tag_fg = _pal("accent_soft"), _pal("subtext")
             elif kind == "SUM":
-                tag_bg, tag_fg = (247, 240, 226), (154, 120, 62)
+                tag_bg, tag_fg = _pal("accent_soft"), _pal("body")
             else:
-                tag_bg, tag_fg = _ACCENT_SOFT, _ACCENT
+                tag_bg, tag_fg = _pal("accent_soft"), _pal("accent")
             draw.rounded_rectangle(
                 [tx, line2_y, tx + pw, line2_y + pill_h],
                 radius=9.5, fill=tag_bg,
@@ -2359,13 +2417,11 @@ def _render_favorability_rank_impl(
     if _omitted:
         fy = MARGIN + card_h - bottom_pad - foot_h + 9
         tip = f"另有 {_omitted} 人未显示"
-        draw.text((hx + 1, fy), tip, font=f_sub, fill=_MUTED)
+        draw.text((hx + 1, fy), tip, font=f_sub, fill=_pal("muted"))
 
     # 玻璃边缘（描边 + 顶部高光）最后统一合成：返回新图像，之后不再绘制
     img = _glass_edges(PIL, img, _edge_panels, scale=S)
 
-    img = _compose_layers(PIL, img, front_layers, stage="front",
-                          base_ctx={"scale": S, "font_path": font_path_resolved})
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
     return buf.getvalue()
@@ -2418,7 +2474,11 @@ def render_profile_card(
     bg_path: str = "",
     bg_blur: float = 14.0,
     bg_dim: int = 0,
-    layers: Any = None,
+    panel_alpha: int = -1,
+    panel_blur: int = -1,
+    bg_anchor: str = "auto",
+    ink: str = "auto",
+    style=None,
 ) -> bytes | None:
     """渲染**单人**关系档案卡片，返回 PNG 字节；不可用返回 None。
 
@@ -2434,7 +2494,12 @@ def render_profile_card(
         return _render_profile_card_impl(
             entry, max_abs_score, font_path=font_path, font_dir=font_dir,
             avatar_dir=avatar_dir, scale=scale,
-            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim, layers=layers,
+            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim,
+            panel_alpha=panel_alpha,
+            panel_blur=panel_blur,
+            bg_anchor=bg_anchor,
+            ink=ink,
+            style=style,
         )
     except Exception:  # noqa: BLE001
         logger.exception("关系档案卡片渲染异常，回退为文本")
@@ -2452,9 +2517,12 @@ def _render_profile_card_impl(
     bg_path: str = "",
     bg_blur: float = 14.0,
     bg_dim: int = 0,
-    layers: Any = None,
+    panel_alpha: int = -1,
+    panel_blur: int = -1,
+    bg_anchor: str = "auto",
+    ink: str = "auto",
+    style=None,
 ) -> bytes | None:
-    back_layers, front_layers = _split_layers(layers, has_bg=bool(str(bg_path or "").strip()))
     PIL = _load_pil()
     if PIL is None:
         return None
@@ -2539,19 +2607,28 @@ def _render_profile_card_impl(
     img_w = CARD_W + MARGIN * 2
     img_h = card_h + MARGIN * 2
 
+    # 背景：自定义图片（cover 裁剪 + 模糊 + 明暗）或内置暖色渐变，再叠一层装饰光斑。
     _bg_ctx.is_image = bool(str(bg_path or "").strip())
-    img = _compose_layers(
-        PIL,
-        _background(PIL, int(img_w * S), int(img_h * S),
-                    path=bg_path, blur=bg_blur, dim=bg_dim, scale=S),
-        back_layers, stage="back", base_ctx={"scale": S, "font_path": fp},
-    )
     try:
-        img = PIL.Image.alpha_composite(
-            img.convert("RGBA"), _decorative_blobs(PIL, img.width, img.height)
-        ).convert("RGB")
-    except Exception:  # noqa: BLE001
-        logger.debug("档案卡背景光斑绘制失败，已跳过", exc_info=True)
+        _bg_ctx.panel_alpha = int(panel_alpha)
+    except (TypeError, ValueError):
+        _bg_ctx.panel_alpha = -1
+    try:
+        _bg_ctx.panel_blur = int(panel_blur)
+    except (TypeError, ValueError):
+        _bg_ctx.panel_blur = -1
+    _bg_ctx.style = normalize_style(style)
+    img = _legacy_background(
+        PIL, int(img_w * S), int(img_h * S),
+        path=bg_path, blur=bg_blur, dim=bg_dim, scale=S, anchor=bg_anchor,
+    )
+
+    # 文字配色：按「这张卡的面板最终有多亮」在深浅两套墨色之间切换（2.4.10）
+    _bg_ctx.palette = _pick_palette(ink, _panel_luma_estimate(
+        PIL, img,
+        (MARGIN * S, MARGIN * S, (MARGIN + CARD_W) * S, (MARGIN + card_h) * S),
+        panel_alpha,
+    ))
 
     try:
         from PIL import ImageFilter
@@ -2588,7 +2665,7 @@ def _render_profile_card_impl(
         gpx = grad.load()
         for yy in range(_bh):
             k = yy / max(_bh - 1, 1)
-            col = tuple(int(_ACCENT[i] + (_ACCENT_LIGHT[i] - _ACCENT[i]) * k) for i in range(3))
+            col = tuple(int(_pal("accent")[i] + (_pal("accent_light")[i] - _pal("accent")[i]) * k) for i in range(3))
             for xx in range(_bw):
                 gpx[xx, yy] = col
         gmask = PIL.Image.new("L", (_bw, _bh), 0)
@@ -2598,8 +2675,8 @@ def _render_profile_card_impl(
         img.paste(grad, (int(hx * S), int((hy + 2 + _ink_top) * S)), gmask)
     except Exception:  # noqa: BLE001
         draw.rounded_rectangle([hx, hy + 2 + _ink_top, hx + 5, hy + 2 + _ink_top + _ink_h],
-                               radius=2.5, fill=_ACCENT)
-    draw.text((hx + 15, hy + 2), "关系档案", font=f_title, fill=_TEXT)
+                               radius=2.5, fill=_pal("accent"))
+    draw.text((hx + 15, hy + 2), "关系档案", font=f_title, fill=_pal("text"))
 
     # 右上：最近互动 / 更新时间（弱化）
     _meta_bits = []
@@ -2616,15 +2693,15 @@ def _render_profile_card_impl(
         _mk = draw.textbbox((0, 0), meta_text, font=f_meta)
         _mcy = hy + 2 + (_ink_top + _ink_bot) / 2
         draw.text((right_edge - _mw, _mcy - (_mk[1] + _mk[3]) / 2),
-                  meta_text, font=f_meta, fill=_MUTED)
+                  meta_text, font=f_meta, fill=_pal("muted"))
 
     # 标题区分隔线
     _line_y = hy + header_h - 14
-    draw.rectangle([hx, _line_y, right_edge, _line_y], fill=(244, 236, 226))
+    draw.rectangle([hx, _line_y, right_edge, _line_y], fill=_pal("divider"))
 
     # ---------------- 档案主体：头像 + 昵称 + ID + 阶段 + 分数 ----------------
     py = hy + header_h
-    score_color = _ACCENT if score > 0 else (_COOL if score < 0 else _NEUTRAL)
+    score_color = _pal("accent") if score > 0 else (_pal("cool") if score < 0 else _pal("neutral"))
 
     ax, ay = hx + AV_R, py + AV_R
     av_img = None
@@ -2656,7 +2733,7 @@ def _render_profile_card_impl(
     score_x = right_edge - _sw - _uw
     draw.text((score_x, py - 4), score_text, font=f_score, fill=score_color)
     if max_abs_score:
-        draw.text((score_x + _sw + 2, py + 18), f"/{max_abs_score}", font=f_unit, fill=_MUTED)
+        draw.text((score_x + _sw + 2, py + 18), f"/{max_abs_score}", font=f_unit, fill=_pal("muted"))
 
     # 双向进度条（以 0 为中点；与排行榜同款语义）
     bar_w, bar_h = 200, 6
@@ -2680,7 +2757,7 @@ def _render_profile_card_impl(
     # 昵称
     name_max_w = max(80, score_x - text_x - 16)
     draw.text((text_x, py - 6), _truncate(draw, display_name, f_name, name_max_w),
-              font=f_name, fill=_TEXT)
+              font=f_name, fill=_pal("text"))
 
     # ID 胶囊 + 阶段胶囊
     pill_y = py + 30
@@ -2690,9 +2767,9 @@ def _render_profile_card_impl(
         _id_txt = f"ID {uid}"
         _w = int(draw.textlength(_id_txt, font=f_id)) + 20
         draw.rounded_rectangle([tx, pill_y, tx + _w, pill_y + pill_h], radius=9.5,
-                               fill=(244, 238, 230))
+                               fill=_pal("accent_soft"))
         _draw_centered(draw, [tx, pill_y, tx + _w, pill_y + pill_h], _id_txt, f_id,
-                       (140, 118, 98))
+                       _pal("subtext"))
         tx += _w + 8
     if stage:
         stage_bg, stage_fg = _STAGE_STYLES.get(stage, _STAGE_STYLES["中立"])
@@ -2711,8 +2788,8 @@ def _render_profile_card_impl(
             for tg in row:
                 _w = int(draw.textlength(tg, font=f_tag)) + 20
                 draw.rounded_rectangle([tx, y, tx + _w, y + pill_h], radius=9.5,
-                                       fill=_ACCENT_SOFT)
-                _draw_centered(draw, [tx, y, tx + _w, y + pill_h], tg, f_tag, _ACCENT)
+                                       fill=_pal("accent_soft"))
+                _draw_centered(draw, [tx, y, tx + _w, y + pill_h], tg, f_tag, _pal("accent"))
                 tx += _w + 8
             y += 28
         y += 14
@@ -2727,23 +2804,21 @@ def _render_profile_card_impl(
     # 这里上下各放 1~2px 让色块把整行字的视觉高度盖住，与标题红标观感一致。
     _lab_h = max(9, _lab_bot - _lab_top + 1)
     draw.rounded_rectangle(
-        [hx, y + _lab_top, hx + 4, y + _lab_top + _lab_h], radius=2, fill=_ACCENT,
+        [hx, y + _lab_top, hx + 4, y + _lab_top + _lab_h], radius=2, fill=_pal("accent"),
     )
-    draw.text((hx + 12, y), "稳定印象", font=f_label, fill=_SUBTEXT)
+    draw.text((hx + 12, y), "稳定印象", font=f_label, fill=_pal("subtext"))
     y += sum_label_h
 
     _empty = not summary
     for line in body_lines:
-        draw.text((hx, y), line, font=f_body, fill=(_MUTED if _empty else (88, 68, 52)))
+        draw.text((hx, y), line, font=f_body, fill=_pal("body"))
         y += line_h
 
     # ---------------- 页脚 ----------------
     fy = MARGIN + card_h - pad - foot_h + 10
-    draw.text((hx, fy), "nekro_persona · 关系档案", font=f_foot, fill=_MUTED)
+    draw.text((hx, fy), "nekro_persona · 关系档案", font=f_foot, fill=_pal("muted"))
 
     img = _glass_edges(PIL, img, [(card_box, 24, (255, 255, 255, 150), (255, 255, 255, 210))], scale=S)
-    img = _compose_layers(PIL, img, front_layers, stage="front",
-                          base_ctx={"scale": S, "font_path": fp})
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
     return buf.getvalue()
@@ -2774,14 +2849,23 @@ def render_impression_overview(
     bg_path: str = "",
     bg_blur: float = 14.0,
     bg_dim: int = 0,
-    layers: Any = None,
+    panel_alpha: int = -1,
+    panel_blur: int = -1,
+    bg_anchor: str = "auto",
+    ink: str = "auto",
+    style=None,
 ) -> bytes | None:
     """渲染「印象总览」：每人一行，带头像/昵称/ID/标签/稳定印象/好感度。不可用返回 None。"""
     try:
         return _render_impression_overview_impl(
             entries, max_abs_score, limit=limit, font_path=font_path,
             font_dir=font_dir, avatar_dir=avatar_dir, scale=scale,
-            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim, layers=layers,
+            bg_path=bg_path, bg_blur=bg_blur, bg_dim=bg_dim,
+            panel_alpha=panel_alpha,
+            panel_blur=panel_blur,
+            bg_anchor=bg_anchor,
+            ink=ink,
+            style=style,
         )
     except Exception:  # noqa: BLE001
         logger.exception("印象总览卡片渲染异常，回退为文本")
@@ -2800,7 +2884,11 @@ def _render_impression_overview_impl(
     bg_path: str = "",
     bg_blur: float = 14.0,
     bg_dim: int = 0,
-    layers: Any = None,
+    panel_alpha: int = -1,
+    panel_blur: int = -1,
+    bg_anchor: str = "auto",
+    ink: str = "auto",
+    style=None,
 ) -> bytes | None:
     """印象总览：按人数自动分列，**每格竖向节奏与「查看印象」单人卡一致**。
 
@@ -2808,7 +2896,6 @@ def _render_impression_overview_impl(
     标签高 20 行距 6 / 「稳定印象」标题 30 / 正文 15px·25px 行距 / 底部内边距 16。
     上一版把这些数压成 14/26/18/24/13·20，中文行被压到字脚贴边，看着像被盖住。
     """
-    back_layers, front_layers = _split_layers(layers, has_bg=bool(str(bg_path or "").strip()))
     PIL = _load_pil()
     if PIL is None:
         return None
@@ -2959,19 +3046,28 @@ def _render_impression_overview_impl(
     img_w = card_w + MARGIN * 2
     img_h = card_h + MARGIN * 2
 
+    # 背景：自定义图片（cover 裁剪 + 模糊 + 明暗）或内置暖色渐变，再叠一层装饰光斑。
     _bg_ctx.is_image = bool(str(bg_path or "").strip())
-    img = _compose_layers(
-        PIL,
-        _background(PIL, int(img_w * S), int(img_h * S),
-                    path=bg_path, blur=bg_blur, dim=bg_dim, scale=S),
-        back_layers, stage="back", base_ctx={"scale": S, "font_path": fp},
-    )
     try:
-        img = PIL.Image.alpha_composite(
-            img.convert("RGBA"), _decorative_blobs(PIL, img.width, img.height)
-        ).convert("RGB")
-    except Exception:  # noqa: BLE001
-        logger.debug("印象总览背景光斑绘制失败，已跳过", exc_info=True)
+        _bg_ctx.panel_alpha = int(panel_alpha)
+    except (TypeError, ValueError):
+        _bg_ctx.panel_alpha = -1
+    try:
+        _bg_ctx.panel_blur = int(panel_blur)
+    except (TypeError, ValueError):
+        _bg_ctx.panel_blur = -1
+    _bg_ctx.style = normalize_style(style)
+    img = _legacy_background(
+        PIL, int(img_w * S), int(img_h * S),
+        path=bg_path, blur=bg_blur, dim=bg_dim, scale=S, anchor=bg_anchor,
+    )
+
+    # 文字配色：按「这张卡的面板最终有多亮」在深浅两套墨色之间切换（2.4.10）
+    _bg_ctx.palette = _pick_palette(ink, _panel_luma_estimate(
+        PIL, img,
+        (MARGIN * S, MARGIN * S, (MARGIN + card_w) * S, (MARGIN + card_h) * S),
+        panel_alpha,
+    ))
 
     try:
         from PIL import ImageFilter
@@ -3006,7 +3102,7 @@ def _render_impression_overview_impl(
         gpx = grad.load()
         for yy in range(_bh):
             k = yy / max(_bh - 1, 1)
-            col = tuple(int(_ACCENT[i] + (_ACCENT_LIGHT[i] - _ACCENT[i]) * k) for i in range(3))
+            col = tuple(int(_pal("accent")[i] + (_pal("accent_light")[i] - _pal("accent")[i]) * k) for i in range(3))
             for xx in range(_bw):
                 gpx[xx, yy] = col
         gmask = PIL.Image.new("L", (_bw, _bh), 0)
@@ -3016,8 +3112,8 @@ def _render_impression_overview_impl(
         img.paste(grad, (int(hx * S), int((hy + 2 + _ink_top) * S)), gmask)
     except Exception:  # noqa: BLE001
         draw.rounded_rectangle([hx, hy + 2 + _ink_top, hx + 5, hy + 2 + _ink_top + _ink_h],
-                               radius=2.5, fill=_ACCENT)
-    draw.text((hx + 15, hy + 2), "印象总览", font=f_title, fill=_TEXT)
+                               radius=2.5, fill=_pal("accent"))
+    draw.text((hx + 15, hy + 2), "印象总览", font=f_title, fill=_pal("text"))
 
     meta_text = f"共 {len(entries)} 人（有标签）"
     if omitted:
@@ -3025,10 +3121,10 @@ def _render_impression_overview_impl(
     _mw = int(draw.textlength(meta_text, font=f_meta))
     _mk = draw.textbbox((0, 0), meta_text, font=f_meta)
     _mcy = hy + 2 + (_ink_top + _ink_bot) / 2
-    draw.text((right_edge - _mw, _mcy - (_mk[1] + _mk[3]) / 2), meta_text, font=f_meta, fill=_MUTED)
+    draw.text((right_edge - _mw, _mcy - (_mk[1] + _mk[3]) / 2), meta_text, font=f_meta, fill=_pal("muted"))
 
     _line_y = hy + header_h - 14
-    draw.rectangle([hx, _line_y, right_edge, _line_y], fill=(244, 236, 226))
+    draw.rectangle([hx, _line_y, right_edge, _line_y], fill=_pal("divider"))
 
     # ── 逐格 ───────────────────────────────────────────────────────
     row_base_y = hy + header_h
@@ -3044,7 +3140,7 @@ def _render_impression_overview_impl(
             draw = _make_draw(img, ImageDraw, font_dir, S)
 
             score = r["score"]
-            score_color = _ACCENT if score > 0 else (_COOL if score < 0 else _NEUTRAL)
+            score_color = _pal("accent") if score > 0 else (_pal("cool") if score < 0 else _pal("neutral"))
             draw.rounded_rectangle([cx0 + 7, y + 16, cx0 + 10, y + r["h"] - 16],
                                    radius=2, fill=score_color)
 
@@ -3083,12 +3179,12 @@ def _render_impression_overview_impl(
             draw.text((score_x, y + cell_pad - 4), score_text, font=f_score, fill=score_color)
             if max_abs_score:
                 draw.text((score_x + _sw + 1, y + cell_pad + 12), f"/{max_abs_score}",
-                          font=f_unit, fill=_MUTED)
+                          font=f_unit, fill=_pal("muted"))
 
             # 昵称
             name_max_w = max(70, score_x - text_x - 10)
             draw.text((text_x, y + cell_pad - 6),
-                      _truncate(draw, r["name"], f_name, name_max_w), font=f_name, fill=_TEXT)
+                      _truncate(draw, r["name"], f_name, name_max_w), font=f_name, fill=_pal("text"))
 
             # ID / 阶段胶囊：顶边必须落在名字墨迹之下（23px 名字的 ink 底 ≈ cell_pad+28），
             # 否则胶囊会盖住名字下半截（上一版就是这么糊的）。
@@ -3099,9 +3195,9 @@ def _render_impression_overview_impl(
                 _w = int(draw.textlength(_id_txt, font=f_id)) + 16
                 if tx + _w <= cx1 - cell_pad:
                     draw.rounded_rectangle([tx, pill_y, tx + _w, pill_y + pill_h], radius=9,
-                                           fill=(244, 238, 230))
+                                           fill=_pal("accent_soft"))
                     _draw_centered(draw, [tx, pill_y, tx + _w, pill_y + pill_h], _id_txt, f_id,
-                                   (140, 118, 98))
+                                   _pal("subtext"))
                     tx += _w + 6
             if r["stage"]:
                 stage_bg, stage_fg = _STAGE_STYLES.get(r["stage"], _STAGE_STYLES["中立"])
@@ -3119,17 +3215,19 @@ def _render_impression_overview_impl(
                 for tg in trow:
                     _w = int(draw.textlength(tg, font=f_tag)) + 18
                     draw.rounded_rectangle([tx, ty, tx + _w, ty + tag_h], radius=9,
-                                           fill=_ACCENT_SOFT)
-                    _draw_centered(draw, [tx, ty, tx + _w, ty + tag_h], tg, f_tag, _ACCENT)
+                                           fill=_pal("accent_soft"))
+                    _draw_centered(draw, [tx, ty, tx + _w, ty + tag_h], tg, f_tag, _pal("accent"))
                     tx += _w + tag_gap
-                if r["overflow"]:
+                # +N 胶囊只在**最后一行**画：画在循环里时 2 行标签会重复出现
+                # （2.4.3 修）。
+                if r["overflow"] and trow is r["tags"][-1]:
                     _more = f"+{r['overflow']}"
                     _w = int(draw.textlength(_more, font=f_tag)) + 18
                     if tx + _w <= cx1 - cell_pad:
                         draw.rounded_rectangle([tx, ty, tx + _w, ty + tag_h], radius=9,
-                                               fill=(244, 238, 230))
+                                               fill=_pal("accent_soft"))
                         _draw_centered(draw, [tx, ty, tx + _w, ty + tag_h], _more, f_tag,
-                                       (140, 118, 98))
+                                       _pal("subtext"))
                 ty += tag_h + tag_gap
             if r["tags"]:
                 ty += tag_gap_after - tag_gap
@@ -3140,13 +3238,12 @@ def _render_impression_overview_impl(
             _lab_h = max(9, _lab_bot - _lab_top + 1)
             _lx = cx0 + cell_pad
             draw.rounded_rectangle([_lx, ty + _lab_top, _lx + 4, ty + _lab_top + _lab_h],
-                                   radius=2, fill=_ACCENT)
-            draw.text((_lx + 11, ty), "稳定印象", font=f_label, fill=_SUBTEXT)
+                                   radius=2, fill=_pal("accent"))
+            draw.text((_lx + 11, ty), "稳定印象", font=f_label, fill=_pal("subtext"))
             ty += label_h
 
             for line in r["body"]:
-                draw.text((cx0 + cell_pad, ty), line, font=f_body,
-                          fill=(_MUTED if r["empty_body"] else (92, 72, 56)))
+                draw.text((cx0 + cell_pad, ty), line, font=f_body, fill=_pal("body"))
                 ty += body_line_h
 
             _edges.append((box, 14, (255, 255, 255, 90), None))
@@ -3156,14 +3253,12 @@ def _render_impression_overview_impl(
     fy = MARGIN + card_h - pad - foot_h + 8
     if omitted:
         draw.text((hx, fy), f"另有 {omitted} 位有标签的人未显示（按好感度取前 {len(shown)} 位）",
-                  font=f_foot, fill=_MUTED)
+                  font=f_foot, fill=_pal("muted"))
     _wm = "nekro_persona · 印象总览"
     draw.text((right_edge - int(draw.textlength(_wm, font=f_foot)), fy), _wm,
-              font=f_foot, fill=_MUTED)
+              font=f_foot, fill=_pal("muted"))
 
     img = _glass_edges(PIL, img, _edges, scale=S)
-    img = _compose_layers(PIL, img, front_layers, stage="front",
-                          base_ctx={"scale": S, "font_path": fp})
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
     return buf.getvalue()

@@ -310,6 +310,28 @@ def _validate_favor_cfg(data: Any) -> str:
 _TIER_LABEL = {"tier1": "1 档·身份", "tier2": "2 档·往事", "tier3": "3 档·世界知识"}
 
 
+def _render_unavailable_detail(pil_state: dict, font_name: str = "") -> str:
+    """渲染返回 None 时给人看的原因（2.5.8）。三种情况分别给不同文案：
+
+    1. Pillow 不可用 → 说明会自动回退文字版，并给出 pip install pillow 的修法；
+    2. Pillow 正常但没有中文字体 → 引导上传/放置字体；
+    3. 两者都正常却仍失败 → 指向日志，别乱猜。
+    """
+    ps = pil_state or {}
+    if ps.get("ok") is False:
+        reason = str(ps.get("reason") or "").strip() or "未检测到 Pillow"
+        return (
+            f"渲染不可用：{reason}。图片卡片会自动回退为文字版；"
+            f"在容器里执行 pip install pillow 后重试（或重装插件触发自动安装）"
+        )
+    if not str(font_name or "").strip():
+        return (
+            "渲染不可用：没找到中文字体。把字体放到插件数据目录 fonts/，"
+            "或用上面的「上传自定义字体」再试"
+        )
+    return "渲染不可用：Pillow 与字体都在，但渲染仍失败（看插件日志里 persona 的关键字）"
+
+
 def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any]) -> APIRouter:
     """helpers: 由 plugin.py 传入的内部函数（load_state/save_state/stage_info/
     clamp_score/max_abs_score/now_ts）。不在此处 import 插件模块——
@@ -394,8 +416,8 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         · 只接受 `X-WebUI-Key` 请求头，不再接受 `?key=` 查询参数
           （查询参数会进访问日志 / 浏览器历史 / Referer，等于泄露密钥）。
         · 用 hmac.compare_digest 做常数时间比较，避免按字节短路泄露密钥长度与前缀。
-        · 未配置密钥时：只读（GET）放行，写操作（非 GET）一律 403——
-          防止插件路由在 NA 全局鉴权之外「裸奔」改人设记忆与人格预设。
+        · 未配置密钥时一律 401（读写都拒，2.4.3 起）——防止插件路由在 NA 全局
+          鉴权之外「裸奔」；页面壳 GET / 仍公开，否则首次打开连设密钥入口都没有。
         """
         expect = str(getattr(config, "WEBUI_ACCESS_KEY", "") or "").strip()
         got = str(request.headers.get("X-WebUI-Key") or "").strip()
@@ -768,6 +790,17 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             _write_trash(remaining)
             return True
 
+    # 配置读-改-写锁（2.4.3）：config/card_bg/font 等端点并发时
+    # 各自 get_config → setattr → save_config，last-writer-wins 会丢字段。
+    _CONFIG_LOCK = threading.RLock()
+
+    def _set_cfg(**kv: Any) -> None:
+        with _CONFIG_LOCK:
+            cfg = plugin.get_config()
+            for _k, _v in kv.items():
+                setattr(cfg, _k, _v)
+            plugin.save_config(cfg)
+
     def _public_detail(text: str) -> str:
         """把宿主机绝对路径换成占位符。
 
@@ -812,6 +845,17 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         from nekro_agent.models.db_plugin_data import DBPluginData
 
         rows = await DBPluginData.filter(plugin_key=plugin.key).all()
+        # ⚠️ 多账号分支（NA5）：plugin_data 有 account_key 列。不过滤会把**所有账号**
+        #    的频道键/人数/最高分列给当前账号（实测三账号都看到同样的 173 人/9 频道）。
+        #    口径与 /api/index 一致：本账号行 + 键带本账号后缀 + 无后缀历史行可见。
+        _acct = helpers.get("account_key", lambda: "")() if helpers else ""
+        if _acct:
+            def _row_in_scope(r) -> bool:
+                if str(getattr(r, "account_key", "") or "") == _acct:
+                    return True
+                _owner = helpers["chat_key_account"](str(getattr(r, "target_chat_key", "") or ""))
+                return (not _owner) or _owner == _acct
+            rows = [r for r in rows if _row_in_scope(r)]
         out: List[Dict[str, Any]] = []
         for r in rows:
             ck = r.target_chat_key or ""
@@ -927,6 +971,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             return dict(sorted(d.items(), key=lambda kv: int(kv[0])))
 
         return {
+            "render": {
+                # 渲染后端状态（2.5.8）：Pillow 缺失时概览页据此提醒一次
+                "pillow": (lambda: _card.pil_status())() if hasattr(_card, "pil_status") else {},
+            },
             "plugin": {
                 "key": plugin.key,
                 "name": plugin.name,
@@ -1966,10 +2014,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             patch[k] = v
         if not patch:
             raise HTTPException(status_code=400, detail="没有要修改的配置")
-        cfg = plugin.get_config()
-        for k, v in patch.items():
-            setattr(cfg, k, v)
-        plugin.save_config(cfg)
+        _set_cfg(**patch)
         def _redact(d: Dict[str, Any]) -> Dict[str, Any]:
             """日志脱敏：键名里带 KEY/TOKEN/SECRET/PASSWORD 的值一律打码。
 
@@ -1994,7 +2039,24 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         body = await _json_body(request)
         patch: Dict[str, Any] = {}
         if "enabled" in body:
-            patch["enabled"] = bool(body["enabled"])
+            # ⚠️ 不能 bool(str)：传 "false"/"0"/"no" 会变成 True（/api/config 的
+            #    _cfg_value 半年前就修掉同一类，这里漏改，2.4.3 补齐）。
+            _raw_en = body["enabled"]
+            if isinstance(_raw_en, bool):
+                patch["enabled"] = _raw_en
+            elif isinstance(_raw_en, (int, float)):
+                patch["enabled"] = bool(_raw_en)
+            else:
+                _s = str(_raw_en).strip().lower()
+                if _s in ("true", "1", "yes", "on"):
+                    patch["enabled"] = True
+                elif _s in ("false", "0", "no", "off", ""):
+                    patch["enabled"] = False
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"enabled 必须是 true/false，收到 {_raw_en!r}",
+                    )
         if "stages" in body and isinstance(body["stages"], list):
             raw_stages = body["stages"]
             if not raw_stages and not bool(body.get("allow_empty_stages", False)):
@@ -2523,6 +2585,21 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         if not body:
             raise HTTPException(status_code=400, detail="没有收到文件内容")
         import io as _io
+
+        def _zip_read(zf, name: str) -> bytes:
+            """限量读取 zip 成员（2.4.3）：32MB 压缩包可放大到数 GB，
+            无脑 zf.read() 会 OOM 拖垮整个 NA 进程。"""
+            _MAX_MEMBER = 256 * 1024 * 1024
+            try:
+                _sz = zf.getinfo(name).file_size
+            except Exception:  # noqa: BLE001
+                _sz = 0
+            if _sz > _MAX_MEMBER:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"包内文件 {name} 解压后超过 256 MB，已拒绝",
+                )
+            return zf.read(name)
         import zipfile as _zipfile
         from datetime import datetime as _datetime
 
@@ -2571,7 +2648,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         arch_items: List[tuple] = []
         if arch_src:
             try:
-                arch_obj = json.loads(zf.read(arch_src).decode("utf-8"))
+                arch_obj = json.loads(_zip_read(zf, arch_src).decode("utf-8"))
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(status_code=400, detail=_public_detail(f"archives.json 不是合法 JSON：{exc}")) from exc
             if not isinstance(arch_obj, dict):
@@ -2612,7 +2689,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         # 1) tier4.json —— 校验后覆盖（原子写：tmp + os.replace）
         t4_src = next((n for n in names if n.endswith("tier4.json")), None)
         if t4_src:
-            raw = zf.read(t4_src)
+            raw = _zip_read(zf, t4_src)
             try:
                 data = json.loads(raw.decode("utf-8"))
             except Exception as exc:  # noqa: BLE001
@@ -2654,7 +2731,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         return {
             "ok": True,
             "applied": applied,
-            "backup_dir": str(bdir),
+            "backup_dir": _public_detail(str(bdir)),
             "backed_up_archives": backed_arch,
             "note": "关系档案与 tier4 即时生效；热度（命中统计）不随生长包迁移，由本实例自行累积。",
             **reload_state,
@@ -2739,6 +2816,21 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         if not body:
             raise HTTPException(status_code=400, detail="没有收到文件内容")
         import io as _io
+
+        def _zip_read(zf, name: str) -> bytes:
+            """限量读取 zip 成员（2.4.3）：32MB 压缩包可放大到数 GB，
+            无脑 zf.read() 会 OOM 拖垮整个 NA 进程。"""
+            _MAX_MEMBER = 256 * 1024 * 1024
+            try:
+                _sz = zf.getinfo(name).file_size
+            except Exception:  # noqa: BLE001
+                _sz = 0
+            if _sz > _MAX_MEMBER:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"包内文件 {name} 解压后超过 256 MB，已拒绝",
+                )
+            return zf.read(name)
         import zipfile as _zipfile
         from datetime import datetime as _datetime
 
@@ -2781,7 +2873,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             src = _pick(arc)
             if src is None:
                 continue
-            raw = zf.read(src)
+            raw = _zip_read(zf, src)
             try:
                 data = json.loads(raw.decode("utf-8"))
             except Exception as exc:
@@ -2834,7 +2926,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     status_code=400,
                     detail=f"预设文件名不是合法 id：{_n}（已拒绝导入，未改动任何文件）",
                 ) from exc
-            _ptext = zf.read(_n).decode("utf-8", "replace")
+            _ptext = _zip_read(zf, _n).decode("utf-8", "replace")
             if _ptext.strip():
                 # ⚠️ 必须与导出**同向**：导出是「字面 \n → 真换行」（webui.py 的导出段），
                 #    这里原来是反的（字面 \n → \\n），两者不互逆：md 里手写的字面 \n
@@ -2899,7 +2991,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "applied": applied,
             "preset_applied": preset_applied,
             "preset_failed": preset_failed,
-            "backup_dir": str(bdir),
+            "backup_dir": _public_detail(str(bdir)),
             **reload_state,
         }
 
@@ -2946,73 +3038,60 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
     def _bg_custom_dir() -> Path:
         return plugin.get_plugin_data_dir() / "backgrounds_custom"
 
-    _LAYERS_CACHE: Dict[str, Any] = {}
-
-    def _current_layers():
-        """当前生效的图层模板（配置给路径或内联 JSON）；没配返回 None = 内置默认。"""
+    def _style_state() -> Dict[str, Any]:
+        """DIY 配色：token 表（含默认值/中文名）+ 当前生效值。"""
         cfg = plugin.get_config()
-        raw_val = str(getattr(cfg, "RANK_CARD_LAYERS", "") or "").strip()
-        if not raw_val:
-            return None
-        if raw_val.startswith(("[", "{")):
-            try:
-                return json.loads(raw_val)
-            except Exception:  # noqa: BLE001
-                return None
-        try:
-            p = Path(raw_val)
-            if not p.is_file():
-                return None
-            key = f"{p}:{int(p.stat().st_mtime)}"
-            if key in _LAYERS_CACHE:
-                return _LAYERS_CACHE[key]
-            data = json.loads(p.read_text(encoding="utf-8"))
-            cover = data.get("layers") if isinstance(data, dict) else data
-            resolved = _card.resolve_layer_sources(cover or [], str(plugin.get_plugin_data_dir()))
-            data = {"layers": resolved} if isinstance(data, dict) else resolved
-            _LAYERS_CACHE.clear()
-            _LAYERS_CACHE[key] = data
-            return data
-        except Exception:  # noqa: BLE001
-            return None
-
-    def _layers_dir() -> Path:
-        return plugin.get_plugin_data_dir() / "card_layers"
-
-    def _layers_templates() -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
-        try:
-            d = _layers_dir()
-            if d.is_dir():
-                for f in sorted(d.glob("*.json")):
-                    try:
-                        data = json.loads(f.read_text(encoding="utf-8"))
-                    except Exception:  # noqa: BLE001
-                        continue
-                    layers = data.get("layers") if isinstance(data, dict) else data
-                    out.append({"name": f.stem, "layers": layers or [],
-                                "count": len(layers or [])})
-        except Exception:  # noqa: BLE001
-            pass
-        return out
-
-    def _layers_state() -> Dict[str, Any]:
-        cfg = plugin.get_config()
-        cur = str(getattr(cfg, "RANK_CARD_LAYERS", "") or "").strip()
-        return {
-            "config": cur,
-            "name": Path(cur).stem if cur else "",
-            "exists": bool(cur and Path(cur).is_file()),
-            "templates": _layers_templates(),
-            "types": list(_card._LAYER_TYPES),
-            "defaults": [dict(x) for x in _card._LAYER_DEFAULT],
-            "images": _bg_state()["images"],
-        }
+        raw_json = str(getattr(cfg, "RANK_CARD_STYLE", "") or "")
+        cur = _card.normalize_style(raw_json)
+        items = []
+        for key, spec in _card.STYLE_TOKENS.items():
+            label, default_hex = spec[0], spec[1]
+            where = spec[2] if len(spec) > 2 else ""
+            raw_val = cur.get(key)
+            if raw_val == "#0":
+                shown = "#0"
+            elif isinstance(raw_val, (tuple, list)) and len(raw_val) >= 3:
+                shown = "#%02x%02x%02x" % tuple(raw_val)[:3]
+            else:
+                shown = default_hex
+            items.append({
+                "key": key,
+                "label": label,
+                "where": where,
+                "default": default_hex,
+                "value": shown,
+                "custom": key in cur,
+                "zero": raw_val == "#0",
+                # 渐变三色不支持 #0（分段颜色没有"不渲染"的语义）
+                "supportsZero": key not in ("bg_top", "bg_mid", "bg_bottom"),
+            })
+        return {"raw": raw_json, "tokens": items,
+                "customCount": len(cur),
+                "note": "只开放颜色：卡片尺寸、间距、结构（框架）不可改"}
 
     def _bg_state() -> Dict[str, Any]:
         """当前背景配置 + 目录里可选的自定义背景图。"""
         cfg = plugin.get_config()
         cur = str(getattr(cfg, "RANK_CARD_BG", "") or "").strip()
+        _glass = getattr(cfg, "RANK_CARD_GLASS", -1)
+        try:
+            glass = -1 if _glass is None else int(_glass)
+        except (TypeError, ValueError):
+            glass = -1
+        _anchor = str(getattr(cfg, "RANK_CARD_BG_ANCHOR", "auto") or "auto").strip() or "auto"
+        _ink = str(getattr(cfg, "RANK_CARD_INK", "auto") or "auto").strip() or "auto"
+        _gblur = getattr(cfg, "RANK_CARD_GLASS_BLUR", -1)
+        try:
+            glass_blur = -1 if _gblur is None else int(_gblur)
+        except (TypeError, ValueError):
+            glass_blur = -1
+        _scope_keys = {"all": "RANK_CARD_BG", "single": "RANK_CARD_BG_SINGLE",
+                       "rank": "RANK_CARD_BG_RANK", "overview": "RANK_CARD_BG_OVERVIEW"}
+        scopes: Dict[str, Any] = {}
+        for _sc, _key in _scope_keys.items():
+            _p = str(getattr(cfg, _key, "") or "").strip()
+            scopes[_sc] = {"path": _p, "name": Path(_p).name if _p else "",
+                           "exists": bool(_p and Path(_p).is_file())}
         items: List[Dict[str, Any]] = []
         try:
             d = _bg_custom_dir()
@@ -3033,6 +3112,12 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             pass
         return {
             "config": cur,
+            "scopes": scopes,
+            "anchor": _anchor,
+            "ink": _ink,
+            "style": _style_state(),
+            "glass": glass,
+            "glass_blur": glass_blur,
             "name": Path(cur).name if cur else "",
             "exists": bool(cur and Path(cur).is_file()),
             "blur": float(getattr(cfg, "RANK_CARD_BG_BLUR", 14.0) or 0.0),
@@ -3104,6 +3189,21 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                       else (mono_cands[0]["name"] if mono_cands else "")),
             "emojiColor": color_cands[0]["name"] if color_cands else "",
         }
+
+    def _render_unavailable(lenient_font: str = "") -> HTTPException:
+        """渲染返回 None 时给出**准确**原因（2.5.8）。
+
+        以前只有一句「没找到中文字体」—— Pillow 缺失的用户会被指到字体上去，
+        真正的修法（pip install pillow）永远看不到。
+        """
+        try:
+            ps = _card.pil_status()
+        except Exception:  # noqa: BLE001
+            ps = {"ok": True, "reason": ""}
+        return HTTPException(
+            status_code=400,
+            detail=_render_unavailable_detail(ps, lenient_font),
+        )
 
     def _font_state() -> Dict[str, Any]:
         """当前字体：配置值 / 实际解析到的路径 / 是否已落地 / 数据目录里的可选字体。"""
@@ -3180,10 +3280,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             ],
             "fontCatalog": [dict(x) for x in _FONT_CATALOG],
             "background": _bg_state(),
-            "layers": _layers_state(),
             "backend": (lambda: _card.backend_report(str(_font_dir())))() if hasattr(
                 _card, "backend_report",
             ) else {},
+            "pillow": (lambda: _card.pil_status())() if hasattr(_card, "pil_status") else {},
             "scales": [
                 {"value": 0, "label": "跟随插件配置"},
                 {"value": 1.5, "label": "1.5×（省流）"},
@@ -3256,21 +3356,71 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             _card.set_emoji_font_override(str(getattr(cfg, "RANK_CARD_EMOJI_FONT", "") or ""))
         except Exception:  # noqa: BLE001
             plugin.logger.debug("设置 emoji 字体覆盖失败（忽略）", exc_info=True)
+        # scale=0 = 跟随插件配置：预览必须与真实触发同倍率。旧实现回落模块常量 1.5，
+        # 不读 RANK_CARD_QUALITY/SCALE——精度设“高(3.0)”的用户看到的是 1.5× 预览（2.4.3 修）。
+        if not scale:
+            try:
+                scale = float(plugin._rank_card_scale())
+            except Exception:  # noqa: BLE001
+                scale = 0.0
         bg_cfg = _bg_state()
-        bg_path = str(body.get("bg_path", bg_cfg["config"]) or "")
-        bg_blur = float(body.get("bg_blur", bg_cfg["blur"]) or 0.0)
-        bg_dim = int(body.get("bg_dim", bg_cfg["dim"]) or 0)
-        meta["bg"] = {"name": Path(bg_path).name if bg_path else "", "blur": bg_blur, "dim": bg_dim}
-        if "layers" in body:
-            kwargs_layers = _card.resolve_layer_sources(
-                body.get("layers") or [], str(plugin.get_plugin_data_dir()),
-            )
+        # ⚠️ 安全（2.4.3）：bg_path 只接受背景目录内的**文件名**。旧实现原样收下
+        #    传进渲染管线，持密钥者可读宿主任意图片（PoC 实证：数据目录外的绝对
+        #    路径被读入并 base64 回显）；绝对路径 / 含 .. 一律 400。
+        # ⚠️ 只校验「请求体显式传了 bg_path」的情况。默认值来自配置，是**绝对路径**
+        #    （api_card_bg 落库时写的就是绝对路径），把它一起按 basename 校验会
+        #    在"用户已设过背景图"时让每次预览都 400（2.4.3 修复）。
+        _kind_scope = str(body.get("card") or "single")
+        if _kind_scope not in ("single", "rank", "overview"):
+            _kind_scope = "single"
+        _scope_bg = str(((bg_cfg.get("scopes") or {}).get(_kind_scope) or {}).get("path") or "")
+        if "bg_path" in body:
+            _bg_raw = str(body.get("bg_path") or "").strip()
+            if _bg_raw:
+                _bg_name = Path(_bg_raw).name
+                if _bg_name != _bg_raw or _bg_raw in (".", ".."):
+                    raise HTTPException(status_code=400, detail="bg_path 只接受背景目录内的文件名")
+                bg_path = str(_bg_custom_dir() / _bg_name)
+                if not Path(bg_path).is_file():
+                    raise HTTPException(status_code=404, detail=f"背景目录里没有 {_bg_name}")
+            else:
+                bg_path = ""
         else:
-            kwargs_layers = _current_layers()
-        _lyr = _card._layer_list(kwargs_layers)
-        meta["layers"] = len(_lyr) if _lyr is not None else 0
+            bg_path = _scope_bg or str(bg_cfg["config"] or "")
+        _glass_raw = body.get("glass", bg_cfg.get("glass", -1))
+        try:
+            panel_alpha = -1 if _glass_raw in (None, "", -1, "-1") else max(0, min(100, int(float(_glass_raw))))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="glass 必须是 0~100 的数字，或 -1 表示自动")
+        bg_anchor = str(body.get("anchor", bg_cfg.get("anchor", "auto")) or "auto").strip() or "auto"
+        ink_mode = str(body.get("ink", bg_cfg.get("ink", "auto")) or "auto").strip() or "auto"
+        style_raw = body.get("style", ((bg_cfg.get("style") or {}).get("raw") or ""))
+        style_val = _card.normalize_style(style_raw)
+        if ink_mode.lower() not in ("auto", "dark", "light"):
+            raise HTTPException(status_code=400, detail="ink 只接受 auto / dark / light")
+        _gblur_raw = body.get("glass_blur", bg_cfg.get("glass_blur", -1))
+        try:
+            panel_blur = -1 if _gblur_raw in (None, "", -1, "-1") else max(0, min(60, int(float(_gblur_raw))))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="glass_blur 必须是 0~60 的数字，或 -1 表示自动")
+        try:
+            bg_blur = float(body.get("bg_blur", bg_cfg["blur"]) or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="bg_blur 必须是数字") from exc
+        try:
+            bg_dim = int(body.get("bg_dim", bg_cfg["dim"]) or 0)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="bg_dim 必须是整数") from exc
+        meta["bg"] = {"name": Path(bg_path).name if bg_path else "", "blur": bg_blur,
+                      "dim": bg_dim, "glass": panel_alpha, "glass_blur": panel_blur,
+                      "anchor": bg_anchor, "ink": ink_mode,
+                      "style_count": len(style_val)}
         kwargs = {
-            "layers": kwargs_layers,
+            "bg_anchor": bg_anchor,
+            "ink": ink_mode,
+            "style": style_val,
+            "panel_alpha": panel_alpha,
+            "panel_blur": panel_blur,
             "bg_path": bg_path,
             "bg_blur": bg_blur,
             "bg_dim": bg_dim,
@@ -3294,11 +3444,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             plugin.logger.exception("[persona] 卡片预览渲染失败")
             raise HTTPException(status_code=500, detail=f"渲染异常：{exc}") from exc
         if png is None:
-            raise HTTPException(
-                status_code=400,
-                detail="渲染不可用：没找到中文字体。把字体放到插件数据目录 fonts/，"
-                       "或用上面的「上传自定义字体」再试",
-            )
+            raise _render_unavailable(lenient_font=_font_state().get("name") or "")
         meta["bytes"] = len(png)
         meta["font"] = _font_state()["name"]
         meta["scale"] = scale or None
@@ -3308,51 +3454,53 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
         }
 
-    @router.get("/api/card_layers", summary="卡片外观图层：模板列表 + 默认值 + 可用素材")
-    async def api_card_layers_info(request: Request) -> Dict[str, Any]:
+    @router.get("/api/card_style", summary="卡片 DIY 配色：可用 token + 当前值")
+    async def api_card_style_info(request: Request) -> Dict[str, Any]:
         _check_key(request)
-        return {"ok": True, "layers": _layers_state()}
+        return {"ok": True, "style": _style_state()}
 
-    @router.post("/api/card_layers", summary="保存 / 选择 / 清除外观图层模板")
-    async def api_card_layers(request: Request) -> Dict[str, Any]:
+    @router.post("/api/card_style", summary="设置 / 清除卡片 DIY 配色（只改颜色）")
+    async def api_card_style(request: Request) -> Dict[str, Any]:
         _check_key(request)
         body = await _json_body(request)
         cfg = plugin.get_config()
+        cur = dict(_card.normalize_style(str(getattr(cfg, "RANK_CARD_STYLE", "") or "")))
         if body.get("clear"):
-            setattr(cfg, "RANK_CARD_LAYERS", "")
-            plugin.save_config(cfg)
+            _set_cfg(RANK_CARD_STYLE="")
             _card.reset_background_cache()
-            return {"ok": True, "layers": _layers_state()}
-        if "select" in body:
-            name = Path(str(body.get("select") or "")).name.strip()
-            if not name:
-                setattr(cfg, "RANK_CARD_LAYERS", "")
+            plugin.logger.info("[persona] 卡片 DIY 配色已恢复默认")
+            return {"ok": True, "style": _style_state()}
+        if "key" in body:
+            key = str(body.get("key") or "").strip()
+            if key not in _card.STYLE_TOKENS:
+                raise HTTPException(status_code=400, detail=f"未知配色项: {key}")
+            val = str(body.get("value") or "").strip()
+            if val in ("", "default", "reset"):
+                cur.pop(key, None)
+            elif val.lower() in ("#0", "0"):
+                if key in ("bg_top", "bg_mid", "bg_bottom"):
+                    raise HTTPException(status_code=400,
+                                        detail="渐变三色不支持 #0（分段颜色没有「不渲染」语义）")
+                cur[key] = "#0"
             else:
-                target = _layers_dir() / (name if name.endswith(".json") else f"{name}.json")
-                if not target.is_file():
-                    raise HTTPException(status_code=404, detail=f"没有这个模板: {name}")
-                setattr(cfg, "RANK_CARD_LAYERS", str(target))
-            plugin.save_config(cfg)
-            _card.reset_background_cache()
-            return {"ok": True, "layers": _layers_state()}
-        name = Path(str(body.get("name") or "")).stem.strip()
-        if not name:
-            raise HTTPException(status_code=400, detail="模板名不能为空")
-        layers = _card.normalize_layers(body.get("layers") or [])
-        if not layers:
-            raise HTTPException(status_code=400, detail="图层为空或全部不可识别")
-        d = _layers_dir()
-        d.mkdir(parents=True, exist_ok=True)
-        target = d / f"{name}.json"
-        tmp = target.with_name(target.name + ".tmp")
-        tmp.write_text(json.dumps({"version": 1, "name": name, "layers": layers},
-                                  ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(target)
-        setattr(cfg, "RANK_CARD_LAYERS", str(target))
-        plugin.save_config(cfg)
+                rgb = _card._hex_to_rgb_soft(val, None)
+                if rgb is None:
+                    raise HTTPException(status_code=400, detail=f"颜色格式不对: {val}（要 #rrggbb 或 #0）")
+                cur[key] = tuple(rgb)
+        elif "style" in body:
+            incoming = _card.normalize_style(body.get("style"))
+            bad = [k for k in (body.get("style") or {}) if k not in _card.STYLE_TOKENS]
+            if bad:
+                raise HTTPException(status_code=400, detail=f"未知配色项: {', '.join(bad)}")
+            cur = incoming
+        else:
+            raise HTTPException(status_code=400, detail="要么给 key/value，要么给 style，要么 clear")
+        payload = {k: (v if isinstance(v, str) else "#%02x%02x%02x" % tuple(v)[:3])
+                   for k, v in cur.items()}
+        _set_cfg(RANK_CARD_STYLE=json.dumps(payload, ensure_ascii=False) if payload else "")
         _card.reset_background_cache()
-        plugin.logger.info(f"[persona] 保存外观图层模板 {name}（{len(layers)} 层）并启用")
-        return {"ok": True, "layers": _layers_state()}
+        plugin.logger.info(f"[persona] 卡片 DIY 配色更新（{len(payload)} 项）")
+        return {"ok": True, "style": _style_state()}
 
     @router.get("/api/card_bg", summary="卡片背景：当前配置 + 可选背景图")
     async def api_card_bg_info(request: Request) -> Dict[str, Any]:
@@ -3366,6 +3514,11 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         ctype = (request.headers.get("content-type") or "").lower()
         if ctype.startswith("application/octet-stream"):
             name = Path(str(request.query_params.get("name") or "bg.png")).name.strip()
+            _up_scope = str(request.query_params.get("card") or "all").strip().lower()
+            _up_key = {"all": "RANK_CARD_BG", "single": "RANK_CARD_BG_SINGLE",
+                       "rank": "RANK_CARD_BG_RANK", "overview": "RANK_CARD_BG_OVERVIEW"}.get(_up_scope)
+            if _up_key is None:
+                raise HTTPException(status_code=400, detail="card 只能是 all / single / rank / overview")
             if not name.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp")):
                 raise HTTPException(status_code=400, detail="只接受 .jpg / .png / .webp / .bmp")
             raw_bytes = await request.body()
@@ -3383,37 +3536,93 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             d = _bg_custom_dir()
             d.mkdir(parents=True, exist_ok=True)
             dst = d / name
-            tmp = dst.with_name(dst.name + ".tmp")
+            # .bak + 唯一 tmp（2.4.3）：覆盖前备份；并发上传同名不再互相截断
+            if dst.exists():
+                try:
+                    shutil.copy2(dst, dst.with_suffix(dst.suffix + ".bak"))
+                except OSError:
+                    pass
+            tmp = dst.with_name(f"{dst.name}.{os.getpid()}.{threading.get_ident()}.tmp")
             tmp.write_bytes(raw_bytes)
             tmp.replace(dst)
-            setattr(cfg, "RANK_CARD_BG", str(dst))
-            plugin.save_config(cfg)
+            _set_cfg(**{_up_key: str(dst)})
             _card.reset_background_cache()
             plugin.logger.info(f"[persona] WebUI 上传卡片背景 {name}（{len(raw_bytes):,} 字节）")
             return {"ok": True, "background": _bg_state()}
         body = await _json_body(request)
+        # 先攒 patch 再一次加锁落盘（2.4.3）：旧实现边解析边 setattr 最后统一 save，
+        #    与其它配置端点并发时 last-writer-wins 丢字段。
+        _bg_patch: Dict[str, Any] = {}
+        _scope = str(body.get("card") or "all").strip().lower()
+        _scope_key = {"all": "RANK_CARD_BG", "single": "RANK_CARD_BG_SINGLE",
+                      "rank": "RANK_CARD_BG_RANK", "overview": "RANK_CARD_BG_OVERVIEW"}.get(_scope)
+        if _scope_key is None:
+            raise HTTPException(status_code=400, detail="card 只能是 all / single / rank / overview")
         if body.get("clear"):
-            setattr(cfg, "RANK_CARD_BG", "")
+            _bg_patch[_scope_key] = ""
         if "name" in body:
             name = Path(str(body.get("name") or "")).name.strip()
             if name:
                 target = _bg_custom_dir() / name
                 if not target.is_file():
                     raise HTTPException(status_code=404, detail=f"背景目录里没有 {name}")
-                setattr(cfg, "RANK_CARD_BG", str(target))
+                _bg_patch[_scope_key] = str(target)
             else:
-                setattr(cfg, "RANK_CARD_BG", "")
+                _bg_patch[_scope_key] = ""
+        if "anchor" in body:
+            _av = str(body.get("anchor") or "auto").strip().lower()
+            allowed = {"auto", "center", "middle", "top", "bottom", "left", "right",
+                       "top-left", "top-right", "bottom-left", "bottom-right", "up", "down"}
+            if _av in allowed:
+                _bg_patch["RANK_CARD_BG_ANCHOR"] = _av
+            else:
+                # 也允许 "0.5,0.3" 这种自定义
+                _parts = [x for x in _av.replace("，", ",").split(",") if x.strip()]
+                try:
+                    _ax, _ay = float(_parts[0]), float(_parts[1])
+                    if len(_parts) == 2 and 0 <= _ax <= 1 and 0 <= _ay <= 1:
+                        _bg_patch["RANK_CARD_BG_ANCHOR"] = f"{_ax:g},{_ay:g}"
+                    else:
+                        raise ValueError
+                except (IndexError, ValueError):
+                    raise HTTPException(status_code=400,
+                                        detail="anchor 只接受 auto/center/top/bottom/left/right/up/down 或 \"x,y\"（0~1）")
+        if "ink" in body:
+            _iv = str(body.get("ink") or "auto").strip().lower()
+            if _iv not in ("auto", "dark", "light"):
+                raise HTTPException(status_code=400, detail="ink 只接受 auto / dark / light")
+            _bg_patch["RANK_CARD_INK"] = _iv
         if "blur" in body:
             try:
-                setattr(cfg, "RANK_CARD_BG_BLUR", max(0.0, min(60.0, float(body["blur"]))))
+                _bg_patch["RANK_CARD_BG_BLUR"] = max(0.0, min(60.0, float(body["blur"])))
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail="blur 必须是数字")
         if "dim" in body:
             try:
-                setattr(cfg, "RANK_CARD_BG_DIM", max(-100, min(100, int(body["dim"]))))
+                _bg_patch["RANK_CARD_BG_DIM"] = max(-100, min(100, int(body["dim"])))
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail="dim 必须是整数")
-        plugin.save_config(cfg)
+        if "glass" in body:
+            # 毛玻璃不透明度：0~100 百分比，-1/None = 自动
+            _g = body.get("glass")
+            if _g is None or _g == "" or _g == -1 or _g == "-1":
+                _bg_patch["RANK_CARD_GLASS"] = -1
+            else:
+                try:
+                    _bg_patch["RANK_CARD_GLASS"] = max(0, min(100, int(float(_g))))
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail="glass 必须是 0~100 的数字，或 -1 表示自动")
+        if "glass_blur" in body:
+            _gb = body.get("glass_blur")
+            if _gb is None or _gb == "" or _gb == -1 or _gb == "-1":
+                _bg_patch["RANK_CARD_GLASS_BLUR"] = -1
+            else:
+                try:
+                    _bg_patch["RANK_CARD_GLASS_BLUR"] = max(0, min(60, int(float(_gb))))
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail="glass_blur 必须是 0~60 的数字，或 -1 表示自动")
+        if _bg_patch:
+            _set_cfg(**_bg_patch)
         _card.reset_background_cache()
         return {"ok": True, "background": _bg_state()}
 
@@ -3442,27 +3651,99 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         tmp = fdir / (str(spec["as"]) + ".download")
 
         def _fetch() -> None:
+            """下载字体包：**带重试 + 完整性校验**（2.4.3）。
+
+            ⚠️ 实测过两类失败：GitHub 偶发把连接掐断（拿到半截 zip → 后面报
+               "File is not a zip file"），以及上游 302 到网页（200 但内容是 HTML）。
+               所以这里 3 次重试，并且 zip 资产要校验 `PK` 魔数，错误信息直说原因。
+            """
             import urllib.request
 
-            req = urllib.request.Request(
-                str(spec["url"]),
-                headers={"User-Agent": "nekro_persona-font-installer/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=120) as resp, tmp.open("wb") as fp:
-                total = 0
-                while True:
-                    chunk = resp.read(262_144)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > 400 * 1024 * 1024:
-                        raise ValueError("下载超过 400 MB，已中止")
-                    fp.write(chunk)
+            last: Exception | None = None
+            for attempt in range(4):
+                try:
+                    req = urllib.request.Request(
+                        str(spec["url"]),
+                        headers={"User-Agent": "nekro_persona-font-installer/1.0"},
+                    )
+                    with urllib.request.urlopen(req, timeout=120) as resp, tmp.open("wb") as fp:
+                        total = 0
+                        while True:
+                            chunk = resp.read(262_144)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > 400 * 1024 * 1024:
+                                raise ValueError("下载超过 400 MB，已中止")
+                            fp.write(chunk)
+                    if total <= 0:
+                        raise ValueError("下载到 0 字节")
+                    # ⚠️ 实测这台宿主的出网会**偶发截断**（同一 URL 有时 5.7MB 完整、
+                    #    有时只拿到 1MB，且 HTTP 头里的 PK 魔数完好）。所以必须按
+                    #    Content-Length 校验字节数，zip 资产还要真打开一次看中央目录。
+                    expect_raw = str(resp.headers.get("Content-Length") or "").strip()
+                    if expect_raw.isdigit() and total != int(expect_raw):
+                        raise ValueError(f"下载不完整（{total} / {expect_raw} 字节）")
+                    if str(spec.get("pick") or ""):
+                        import zipfile
+
+                        with tmp.open("rb") as fp:
+                            head = fp.read(4)
+                        if head[:2] != b"PK":
+                            raise ValueError(
+                                f"下载内容不是 zip（头部 {head.hex() or '空'}），"
+                                "可能被网络截断或上游返回了网页")
+                        with zipfile.ZipFile(tmp) as zf:   # 中央目录坏了会在这一步抛
+                            zf.namelist()
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+                    tmp.unlink(missing_ok=True)
+                    if attempt < 3:
+                        plugin.logger.warning(
+                            f"[persona] 字体包下载失败（第 {attempt + 1}/4 次，将重试）: {exc}")
+                        time.sleep(1.5 * (attempt + 1))
+            raise last if last else ValueError("下载失败")
+
+        # 覆盖安装前先备份：下载/解包失败时不能把用户原来的字体弄没（本次实测踩到）
+        backup = target.with_suffix(target.suffix + ".bak")
+        had_old = target.is_file()
+
+        def _write_license(zf=None, member: str = "") -> None:
+            """把许可文件落到字体旁边（OFL 1.1 要求随字体提供许可）。
+
+            两种情况：
+              · 上游包里有 LICENSE / OFL.txt → 原样落盘（最权威）；
+              · 没有（得意黑这类、以及**直链 ttf**）→ 生成一份记录来源/许可/官方链接的说明。
+            ⚠️ 以前只有 zip 分支写了，直链分支（霞鹜文楷、Noto Color Emoji）直接
+               `tmp.replace(target)` —— 落地后既无许可也无来源，属合规缺口。
+            """
+            lic_path = fdir / (target.stem + ".LICENSE.txt")
+            try:
+                if zf is not None and member:
+                    lic_path.write_bytes(zf.read(member))
+                    return
+                lic_path.write_text(
+                    f"{item['name']}\n许可: {item['license']}\n"
+                    f"官方来源: {spec['url']}\n项目页: {item['url']}\n"
+                    "OFL 1.1 全文: https://openfontlicense.org\n\n"
+                    "本文件由插件自动生成，仅记录来源与许可；字体本身的许可条款见上游"
+                    " LICENSE / OFL.txt。\n",
+                    encoding="utf-8",
+                )
+            except Exception:  # noqa: BLE001
+                plugin.logger.debug("许可文件写出失败（忽略）", exc_info=True)
 
         def _extract() -> None:
+            if had_old:
+                try:
+                    shutil.copy2(target, backup)
+                except Exception:  # noqa: BLE001
+                    plugin.logger.warning("[persona] 备份旧字体失败（继续安装）", exc_info=True)
             pick = str(spec.get("pick") or "")
             if not pick:
                 tmp.replace(target)
+                _write_license()          # 直链字体同样要带许可
                 return
             import zipfile
 
@@ -3474,27 +3755,15 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 )
                 if member is None:
                     raise ValueError(f"压缩包里没有 {pick}")
+                # 解压限量（2.4.3）：上游 URL 固定，但仍是 zip bomb 面
+                if z.getinfo(member).file_size > 200 * 1024 * 1024:
+                    raise ValueError("字体文件解压后超过 200 MB")
                 with z.open(member) as src, target.open("wb") as dst:
-                    dst.write(src.read())
+                    dst.write(src.read(200 * 1024 * 1024 + 1))
                 # OFL 要求随字体保留许可文件
                 lic = next((n for n in names if n.split("/")[-1].lower() in
                             ("license", "license.txt", "ofl.txt", "license.otf.txt")), None)
-                lic_path = fdir / (target.stem + ".LICENSE.txt")
-                try:
-                    if lic:
-                        lic_path.write_bytes(z.read(lic))
-                    else:
-                        # 压缩包里没带许可文件（得意黑这种就是）→ 自己写一份指向说明，
-                        # OFL 1.1 要求随字体保留许可，别让落地后的字体"无证裸奔"。
-                        lic_path.write_text(
-                            f"{item['name']}\n许可: {item['license']}\n"
-                            f"官方来源: {spec['url']}\n项目页: {item['url']}\n\n"
-                            "本文件由插件自动生成，仅记录来源与许可；字体本身的许可条款见上游"
-                            " LICENSE / OFL.txt。\n",
-                            encoding="utf-8",
-                        )
-                except Exception:  # noqa: BLE001
-                    plugin.logger.debug("许可文件写出失败（忽略）", exc_info=True)
+                _write_license(z, lic or "")
             tmp.unlink(missing_ok=True)
 
         try:
@@ -3503,21 +3772,33 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             await asyncio.to_thread(_extract)
             caps = await asyncio.to_thread(_card.probe_font_capabilities, str(target))
             if not caps.get("ok") or not (caps.get("roles") or []):
-                target.unlink(missing_ok=True)
                 raise ValueError("下载到的文件不是可用字体（能力探测无结果）")
         except Exception as exc:  # noqa: BLE001
             tmp.unlink(missing_ok=True)
+            # 失败时把写了一半的 target 清掉：否则 fonts/ 里留下损坏文件，
+            # 之后会被 UI 选中、_pin_font 钉住，所有卡片静默退化成文本（2.4.3 修）。
+            # ⚠️ 但如果**本来就有**这个字体（覆盖安装），要还原而不是删掉 ——
+            #    实测：出网被拒时重装霞鹜文楷，把用户原来那个 25 MB 的字体删没了。
+            if backup.is_file():
+                try:
+                    backup.replace(target)
+                    plugin.logger.warning(
+                        f"[persona] 一键安装失败，已还原上一次的字体: {target.name}")
+                except Exception:  # noqa: BLE001
+                    plugin.logger.warning("[persona] 还原上一次字体失败", exc_info=True)
+                    target.unlink(missing_ok=True)
+            else:
+                target.unlink(missing_ok=True)
             plugin.logger.warning(f"[persona] 一键安装失败: {exc}")
             raise HTTPException(status_code=502, detail=f"安装失败：{exc}") from exc
 
-        cfg = plugin.get_config()
-        if item["kind"] == "emoji":
-            setattr(cfg, "RANK_CARD_EMOJI_FONT", str(target))
-        else:
-            setattr(cfg, "RANK_CARD_FONT", str(target))
-        plugin.save_config(cfg)
+        backup.unlink(missing_ok=True)          # 安装成功，备份不再需要
+        _set_cfg(**{"RANK_CARD_EMOJI_FONT" if item["kind"] == "emoji" else "RANK_CARD_FONT": str(target)})
         _card.reset_font_caches()
-        _card.set_emoji_font_override(str(getattr(cfg, "RANK_CARD_EMOJI_FONT", "") or ""))
+        # ⚠️ 必须重新取配置：本函数里已经没有 cfg（改用 _set_cfg 后删掉了），
+        #    原来这行 getattr(cfg, ...) 会 NameError → 装好了却回 500（2.4.3 修复）
+        _card.set_emoji_font_override(
+            str(getattr(plugin.get_config(), "RANK_CARD_EMOJI_FONT", "") or ""))
         _FONT_CAP_CACHE.clear()
         plugin.logger.info(
             f"[persona] 字体已安装并启用: {target.name}（{caps.get('kind')} / "
@@ -3540,16 +3821,31 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 raise HTTPException(status_code=400, detail="字体文件超过 60 MB")
             fdir.mkdir(parents=True, exist_ok=True)
             dst = fdir / name
-            tmp = dst.with_name(dst.name + ".tmp")
+            # ⚠️ 上传的字体必须**先落临时文件→探测→通过才转正**（2.4.3）：旧实现只查
+            #    大小就落盘并设为当前字体，一个损坏 ttc 会让之后所有卡片静默退化成文本，
+            #    且被 _pin_font 永久钉住，须手工删文件才能恢复。与 install 端点同口径。
+            tmp = dst.with_name(f"{dst.name}.{os.getpid()}.{threading.get_ident()}.tmp")
             tmp.write_bytes(raw_bytes)
+            _probe = await asyncio.to_thread(_card.probe_font_capabilities, str(tmp))
+            if not _probe.get("ok") or not (_probe.get("roles") or []):
+                tmp.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"上传的文件不是可用字体（能力探测无结果）：{name}",
+                )
+            # 覆盖已有字体前留 .bak：覆盖唯一好字体后新文件坏不可恢复
+            if dst.exists():
+                try:
+                    shutil.copy2(dst, dst.with_suffix(dst.suffix + ".bak"))
+                except OSError:
+                    pass
             tmp.replace(dst)
             target = dst
             plugin.logger.info(f"[persona] WebUI 上传字体 {name}（{len(raw_bytes):,} 字节）")
         else:
             body = await _json_body(request)
             if body.get("clear"):
-                setattr(cfg, "RANK_CARD_FONT", "")
-                plugin.save_config(cfg)
+                _set_cfg(RANK_CARD_FONT="")
                 _card.reset_font_caches()
                 _FONT_CAP_CACHE.clear()
                 return {"ok": True, "font": _font_state()}
@@ -3561,12 +3857,13 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     em_target = fdir / em_name
                     if not em_target.is_file():
                         raise HTTPException(status_code=404, detail=f"数据目录 fonts/ 里没有 {em_name}")
-                    setattr(cfg, "RANK_CARD_EMOJI_FONT", str(em_target))
+                    _set_cfg(RANK_CARD_EMOJI_FONT=str(em_target))
                 else:
-                    setattr(cfg, "RANK_CARD_EMOJI_FONT", "")
-                plugin.save_config(cfg)
+                    _set_cfg(RANK_CARD_EMOJI_FONT="")
                 _card.reset_font_caches()
-                _card.set_emoji_font_override(str(getattr(cfg, "RANK_CARD_EMOJI_FONT", "") or ""))
+                # 重新取配置：_set_cfg 里 save_config 之后，函数开头捕获的 cfg 可能已过期
+                _card.set_emoji_font_override(
+                    str(getattr(plugin.get_config(), "RANK_CARD_EMOJI_FONT", "") or ""))
                 plugin.logger.info(
                     f"[persona] WebUI 切换 emoji 字体 → {em_name or '（自动探测）'}",
                 )
@@ -3575,10 +3872,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             target = fdir / name
             if not target.is_file():
                 raise HTTPException(status_code=404, detail=f"数据目录 fonts/ 里没有 {name}")
-        setattr(cfg, "RANK_CARD_FONT", str(target))
-        plugin.save_config(cfg)
+        _set_cfg(RANK_CARD_FONT=str(target))
         _card.reset_font_caches()
-        _card.set_emoji_font_override(str(getattr(cfg, "RANK_CARD_EMOJI_FONT", "") or ""))
+        _card.set_emoji_font_override(
+            str(getattr(plugin.get_config(), "RANK_CARD_EMOJI_FONT", "") or ""))
         plugin.logger.info(f"[persona] WebUI 切换卡片字体 → {target.name}")
         return {"ok": True, "font": _font_state()}
 

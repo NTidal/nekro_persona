@@ -72,7 +72,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.4.0",
+    version="2.5.0",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -568,17 +568,59 @@ class FavorabilityConfig(ConfigBase):
         "自定义卡片背景图（.jpg/.png/.webp）；留空则用暖色渐变。图片会等比铺满 + 模糊 + 明暗补偿",
         en_title="Card Background Image", en_desc="Custom card background image; empty uses built-in gradient",
     )
+    RANK_CARD_BG_SINGLE: str = _fav_field(
+        "", "单人卡背景图",
+        "只给「单人档案卡」用的背景图路径（留空 = 跟随上面的通用背景图）。"
+        "在 WebUI「卡片预览 → 背景 → 作用范围」里选图片即可，不用手写路径",
+        en_title="Profile Card Background", en_desc="Path used only by the profile card; empty = follow the shared background",
+    )
+    RANK_CARD_BG_RANK: str = _fav_field(
+        "", "排行榜背景图",
+        "只给「好感度排行榜」用的背景图路径（留空 = 跟随通用背景图）",
+        en_title="Rank Card Background", en_desc="Path used only by the rank card; empty = follow the shared background",
+    )
+    RANK_CARD_BG_OVERVIEW: str = _fav_field(
+        "", "印象总览背景图",
+        "只给「印象总览」用的背景图路径（留空 = 跟随通用背景图）",
+        en_title="Overview Card Background", en_desc="Path used only by the overview card; empty = follow the shared background",
+    )
+    RANK_CARD_STYLE: str = _fav_field(
+        "", "卡片 DIY 配色（JSON）",
+        "只覆盖颜色、不改卡片框架。形如 {\"text\": \"#4a3728\", \"accent\": \"#c46a4a\", "
+        "\"panel_color\": \"#fffaf2\"}；留空 = 默认配色。在 WebUI「卡片预览 → 外观配色」里点选即可",
+        en_title="Card Style Colors", en_desc="JSON map of color tokens; empty = defaults",
+    )
+    RANK_CARD_INK: str = _fav_field(
+        "auto", "卡片文字配色",
+        "auto = 按毛玻璃面板的实际亮度自动在深/浅两套墨色间切换（默认）；"
+        "dark = 固定深色字（浅底卡）；light = 固定浅色字（深底卡）。"
+        "背景图很暗或把毛玻璃调到很透时，auto 会自动改用浅色字",
+        en_title="Card Text Ink",
+        en_desc="auto / dark / light",
+    )
+    RANK_CARD_BG_ANCHOR: str = _fav_field(
+        "auto", "背景裁剪锚点",
+        "超大图按目标比例裁剪时的取景位置：auto = 自动找画面显著区（默认）；也可填 center / top / bottom / left / right / up / down，或自定义 x,y（0~1，如 0.5,0.3 = 横向居中、竖向往上 30%）。只有被裁掉的那个方向会受影响",
+        en_title="Background Crop Anchor",
+        en_desc="auto / center / top / bottom / left / right / up / down / x,y",
+    )
     RANK_CARD_BG_BLUR: float = _fav_field(
         14.0, "卡片背景模糊半径",
         "自定义背景的模糊半径（0~60，逻辑像素；绘制时会乘以渲染倍率）",
         en_title="Card Background Blur", en_desc="Blur radius for custom background (0-60)",
         ge=0.0, le=60.0,
     )
-    RANK_CARD_LAYERS: str = _fav_field(
-        "", "卡片外观图层模板",
-        "外观图层模板 JSON 的路径（留空 = 内置默认：暖色渐变 + 光斑）。"
-        "模板是一串图层：gradient/image/veil/scrim/blobs/tint（背景）与 border/text/sticker/grain（前景）",
-        en_title="Card Layer Template", en_desc="Path to a layer-template JSON; empty = built-in default",
+    RANK_CARD_GLASS: int = _fav_field(
+        -1, "卡片毛玻璃不透明度",
+        "面板那层磨砂玻璃的浓度：0 = 全透（只剩模糊，背景花纹直接透出来），"
+        "100 = 几乎不透（最干净但看不到背景）。-1 = 自动（各面板按预设浓度，图片背景自动加厚一点）",
+        en_title="Frosted Panel Opacity", en_desc="0–100 percent; -1 = automatic",
+    )
+    RANK_CARD_GLASS_BLUR: int = _fav_field(
+        -1, "卡片毛玻璃模糊度",
+        "面板背后那层磨砂的模糊半径（逻辑像素）：0 = 面板里就是清晰底图（只剩一层白纱），"
+        "越大越糊；-1 = 自动（各面板预设 10~16）",
+        en_title="Frosted Panel Blur", en_desc="Blur radius in logical px; -1 = automatic",
     )
     RANK_CARD_BG_DIM: int = _fav_field(
         0, "卡片背景明暗补偿",
@@ -720,11 +762,11 @@ _RANK_TRIGGERS = ("好感度总览", "好感度排行", "好感榜")
 _IMPRESSION_OVERVIEW_TRIGGERS = ("印象总览", "查看印象总览", "印象一览")
 
 # 无前缀触发「查看<账号>印象」——单人关系档案卡片（2.2.19）
-# 形如「查看198194468印象」。ID 允许 QQ 号、网页 ID、带 @ 的平台前缀。
+# 形如「查看100001印象」。ID 允许 QQ 号、网页 ID、带 @ 的平台前缀。
 #
 # ⚠️ 2.2.20：QQ 里 @ 是**独立消息段**，纯文本里根本没有 ID。实测那两条消息是：
-#     content_text = "查看[@id:198194468;nickname:⚽️🏀🏈⚾️🎾🏐🏉🎱@] 印象"
-#     content_data = [text:"查看", at{target_platform_userid:"198194468"}, text:" 印象"]
+#     content_text = "查看[@id:100001;nickname:⚽️🏀🏈⚾️🎾🏐🏉🎱@] 印象"
+#     content_data = [text:"查看", at{target_platform_userid:"100001"}, text:" 印象"]
 #   旧正则只吃纯文本，于是「查看@某人印象」永远没反应。现在先把消息段拼成一条
 #   「带 at 占位符」的串再匹配，命中占位符就取 target_platform_userid。
 _AT_PLACEHOLDER = "\x00at{}\x00"
@@ -1015,7 +1057,7 @@ def _message_impression_target(message: ChatMessage) -> str | None:
     三条取数路径（按可靠性排序）：
       1. content_data 逐段拼接，at 段换成占位符 —— QQ 群里的正常形态；
       2. content_text 里 `[@id:xxx;nickname:yyy@]` 形态（部分链路只给文本）；
-      3. content_text 里的裸账号（`查看198194468印象`、WebUI/网页会话）。
+      3. content_text 里的裸账号（`查看100001印象`、WebUI/网页会话）。
     """
     segs = getattr(message, "content_data", None) or []
     at_ids: List[str] = []
@@ -1685,6 +1727,10 @@ async def _decay_pass() -> int:
         chat_key = row.target_chat_key or ""
         if not chat_key:
             continue
+        # ⚠️ 账号过滤（2.4.3）：枚举绕过了按需加载的 store。有账号上下文时只处理
+        #    本账号 + 无后缀共享行；无上下文（单账号/后台巡检）行为不变。
+        if not _row_in_account_scope(row):
+            continue
         async with await _archive_lock(chat_key):
             try:
                 state = await _open_archive(chat_key)
@@ -1752,6 +1798,8 @@ async def _recover_pass() -> int:
     for row in rows:
         chat_key = row.target_chat_key or ""
         if not chat_key:
+            continue
+        if not _row_in_account_scope(row):   # 同衰减：按账号过滤（2.4.3）
             continue
         async with await _archive_lock(chat_key):
             try:
@@ -1853,12 +1901,18 @@ class ArchiveEvent:
 
     @staticmethod
     def from_raw(raw: object) -> "ArchiveEvent":
+        """从落库 dict 还原；坏字段回落默认值（2.4.3）。
+
+        ⚠️ 旧实现裸 int()：一个手写/脏导入的 "delta": "三" 会让**整频道档案**
+        解析失败 → _open_archive 返回空档案 → 下一次写档把真实数据清空。
+        PoC 实证过该链路；与 UserArchive.from_raw 同口径，绝不抛。
+        """
         data = raw if isinstance(raw, dict) else {}
         return ArchiveEvent(
-            delta=int(data.get("delta") or 0),
+            delta=_safe_int(data.get("delta"), 0),
             reason=str(data.get("reason") or ""),
-            score_after=int(data.get("score_after") or 0),
-            timestamp=int(data.get("timestamp") or 0),
+            score_after=_safe_int(data.get("score_after"), 0),
+            timestamp=_safe_int(data.get("timestamp"), 0),
             kind=str(data.get("kind") or "manual"),
         )
 
@@ -1927,27 +1981,33 @@ class UserArchive:
     def from_raw(user_id: str, raw: object) -> "UserArchive":
         """从落库 dict 还原；缺字段一律取默认值（兼容老数据）。"""
         data = raw if isinstance(raw, dict) else {}
+        # ⚠️ 所有数值字段走 _safe_int（2.4.3）：旧实现 8 处裸 int()，一个坏字段
+        #    （"score": "很高" / "updated_at": "x"）就让整个频道档案解析失败 →
+        #    _open_archive 返回空档案 → 下一次写档把整频道真实数据覆盖成空。
+        #    PoC 实证过；与 webui 导入校验补齐为同一口径。
         item = UserArchive(
             user_id=str(data.get("user_id") or user_id),
             display_name=str(data.get("display_name") or ""),
-            score=int(data.get("score") or 0),
+            score=_safe_int(data.get("score"), 0),
             summary=str(data.get("summary") or ""),
             interaction_hint=str(data.get("interaction_hint") or ""),
             tags=[str(x) for x in (data.get("tags") or [])],
             last_reason=str(data.get("last_reason") or ""),
-            updated_at=int(data.get("updated_at") or 0),
-            last_interaction_at=int(data.get("last_interaction_at") or 0),
-            last_decay_at=int(data.get("last_decay_at") or 0),
-            last_recover_at=int(data.get("last_recover_at") or 0),
-            day_key=int(data.get("day_key") or 0),
-            day_net=int(data.get("day_net") or 0),
-            last_adjust_at=int(data.get("last_adjust_at") or 0),
+            updated_at=_safe_int(data.get("updated_at"), 0),
+            last_interaction_at=_safe_int(data.get("last_interaction_at"), 0),
+            last_decay_at=_safe_int(data.get("last_decay_at"), 0),
+            last_recover_at=_safe_int(data.get("last_recover_at"), 0),
+            day_key=_safe_int(data.get("day_key"), 0),
+            day_net=_safe_int(data.get("day_net"), 0),
+            last_adjust_at=_safe_int(data.get("last_adjust_at"), 0),
         )
         item.recent_events = [
             ArchiveEvent.from_raw(x) for x in (data.get("recent_events") or [])
+            if isinstance(x, dict)
         ]
         item.observations = [
             ArchiveEvent.from_raw(x) for x in (data.get("observations") or [])
+            if isinstance(x, dict)
         ]
         return item
 
@@ -2089,8 +2149,15 @@ class ChannelArchive:
     def from_raw(raw: object) -> "ChannelArchive":
         data = raw if isinstance(raw, dict) else {}
         state = ChannelArchive()
+        # ⚠️ 逐 profile 容错（2.4.3）：单个用户档案解析失败只跳过那一个，
+        #    不再让整个频道 blob 被判损坏 → 空档案覆盖真实数据。from_raw 本身已
+        #    不会抛，这里是双保险；被跳过的 uid 打警告，便于人工回填。
         for uid, item in (data.get("profiles") or {}).items():
-            state.archives[str(uid)] = UserArchive.from_raw(str(uid), item)
+            try:
+                state.archives[str(uid)] = UserArchive.from_raw(str(uid), item)
+            except Exception as exc:  # noqa: BLE001
+                plugin.logger.warning(
+                    f"[存档] 用户 {uid} 档案解析失败，本次跳过（不影响其它用户）: {exc}")
         state.last_active_user_id = str(data.get("last_active_user_id") or "")
         state.memos_migrated = bool(data.get("memos_migrated") or False)
         _purged = data.get("purged")
@@ -2100,7 +2167,10 @@ class ChannelArchive:
             }
         _log = data.get("purge_log")
         if isinstance(_log, list):
-            state.purge_log = [int(x) for x in _log if isinstance(x, (int, float))]
+            state.purge_log = [
+                int(x) for x in _log
+                if isinstance(x, (int, float)) and not isinstance(x, bool)
+            ]
         return state
 
     def to_raw(self) -> Dict[str, object]:
@@ -2179,6 +2249,41 @@ async def _open_archive(chat_key: str) -> ChannelArchive:
         return ChannelArchive()
 
 
+# 已完成「共享行 → 账号行」升格的 chat_key（每个 key 只迁移一次）
+_MIGRATED_CHATS: set = set()
+
+
+async def _upgrade_shared_archive_row(chat_key: str) -> None:
+    """把「键带本账号后缀的历史共享档案行」原地升格为账号作用域行（2.4.3）。
+
+    NA5 实测（plugin_data 表）：账号 store 上线前写入的档案全是 account_key=''
+    的共享行。AccountPluginStore.set 只对 accounts/<acct>/ 前缀的历史行做原地
+    升格，对 plain 共享行只会**新建**一份——同一 chat_key 会出现「陈旧共享行 +
+    新账号行」两份，无账号上下文的后台循环（衰减/回升）继续读写陈旧那份，
+    两边各自演化。这里在写档前把后缀属于当前账号的共享行搬进账号作用域：
+    先写账号行、再删共享行，任何一步失败都不丢数据（下次写档重试）。
+    无后缀的键 = 有意共享（模板/历史数据），不搬。
+    """
+    me = _current_account_key()
+    if not me or chat_key in _MIGRATED_CHATS:
+        return
+    owner = _chat_key_account(chat_key)
+    if not owner or owner != me:
+        _MIGRATED_CHATS.add(chat_key)   # 别账号的键/无后缀：不碰
+        return
+    try:
+        raw = await store.get(chat_key=chat_key, store_key=STATE_KEY)
+        if not raw:
+            _MIGRATED_CHATS.add(chat_key)
+            return
+        await _store_for_write().set(chat_key=chat_key, store_key=STATE_KEY, value=raw)
+        await store.delete(chat_key=chat_key, store_key=STATE_KEY)
+        _MIGRATED_CHATS.add(chat_key)
+        plugin.logger.info(f"[存档] 历史共享档案行已升格为账号作用域: {chat_key}")
+    except Exception as exc:  # noqa: BLE001
+        plugin.logger.warning(f"[存档] 共享行升格失败（不影响本次写档，下次重试）: {exc}")
+
+
 async def _store_archive(chat_key: str, state: ChannelArchive) -> None:
     """写回频道档案。"""
     if not _archive_scope_ok(chat_key):
@@ -2186,6 +2291,7 @@ async def _store_archive(chat_key: str, state: ChannelArchive) -> None:
             f"[存档] 跨账号写入已拦截：当前账号 {_current_account_key()!r} 试图写 "
             f"{_chat_key_account(chat_key)!r} 的档案（{chat_key}）")
         return
+    await _upgrade_shared_archive_row(chat_key)
     await _store_for_write().set(chat_key=chat_key, store_key=STATE_KEY,
                                  value=json.dumps(state.to_raw(), ensure_ascii=False))
     # 为阶段 C 的生长包导出铺路：把见过的频道去重记入自维护索引
@@ -2717,11 +2823,26 @@ async def _render_rank_card(entries: List[dict], max_abs: int) -> bytes | None:
             font_dir=str(plugin.get_plugin_data_dir() / "fonts"),
             avatar_dir=str(plugin.get_plugin_data_dir() / "avatars"),
             scale=_rank_card_scale(),
-            **_card_bg_kwargs(),
+            **_card_bg_kwargs("rank"),
         )
     except Exception:  # noqa: BLE001
         plugin.logger.exception("好感度排行榜卡片渲染失败，回退为文本")
         return None
+
+
+def _card_fallback_hint() -> str:
+    """图片卡片为什么退成了文字：Pillow 缺失时给一句人话（否返回空串）。
+
+    只在**确认 Pillow 不可用**时才提示 —— 字体缺失等其它原因不在这里刷屏，
+    留给 WebUI 的预览报错说清楚（2.5.8）。
+    """
+    try:
+        st = card.pil_status()
+    except Exception:  # noqa: BLE001
+        return ""
+    if st.get("ok") is False:
+        return "（图片卡片不可用：未检测到 Pillow，本次以文字版显示）"
+    return ""
 
 
 def _render_rank_text(entries: List[dict], max_abs: int, total: int) -> str:
@@ -2730,6 +2851,9 @@ def _render_rank_text(entries: List[dict], max_abs: int, total: int) -> str:
         lines.append(f"{i}. {entry['display_name']} | {_delta_text(entry['score'])}/{max_abs} | {entry['stage']}")
     if total > len(entries):
         lines.append(f"… 已省略其余 {total - len(entries)} 位成员")
+    _hint = _card_fallback_hint()
+    if _hint:
+        lines.append(_hint)
     return "\n".join(lines)
 
 
@@ -2785,7 +2909,7 @@ async def _render_impression_overview_card(entries: List[dict], max_abs: int) ->
             font_dir=str(plugin.get_plugin_data_dir() / "fonts"),
             avatar_dir=str(plugin.get_plugin_data_dir() / "avatars"),
             scale=_rank_card_scale(),
-            **_card_bg_kwargs(),
+            **_card_bg_kwargs("overview"),
         )
     except Exception:  # noqa: BLE001
         plugin.logger.exception("印象总览卡片渲染失败，回退为文本")
@@ -2803,6 +2927,9 @@ def _render_impression_overview_text(entries: List[dict], total: int) -> str:
             f"{_delta_text(_as_int_local(entry.get('score'), 0))} | {entry.get('stage') or '—'} | "
             f"标签：{tags} | 印象：{summ}",
         )
+    _hint = _card_fallback_hint()
+    if _hint:
+        lines.append(_hint)
     return "\n".join(lines)
 
 
@@ -2840,59 +2967,31 @@ async def _handle_impression_overview(_ctx: schemas.AgentCtx, message: ChatMessa
         return None
 
 
-_LAYERS_CACHE: dict = {}
+def _card_bg_kwargs(kind: str = "") -> dict:
+    """当前配置里的背景参数（空路径 = 内置渐变）。
 
-
-def _card_layers():
-    """读外观图层模板（配置里给路径或直接给 JSON）；读不到返回 None = 用内置默认。
-
-    按 (路径, mtime) 缓存，模板文件改了才重读。
+    kind ∈ {"single", "rank", "overview"}：优先用该卡专属背景图（RANK_CARD_BG_<KIND>），
+    没配就回落到通用 RANK_CARD_BG。模糊/明暗/毛玻璃三组参数仍是全局的。
     """
-    raw_val = str(getattr(config, "RANK_CARD_LAYERS", "") or "").strip()
-    if not raw_val:
-        return None
-    base = str(plugin.get_plugin_data_dir())
-
-    def _res(v):
-        """模板里的相对图片路径 → 绝对路径（按数据目录解析）。"""
-        try:
-            cover = v.get("layers") if isinstance(v, dict) else v
-            return {"layers": card.resolve_layer_sources(cover, base)} if isinstance(v, dict) \
-                else card.resolve_layer_sources(cover, base)
-        except Exception:  # noqa: BLE001
-            return v
-
-    if raw_val.startswith("[") or raw_val.startswith("{"):
-        try:
-            return _res(json.loads(raw_val))
-        except Exception:  # noqa: BLE001
-            plugin.logger.warning("RANK_CARD_LAYERS 内联 JSON 解析失败，用内置默认")
-            return None
-    try:
-        p = Path(raw_val)
-        if not p.is_file():
-            plugin.logger.warning(f"图层模板不存在，用内置默认: {raw_val}")
-            return None
-        key = (str(p), int(p.stat().st_mtime))
-        hit = _LAYERS_CACHE.get(key)
-        if hit is not None:
-            return hit
-        data = _res(json.loads(p.read_text(encoding="utf-8")))
-        _LAYERS_CACHE.clear()
-        _LAYERS_CACHE[key] = data
-        return data
-    except Exception:  # noqa: BLE001
-        plugin.logger.warning("图层模板读取失败，用内置默认", exc_info=True)
-        return None
-
-
-def _card_bg_kwargs() -> dict:
-    """当前配置里的背景 / 外观参数（空路径 = 内置渐变）。"""
+    per_card = {
+        "single": "RANK_CARD_BG_SINGLE",
+        "rank": "RANK_CARD_BG_RANK",
+        "overview": "RANK_CARD_BG_OVERVIEW",
+    }
+    bg_path = ""
+    if kind:
+        bg_path = str(getattr(config, per_card.get(kind, ""), "") or "").strip()
+    if not bg_path:
+        bg_path = str(getattr(config, "RANK_CARD_BG", "") or "").strip()
     return {
-        "bg_path": str(getattr(config, "RANK_CARD_BG", "") or "").strip(),
+        "bg_path": bg_path,
         "bg_blur": float(getattr(config, "RANK_CARD_BG_BLUR", 14.0) or 0.0),
         "bg_dim": int(getattr(config, "RANK_CARD_BG_DIM", 0) or 0),
-        "layers": _card_layers(),
+        "panel_alpha": int(getattr(config, "RANK_CARD_GLASS", -1) if getattr(config, "RANK_CARD_GLASS", -1) is not None else -1),
+        "panel_blur": int(getattr(config, "RANK_CARD_GLASS_BLUR", -1) if getattr(config, "RANK_CARD_GLASS_BLUR", -1) is not None else -1),
+        "bg_anchor": str(getattr(config, "RANK_CARD_BG_ANCHOR", "auto") or "auto").strip() or "auto",
+        "ink": str(getattr(config, "RANK_CARD_INK", "auto") or "auto").strip() or "auto",
+        "style": str(getattr(config, "RANK_CARD_STYLE", "") or ""),
     }
 
 
@@ -2918,7 +3017,7 @@ async def _render_profile_card_bytes(entry: dict, max_abs: int) -> bytes | None:
             font_dir=str(plugin.get_plugin_data_dir() / "fonts"),
             avatar_dir=str(plugin.get_plugin_data_dir() / "avatars"),
             scale=_rank_card_scale(),
-            **_card_bg_kwargs(),
+            **_card_bg_kwargs("single"),
         )
     except Exception:  # noqa: BLE001
         plugin.logger.exception("关系档案卡片渲染失败，回退为文本")
@@ -2938,6 +3037,9 @@ def _render_profile_text(entry: dict, max_abs: int) -> str:
         lines.append("标签：" + "、".join(tags))
     summ = str(entry.get("summary") or "").strip()
     lines.append("稳定印象：" + (summ if summ else "（暂无）"))
+    _hint = _card_fallback_hint()
+    if _hint:
+        lines.append(_hint)
     return "\n".join(lines)
 
 
@@ -3518,14 +3620,16 @@ async def set_favorability_profile(
         #    每日净上限），于是「删掉再建一个 100 分」就能绕过整套防刷。
         #    删除时留了墓碑，24h 内重建沿用被删档案的预算与间隔锚点。
         _purge = (getattr(state, "purged", None) or {}).get(resolved_user_id) or {}
-        if is_new and _purge and (_ts_now() - int(_purge.get("at") or 0)) <= 86400:
+        # ⚠️ 墓碑是落库数据，手改/脏导入可能非数字：裸 int() 抛出的异常会穿出
+        #    BEHAVIOR 沙盒，被 NA 推成一条 "[SYSTEM] None" 脏消息给用户（2.4.3 修）。
+        if is_new and _purge and (_ts_now() - _safe_int(_purge.get("at"), 0)) <= 86400:
             is_new = False
-            profile.day_key = int(_purge.get("day_key") or 0)
-            profile.day_net = int(_purge.get("day_net") or 0)
-            profile.last_adjust_at = int(_purge.get("last_adjust_at") or 0)
+            profile.day_key = _safe_int(_purge.get("day_key"), 0)
+            profile.day_net = _safe_int(_purge.get("day_net"), 0)
+            profile.last_adjust_at = _safe_int(_purge.get("last_adjust_at"), 0)
             plugin.logger.info(
                 f"[favorability] 删档后重建，沿用被删档案的预算: user={resolved_user_id} "
-                f"day_net={profile.day_net} 距删除 {_ts_now() - int(_purge.get('at') or 0)}s",
+                f"day_net={profile.day_net} 距删除 {_ts_now() - _safe_int(_purge.get('at'), 0)}s",
             )
 
         # ---- 约束层（v1.4.1）：堵住 set_profile 绕过 adjust 防刷体系的旁路 ----
@@ -3646,8 +3750,8 @@ async def remove_favorability_profile(
         if not isinstance(getattr(state, "purge_log", None), list):
             state.purge_log = []
         _log = state.purge_log
-        _log[:] = [int(t) for t in _log if _now - int(t) <= 172800]
-        _recent = sum(1 for t in _log if _now - int(t) < 3600)
+        _log[:] = [_safe_int(t, 0) for t in _log if _now - _safe_int(t, 0) <= 172800]
+        _recent = sum(1 for t in _log if _now - _safe_int(t, 0) < 3600)
         if _recent >= 3:
             return "本次未删除：一小时内已删除 3 份档案，操作过于频繁，请稍后再试。"
         gone = state.profiles.pop(resolved_user_id)
@@ -3661,7 +3765,7 @@ async def remove_favorability_profile(
         }
         # 墓碑只保留 48h，避免无限增长
         for _uid in [k for k, v in _purged.items()
-                     if not isinstance(v, dict) or _now - int(v.get("at") or 0) > 172800]:
+                     if not isinstance(v, dict) or _now - _safe_int(v.get("at"), 0) > 172800]:
             _purged.pop(_uid, None)
         if state.last_active_user_id == resolved_user_id:
             state.last_active_user_id = ""
@@ -4514,6 +4618,25 @@ def _safe_key_name(chat_key: str) -> str:
     return f"{head}_{h}"
 
 
+def _row_in_account_scope(r) -> bool:
+    """枚举出的 DB 行是否属于当前账号（2.4.3）。
+
+    按需加载架构下账号作用域由 AccountPluginStore 在每次调用时解析，枚举类接口
+    （DBPluginData.filter）绕过了 store，必须自己按账号过滤，否则会列出/导出
+    其它账号的行。口径与 WebUI /api/index 一致：
+      · 行 account_key == 当前账号（权威形态，含 default 账号的 'default' 桶）；
+      · 行无 account_key 但 chat_key 带 @当前账号 后缀；
+      · 无后缀的历史共享行对所有账号可见（不能凭空隐藏，否则数据像“丢了”）。
+    """
+    _me = _current_account_key()
+    if not _me:
+        return True
+    if str(getattr(r, "account_key", "") or "") == _me:
+        return True
+    _owner = _chat_key_account(str(getattr(r, "target_chat_key", "") or ""))
+    return (not _owner) or _owner == _me
+
+
 async def _enumerate_archives() -> Dict[str, str]:
     """枚举全部有档案的频道及其**原始 store blob**（供阶段 C 生长包导出）。
 
@@ -4529,22 +4652,46 @@ async def _enumerate_archives() -> Dict[str, str]:
     except Exception as e:  # noqa: BLE001
         plugin.logger.warning(f"[growth] 枚举频道档案失败: {e}")
         return out
+    _skipped = 0
     for r in rows:
         ck = str(r.target_chat_key or "")
         if not ck or ck in out:
             continue
+        # ⚠️ 账号过滤（2.4.3）：旧实现枚举全部账号的行，却用共享 store.get 读——
+        #    账号作用域的行读不出来（导出静默丢数据），别的账号的共享行反而会被
+        #    打进导出包（越权导出）。现在按当前账号过滤，并走 _store_get
+        #    （账号优先、共享兜底），与 _open_archive 同口径。
+        if not _row_in_account_scope(r):
+            _skipped += 1
+            continue
         try:
-            val = await store.get(chat_key=ck, store_key=STATE_KEY)
+            val = await _store_get(ck, STATE_KEY)
         except Exception:  # noqa: BLE001
             continue
         if val:
             out[ck] = val
+    if _skipped:
+        plugin.logger.info(f"[growth] 导出按账号过滤：跳过 {_skipped} 个非本账号频道行")
     return out
 
 
 async def _write_archive(chat_key: str, raw: str) -> None:
-    """原样写回某频道的档案 blob（阶段 C 生长包导入用，scope 仅在 store 档案键）。"""
-    await store.set(chat_key=chat_key, store_key=STATE_KEY, value=raw)
+    """原样写回某频道的档案 blob（阶段 C 生长包导入用，scope 仅在 store 档案键）。
+
+    ⚠️ 账号隔离（2.4.3）：这是唯一不走 _archive_scope_ok 的写路径。多账号部署下
+    生长包导入会把 A 账号的档案写进 B 账号 scope——按频道键的 @账号后缀拦一道，
+    与 _store_archive 同口径（无后缀/无上下文一律放行，保持单账号行为不变）。
+    """
+    if not _archive_scope_ok(chat_key):
+        plugin.logger.warning(
+            f"[存档] 跨账号写入已拦截（生长包导入）: 当前 {_current_account_key()!r} "
+            f"试图写 {_chat_key_account(chat_key)!r} 的档案（{chat_key}）")
+        return
+    # ⚠️ 必须走账号作用域 store（2.4.3）：旧实现写共享 store，导入的档案落在
+    #    account_key='' 的共享桶里——任何账号经 _store_get 的共享兜底都能读到，
+    #   等于把 A 账号的档案广播给所有账号。_store_for_write 在按需加载架构下
+    #    落到「当前上下文账号」，与 _store_archive 完全同路。
+    await _store_for_write().set(chat_key=chat_key, store_key=STATE_KEY, value=raw)
 
 
 async def _migrate_memos_on_load() -> None:
@@ -4578,10 +4725,15 @@ async def _migrate_memos_on_load() -> None:
         ck = str(row.target_chat_key or "")
         if not ck or ck in seen_keys:
             continue
+        # ⚠️ 账号过滤 + _store_get（2.4.3）：旧实现枚举全部账号的行却用共享
+        #    store.get 直读——账号作用域的旧 memo 读不出来（漏迁移），且会把
+        #    其它账号可见的共享 blob 迁进当前账号的数据目录。
+        if not _row_in_account_scope(row):
+            continue
         seen_keys.add(ck)
         scanned += 1
         async with await _archive_lock(ck):
-            raw = await store.get(chat_key=ck, store_key=STATE_KEY)
+            raw = await _store_get(ck, STATE_KEY)
             if not raw:
                 continue
             try:

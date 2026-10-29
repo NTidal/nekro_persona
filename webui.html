@@ -2535,6 +2535,33 @@ body.is-scrolling .dialog-foot {
         </div>
         <div class="card-body">
           <div class="preview-control">
+              <div class="field-label">作用范围
+                <select class="select" id="cardBgScope">
+                  <option value="all">全部卡片（默认）</option>
+                  <option value="single">只单人卡</option>
+                  <option value="rank">只排行榜</option>
+                  <option value="overview">只印象总览</option>
+                </select>
+              </div>
+              <div class="field-label">裁剪锚点
+                <select class="select" id="cardBgAnchor">
+                  <option value="auto">自动（找画面主体，推荐）</option>
+                  <option value="center">居中</option>
+                  <option value="top">顶部对齐</option>
+                  <option value="bottom">底部对齐</option>
+                  <option value="left">靠左</option>
+                  <option value="right">靠右</option>
+                  <option value="up">偏上一点</option>
+                  <option value="down">偏下一点</option>
+                </select>
+              </div>
+              <div class="field-label">文字配色
+                <select class="select" id="cardBgInk">
+                  <option value="auto">自动（按面板亮度切换，推荐）</option>
+                  <option value="dark">固定深色字（浅底）</option>
+                  <option value="light">固定浅色字（深底）</option>
+                </select>
+              </div>
             <div class="field-label">背景图
               <select class="select" id="cardBgSelect"></select>
             </div>
@@ -2546,6 +2573,16 @@ body.is-scrolling .dialog-foot {
               <div class="score-top"><span>明暗补偿</span><output id="cardBgDimOut">自动</output></div>
               <input type="range" id="cardBgDim" min="-100" max="100" step="5" value="0">
             </div>
+            <div class="score-control">
+              <div class="score-top"><span>毛玻璃不透明度</span><output id="cardBgGlassOut">自动</output></div>
+              <input type="range" id="cardBgGlass" min="-1" max="100" step="1" value="-1"
+                     title="面板那层磨砂玻璃的浓度：0 = 全透（只剩模糊），100 = 几乎不透；-1 = 自动">
+            </div>
+            <div class="score-control">
+              <div class="score-top"><span>毛玻璃模糊度</span><output id="cardBgGlassBlurOut">自动</output></div>
+              <input type="range" id="cardBgGlassBlur" min="-1" max="60" step="1" value="-1"
+                     title="面板背后那层磨砂的模糊半径：0 = 面板里是清晰底图（只剩一层白纱），越大越糊；-1 = 自动">
+            </div>
             <div class="row-end">
               <button class="btn" type="button" id="cardBgUploadBtn">上传背景图</button>
               <input type="file" id="cardBgFile" accept=".jpg,.jpeg,.png,.webp,.bmp" hidden>
@@ -2554,40 +2591,46 @@ body.is-scrolling .dialog-foot {
           <p class="hint" id="cardBgHint">
             选中即生效：图片会等比铺满 + 按目标尺寸裁剪 + 模糊，再自动做明暗补偿保证文字可读
             （明暗补偿 0 = 自动，负数压暗、正数提亮）。照片较花时可调低模糊或加大补偿。
+              <br>毛玻璃不透明度：卡片上那块磨砂面板的浓度。0 = 全透（只剩模糊，背景花纹直接透出来），
+              100 = 几乎不透（最干净但看不到背景）；拖到最左「自动」= 各面板按预设浓度，图片背景自动加厚一点。
+              毛玻璃模糊度：面板背后那层磨砂的模糊半径，0 = 面板里是清晰底图（只剩白纱），越大越糊。
+              <br>作用范围：先选「只单人卡 / 只排行榜 / 只印象总览」，再选或上传图片，就只改那张卡的背景；
+              选「全部卡片」相当于以前的通用背景（其它卡没单独设图时也跟随它）。
+              <br>裁剪锚点：只影响<b>被裁掉的那个方向</b>。自动 = 在 64×64 缩略图上算边缘能量找主体（人脸/轮廓），
+              再与画面中心混合一半、夹在 15%~85%，避免为几根树枝把构图裁飞；主体偏上时选「顶部对齐」或「偏上一点」。
+              <br>文字配色：<b>自动</b>会先估算面板最终亮度（背景亮度与该层白纱按毛玻璃浓度混合），
+              偏暗就整套换成浅色墨（含强调色/标签底），偏亮就用原来的深色墨 —— 深色背景或把毛玻璃调到很透时不会再糊成一片。
           </p>
         </div>
       </div>
 
-      <div class="card">
-        <div class="card-head">
-          <div>
-            <h2 class="card-title">外观图层</h2>
-            <div class="card-subtitle" id="cardLayersSub">内置默认（暖色渐变 + 光斑）</div>
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">外观配色（DIY）</h2>
+              <div class="card-subtitle" id="cardStyleSub">只改颜色，卡片框架（尺寸/间距/结构）固定</div>
+            </div>
+            <span class="badge" id="cardStyleBadge">默认</span>
           </div>
-          <span class="badge" id="cardLayersBadge">默认</span>
-        </div>
-        <div class="card-body">
-          <div class="preview-control">
-            <div class="field-label">模板
-              <select class="select" id="cardLayersSelect"></select>
+          <div class="card-body">
+            <div id="cardStyleList" class="hint" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:8px"></div>
+            <div class="row-end" style="margin-top:10px">
+              <button class="btn" type="button" id="cardStyleReset">全部恢复默认</button>
+              <button class="btn primary" type="button" id="cardStylePreview">按当前配色重渲</button>
             </div>
-            <div class="field-label">加一层
-              <select class="select" id="cardLayerAdd"></select>
-            </div>
-            <div class="row-end">
-              <button class="btn" type="button" id="cardLayerAddBtn">添加</button>
-              <button class="btn" type="button" id="cardLayersPreview">仅预览不保存</button>
-              <button class="btn primary" type="button" id="cardLayersSave">保存并启用</button>
-            </div>
+            <p class="hint" style="margin-top:8px">
+              每行一个颜色：取色器与十六进制框互通（六位色值<strong>不写 #</strong>也会自动补上），点「默认」只重置这一项。<br>
+              拖动取色器时<strong>只更新色块</strong>（那行会亮个边），<strong>松手才保存并重渲</strong>——拖一圈也只渲一次。<br>
+              输入 <code>#0</code> = <strong>不渲染</strong>该块：正文/次级/弱化 → 那几行字不画；
+              强调色 → 进度条与标签内的字不画；标签底 → 只留标签文字；毛玻璃面板底色 → 面板整块去掉；背景薄纱色 → 不蒙薄纱。
+              （内置渐变三色不支持 #0，因为它们没有"不渲染"的语义。）
+              这里只动颜色（正文/强调/标签底/毛玻璃底色/背景薄纱/内置渐变三色），
+              位置、尺寸、层次这些框架参数不开放修改。<br>
+              <span style="opacity:.75">阶段徽章（常客 / 亲近 / 特别亲密…）与排行榜名次的金银铜属于语义色，不随这里变化。</span>
+            </p>
           </div>
-          <div id="cardLayerList" style="margin-top:10px"></div>
-          <p class="hint" id="cardLayersHint">
-            从底到顶合成：<code>gradient / image / veil / scrim / blobs / tint</code> 是背景层，
-            <code>border / text / sticker / grain</code> 是前景层（画在内容之上）。
-            坐标用 0~1 相对值；图片层不写 <code>dim</code> 会自动做明暗补偿，不写 <code>veil</code> 会自动补一层薄纱。
-          </p>
         </div>
-      </div>
+
 
       <div class="card">
         <div class="card-head">
@@ -3314,6 +3357,15 @@ async function postAction(path, body) {
   }
 }
 
+/* 业务错误统一提示：postAction 对 401 已自行弹窗并返回 null，
+   其余（400/404/500）会抛异常 —— 这里把后端 detail 显示出来并带上操作名。 */
+function _actionError(e, what) {
+  const msg = (e && (e.message || e.detail)) || '未知错误';
+  toast((what ? what + '失败：' : '') + msg, 'error', 5600);
+  if (window.console && console.warn) console.warn('[persona]', what || 'action', msg);
+  return false;
+}
+
 /* POST：真实执行；演示模式下只做本地模拟并提示 */
 async function mutate(path, body, opts = {}) {
   const { mockApply, okMsg } = opts;
@@ -3805,8 +3857,18 @@ async function loadOverview() {
   renderOverviewGating(data);
   renderOverviewRuntime(data);
   renderOverviewDir(data);
+  _warnIfNoPillow(data);
   setNavCount('memory', (data.tier1.count || 0) + (data.tier2.count || 0) + (data.tier3.count || 0));
   loadChannels();
+}
+
+/* Pillow 缺失时在概览页提醒一次（每个会话只弹一次，不打扰）*/
+function _warnIfNoPillow(data) {
+  const pil = (data || {}).render && (data.render.pillow || null);
+  if (!pil || pil.ok !== false) return;
+  if (sessionStorage.getItem('np_pil_warned')) return;
+  sessionStorage.setItem('np_pil_warned', '1');
+  toast('图片卡片不可用：' + (pil.reason || '未检测到 Pillow') + ' —— 三张卡会回退为文字版', 'error', 8000);
 }
 
 function renderScope(data) {
@@ -4943,31 +5005,66 @@ async function loadCards(opts = {}) {
         + `　·　raqm ${be.raqm ? '✓' : '—'}　·　${src}`;
       beLine.classList.toggle('warn', be.coverage_source !== 'cmap');
     } else {
-      beLine.textContent = '渲染后端信息不可用（Pillow 未就绪）';
+      // 2.5.8：说清后果与修法，而不是只丢一句"未就绪"
+      const why = (info.pillow && info.pillow.reason) || '未检测到 Pillow';
+      beLine.innerHTML = `图片卡片不可用：${esc(why)}　——　三张卡都会自动回退为文字版。`
+        + `<br>修法：在 NA 容器里执行 <code>pip install pillow</code>（或重装插件触发自动安装）后重试。`;
       beLine.classList.add('warn');
     }
   }
 
-  if (!$('#cardLayerList').children.length) await loadCardLayers({ fresh: true });
-
+  if ((info.background || {}).style) {
+    const _st = info.background.style;
+    renderStyleList(_st);
+    const _b = $('#cardStyleBadge');
+    if (_b) _b.textContent = _st.customCount ? `自定义 ${_st.customCount} 项` : '默认';
+  }
   const bg = info.background || {};
+    const _inkSel = $('#cardBgInk');
+    if (_inkSel && document.activeElement !== _inkSel) _inkSel.value = String(bg.ink || 'auto');
+    const _anchorSel = $('#cardBgAnchor');
+    const _anchorVal = String(bg.anchor || 'auto');
+    if (_anchorSel && document.activeElement !== _anchorSel) {
+      const _hasAnc = [..._anchorSel.options].some((o) => o.value === _anchorVal);
+      _anchorSel.value = _hasAnc ? _anchorVal : 'auto';
+    }
+    const _scopeSel = $('#cardBgScope');
+    const _scopes = bg.scopes || {};
+    const _scope = _scopeSel ? (_scopeSel.value || 'all') : 'all';
+    const _eff = (_scopes[_scope] || {}).name || '';
   const bgSel = $('#cardBgSelect');
   if (bgSel) {
     const imgs = bg.images || [];
     bgSel.innerHTML = `<option value="">（内置暖色渐变）</option>`
-      + imgs.map((x) => `<option value="${esc(x.name)}"${x.name === bg.name ? ' selected' : ''}>`
+      + imgs.map((x) => `<option value="${esc(x.name)}"${x.name === _eff ? ' selected' : ''}>`
         + `${esc(x.name)}（${fmtBytes(x.size)}${x.width ? ' · ' + x.width + '×' + x.height : ''}）</option>`).join('');
-    const blur = $('#cardBgBlur'), dim = $('#cardBgDim');
+    const blur = $('#cardBgBlur'), dim = $('#cardBgDim'), glassEl = $('#cardBgGlass');
     if (document.activeElement !== blur) blur.value = Math.round(bg.blur || 0);
     if (document.activeElement !== dim) dim.value = Math.round(bg.dim || 0);
+    const _g = (bg.glass === undefined || bg.glass === null) ? -1 : Number(bg.glass);
+    if (glassEl && document.activeElement !== glassEl) glassEl.value = _g < 0 ? -1 : _g;
     $('#cardBgBlurOut').textContent = Math.round(bg.blur || 0);
     $('#cardBgDimOut').textContent = Number(bg.dim || 0) === 0 ? '自动' : (bg.dim > 0 ? '+' : '') + bg.dim;
-    $('#cardBgSub').textContent = bg.name
-      ? `${bg.name}　·　模糊 ${Math.round(bg.blur || 0)}　·　补偿 ${Number(bg.dim || 0) === 0 ? '自动' : bg.dim}`
-      : '内置暖色渐变（无自定义图）';
+    const gOut0 = $('#cardBgGlassOut');
+    if (gOut0) gOut0.textContent = _g < 0 ? '自动' : _g + '%';
+    const _gbEl = $('#cardBgGlassBlur');
+    const _gb = (bg.glass_blur === undefined || bg.glass_blur === null) ? -1 : Number(bg.glass_blur);
+    if (_gbEl && document.activeElement !== _gbEl) _gbEl.value = _gb < 0 ? -1 : _gb;
+    const gbOut = $('#cardBgGlassBlurOut');
+    if (gbOut) gbOut.textContent = _gb < 0 ? '自动' : _gb + 'px';
+    const _gTxt = _g < 0 ? '' : `　·　玻璃 ${_g}%`;
+    const _effInfo = (_scopes[_scope] || {});
+    const _effName = _effInfo.name || '';
+    const _effExists = !!_effInfo.exists;
+    const _scopeLabel = ({ all: '全部卡片', single: '单人卡', rank: '排行榜', overview: '印象总览' })[_scope] || '全部卡片';
+    // 该作用范围没单独配图 → 实际生效的是全局背景
+    const _fromGlobal = !_effName && !!bg.name;
+    $('#cardBgSub').textContent = (_effName || bg.name)
+      ? `${_effName || bg.name}${_effName ? '' : '（跟随全局）'}　·　${_scopeLabel}　·　模糊 ${Math.round(bg.blur || 0)}　·　补偿 ${Number(bg.dim || 0) === 0 ? '自动' : bg.dim}${_gTxt}`
+      : `${_scopeLabel}：内置暖色渐变（无自定义图）${_gTxt}`;
     const badge = $('#cardBgBadge');
-    badge.textContent = bg.name ? (bg.exists ? '自定义' : '图片丢失') : '渐变';
-    badge.className = 'badge' + (bg.name && !bg.exists ? ' warn' : '');
+    badge.textContent = _effName ? (_effExists ? '专属' : '图片丢失') : (_fromGlobal ? '跟随全局' : '渐变');
+    badge.className = 'badge' + ((_effName && !_effExists) ? ' warn' : '');
   }
 
   $('#cardFontHint').innerHTML = font.pinEnabled
@@ -4981,20 +5078,28 @@ $('#cardSource').addEventListener('change', () => {
 
 /* 选中即生效：正文 / emoji 各一个 change 处理器 */
 async function applyFontKind(kind, name) {
-  const body = kind === 'emoji' ? { emoji: name } : { name };
-  if (kind === 'text' && !name) {          // 正文没有「自动」以外的空值语义 → 用 clear
-    const ok0 = await postAction('font', { clear: true });
-    return ok0;
+  try {
+    if (kind === 'text' && !name) {        // 正文没有「自动」以外的空值语义 → 用 clear
+      return await postAction('font', { clear: true });
+    }
+    const body = kind === 'emoji' ? { emoji: name } : { name };
+    return await postAction('font', body);
+  } catch (e) {
+    _actionError(e, '切换字体');
+    return false;
   }
-  return await postAction('font', body);
 }
 
 $('#cardFontSelect').addEventListener('change', async (e) => {
   const name = e.target.value;
   const ok = await applyFontKind('text', name);
-  if (ok !== null) {
+  if (ok) {
     state.cardInfo = null;
     toast(name ? `正文已切换：${name}` : '正文已恢复自动探测', 'success');
+    await loadCards({ fresh: true });
+  } else {
+    // H3：失败（含 401/400）一律回滚下拉，别停在坏值上
+    state.cardInfo = null;
     await loadCards({ fresh: true });
   }
 });
@@ -5002,9 +5107,12 @@ $('#cardFontSelect').addEventListener('change', async (e) => {
 $('#cardEmojiSelect').addEventListener('change', async (e) => {
   const name = e.target.value;
   const ok = await applyFontKind('emoji', name);
-  if (ok !== null) {
+  if (ok) {
     state.cardInfo = null;
     toast(name ? `emoji 已切换：${name}` : 'emoji 已恢复自动探测', 'success');
+    await loadCards({ fresh: true });
+  } else {
+    state.cardInfo = null;
     await loadCards({ fresh: true });
   }
 });
@@ -5033,244 +5141,211 @@ $('#cardFontCatalogList').addEventListener('click', async (e) => {
   }
 });
 
-/* ---- 外观图层 ---- */
-state.layers = null;          // 当前编辑中的层数组（页面状态，保存前不落盘）
-state.layerInfo = null;
-
-const LAYER_FIELDS = {
-  gradient: [["horizontal", "check"], ["stops", "stops"]],
-  image: [["src", "image"], ["fit", "select:cover,contain,stretch"], ["blur", "num"], ["dim", "num"], ["alpha", "num"]],
-  veil: [["color", "color"], ["alpha", "num"]],
-  scrim: [["from", "select:top,bottom,left,right"], ["color", "color"], ["alpha", "num"], ["size", "num"]],
-  blobs: [["alpha", "num"]],
-  tint: [["color", "color"], ["alpha", "num"]],
-  border: [["color", "color"], ["width", "num"], ["radius", "num"], ["inset", "num"], ["alpha", "num"]],
-  text: [["text", "text"], ["x", "num"], ["y", "num"], ["size", "num"], ["color", "color"], ["align", "select:left,center,right"]],
-  sticker: [["src", "image"], ["x", "num"], ["y", "num"], ["w", "num"], ["h", "num"], ["alpha", "num"]],
-  grain: [["alpha", "num"]],
-};
-
-function layerFieldHtml(layer, idx, field, spec) {
-  const [key, kind] = spec;
-  const val = layer[key] === undefined ? '' : layer[key];
-  const id = `lf-${idx}-${key}`;
-  if (kind === 'check') {
-    return `<label class="hint" style="margin-right:10px"><input type="checkbox" data-li="${idx}" data-lk="${key}" ${val ? 'checked' : ''}> ${key}</label>`;
-  }
-  if (kind.startsWith('select:')) {
-    const opts = kind.slice(7).split(',');
-    return `<label class="hint" style="margin-right:10px">${key}
-      <select class="select" data-li="${idx}" data-lk="${key}" style="min-width:96px">`
-      + opts.map((o) => `<option value="${esc(o)}"${String(val) === o ? ' selected' : ''}>${esc(o)}</option>`).join('')
-      + `</select></label>`;
-  }
-  if (kind === 'image') {
-    const imgs = (state.layerInfo && state.layerInfo.images) || [];
-    return `<label class="hint" style="margin-right:10px">${key}
-      <select class="select" data-li="${idx}" data-lk="${key}" style="min-width:150px">`
-      + `<option value="">（选择图片）</option>`
-      + imgs.map((x) => `<option value="${esc(x.name)}"${String(val).includes(x.name) ? ' selected' : ''}>${esc(x.name)}</option>`).join('')
-      + `</select></label>`;
-  }
-  if (kind === 'stops') {
-    const txt = Array.isArray(val) ? JSON.stringify(val) : '';
-    return `<label class="hint">stops
-      <input class="field" data-li="${idx}" data-lk="${key}" value="${esc(txt)}" style="min-width:220px"
-        placeholder='[[0,"#fdf6ec"],[1,"#f6d5b8"]]'></label>`;
-  }
-  const type = kind === 'color' ? 'text' : (kind === 'text' ? 'text' : 'number');
-  const step = kind === 'num' ? '0.01' : '';
-  return `<label class="hint" style="margin-right:10px">${key}
-    <input class="field" type="${type}" step="${step}" data-li="${idx}" data-lk="${key}"
-      value="${esc(val)}" style="width:${kind === 'num' ? 70 : 130}px"></label>`;
+/* ---- 外观配色（DIY，2.5.0）：只给颜色，框架不动 ---- */
+function renderStyleList(styleInfo) {
+  const box = $('#cardStyleList');
+  if (!box || !styleInfo) return;
+  const toks = styleInfo.tokens || [];
+  box.innerHTML = toks.map((t) => `
+    <div data-token-row="${t.key}" style="display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:8px;padding:6px 8px">
+      <input type="color" class="style-picker" data-token="${t.key}"
+             value="${t.zero ? '#808080' : esc(t.value)}"
+             style="width:34px;height:26px;padding:0;border:none;background:none;cursor:pointer">
+      <input class="field style-hex" data-token="${t.key}" value="${esc(t.value)}" maxlength="7"
+             style="width:88px" spellcheck="false"
+             placeholder="${t.supportsZero ? '#rrggbb 或 #0' : '#rrggbb'}">
+      <span style="flex:1;font-size:11px;color:var(--text-soft);line-height:1.35">
+        <span style="color:var(--text)">${esc(t.label)}${t.custom ? '（已改）' : ''}</span>
+        ${t.where ? `<br><span style="opacity:.72">${esc(t.where)}</span>` : ''}
+      </span>
+      <button class="mini-btn" type="button" data-style-reset="${t.key}">默认</button>
+    </div>`).join('');
 }
 
-function renderLayerEditor() {
-  const box = $('#cardLayerList');
-  if (!box) return;
-  const layers = state.layers || [];
-  if (!layers.length) {
-    box.innerHTML = '<p class="hint">（空模板：将使用内置暖色渐变 + 光斑。点「添加」开始搭层）</p>';
+async function saveStyleToken(key, value) {
+  let d = null;
+  try {
+    d = await postAction('card_style', { key, value });
+  } catch (e) {
+    _actionError(e, '保存配色');
+    await loadCards({ fresh: true });     // 失败就把界面拉回服务端状态
+    return false;
+  }
+  if (!d) {                                // 401：postAction 已提示
+    await loadCards({ fresh: true });
+    return false;
+  }
+  state.cardInfo = null;
+  const st = (d.style || {});
+  renderStyleList(st);
+  const badge = $('#cardStyleBadge');
+  if (badge) badge.textContent = st.customCount ? `自定义 ${st.customCount} 项` : '默认';
+  await runCardPreview();
+  return true;
+}
+
+// 取色器：拖动过程中只更新旁边的十六进制框（纯本地，不发请求、不重渲）
+$('#cardStyleList').addEventListener('input', (e) => {
+  const el = e.target;
+  if (!el.classList.contains('style-picker')) return;
+  const txt = document.querySelector(`.style-hex[data-token="${el.dataset.token}"]`);
+  if (txt) txt.value = el.value;
+  const row = document.querySelector(`[data-token-row="${el.dataset.token}"]`);
+  if (row) {                                // 松手前标脏：边框亮起来，表示"还没生效"
+    row.dataset.dirty = '1';
+    row.style.borderColor = '#c46a4a';
+    row.style.boxShadow = 'inset 0 0 0 1px #c46a4a';
+  }
+});
+// 松手（拖动结束时的 change）才落盘 + 重渲
+$('#cardStyleList').addEventListener('change', (e) => {
+  const el = e.target;
+  if (!el.classList.contains('style-picker')) return;
+  const row = document.querySelector(`[data-token-row="${el.dataset.token}"]`);
+  if (row) { delete row.dataset.dirty; row.style.borderColor = ''; row.style.boxShadow = ''; }
+  const txt = document.querySelector(`.style-hex[data-token="${el.dataset.token}"]`);
+  if (txt) txt.value = el.value;
+  saveStyleToken(el.dataset.token, el.value);
+});
+$('#cardStyleList').addEventListener('change', (e) => {
+  const el = e.target;
+  if (!el.classList.contains('style-hex')) return;
+  let v = (el.value || '').trim().replace(/^#/, '');
+  // 3 位简写先展开成 6 位（fff → ffffff），否则后面 6 位校验会把它拒掉
+  if (/^[0-9a-fA-F]{3}$/.test(v)) v = v[0] + v[0] + v[1] + v[1] + v[2] + v[2];
+  if (/^[0-9a-fA-F]{6}$/.test(v)) v = '#' + v;
+  else if (v === '0') v = '#0';
+  // #0 = 不渲染
+  if (v === '#0' || v === '0') {
+    el.value = '#0';
+    saveStyleToken(el.dataset.token, '#0');
     return;
   }
-  box.innerHTML = layers.map((layer, i) => {
-    const fields = (LAYER_FIELDS[layer.type] || []).map((f) => layerFieldHtml(layer, i, f[0], f[1])).join('');
-    return `<div style="border:1px solid var(--line);border-radius:10px;padding:8px 10px;margin-bottom:8px">
-      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-        <span class="badge">${i + 1}</span>
-        <strong style="font-size:12px">${esc(layer.type)}</strong>
-        <span class="badge">${layer.stage === 'front' ? '前景' : '背景'}</span>
-        <span style="flex:1"></span>
-        <button class="mini-btn" type="button" data-lmove="${i}">上移</button>
-        <button class="mini-btn" type="button" data-lmove="${i}" data-dir="down">下移</button>
-        <button class="mini-btn" type="button" data-ldel="${i}">删除</button>
-      </div>
-      <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">${fields}</div>
-    </div>`;
-  }).join('');
-}
-
-async function loadCardLayers(opts = {}) {
-  let info = state.layerInfo;
-  if (!info || opts.fresh) {
-    info = await load('card_layers', () => null);
-    if (!info) return;
-    state.layerInfo = info;
+  if (!/^#[0-9a-fA-F]{6}$/.test(v)) {
+    toast('颜色要写成 #rrggbb（# 可省略），或 #0 表示不渲染', 'warning');
+    return;
   }
-  const st = info.layers || {};
-  const sel = $('#cardLayersSelect');
-  if (sel) {
-    const tpls = st.templates || [];
-    sel.innerHTML = `<option value="">（内置默认）</option>`
-      + tpls.map((t) => `<option value="${esc(t.name)}"${t.name === st.name ? ' selected' : ''}>`
-        + `${esc(t.name)}（${t.count} 层）</option>`).join('');
-  }
-  const add = $('#cardLayerAdd');
-  if (add && !add.options.length) {
-    add.innerHTML = (st.types || []).map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join('');
-  }
-  if (!state.layers || opts.fresh) {
-    const cur = (st.templates || []).find((t) => t.name === st.name);
-    state.layers = cur ? JSON.parse(JSON.stringify(cur.layers || []))
-      : JSON.parse(JSON.stringify(st.defaults || []));
-  }
-  $('#cardLayersSub').textContent = st.name ? `模板 ${st.name}` : '内置默认（暖色渐变 + 光斑）';
-  const badge = $('#cardLayersBadge');
-  badge.textContent = st.name ? (st.exists ? `${(state.layers || []).length} 层` : '模板丢失') : '默认';
-  badge.className = 'badge' + (st.name && !st.exists ? ' warn' : '');
-  renderLayerEditor();
-}
-
-$('#cardLayersSelect').addEventListener('change', async (e) => {
-  const d = await postAction('card_layers', { select: e.target.value });
-  if (!d) return;
-  state.layerInfo = null;
-  state.layers = null;
-  await loadCardLayers({ fresh: true });
-  toast(e.target.value ? '已切换模板：' + e.target.value : '已恢复内置默认', 'success');
+  el.value = v.toLowerCase();
+  saveStyleToken(el.dataset.token, v.toLowerCase());
 });
-
-$('#cardLayerAddBtn').addEventListener('click', () => {
-  const t = $('#cardLayerAdd').value;
-  if (!t) return;
-  const base = { type: t, stage: (t === 'border' || t === 'text' || t === 'sticker' || t === 'grain') ? 'front' : 'back' };
-  if (t === 'image') Object.assign(base, { fit: 'cover', blur: 12 });
-  if (t === 'veil') Object.assign(base, { color: '#fffcf6', alpha: 0.18 });
-  if (t === 'text') Object.assign(base, { text: '水印', x: 0.5, y: 0.95, size: 11, color: '#00000055', align: 'center' });
-  if (t === 'sticker') Object.assign(base, { x: 0.03, y: 0.03, w: 0.06, alpha: 1 });
-  if (t === 'border') Object.assign(base, { color: '#ffffffcc', width: 2, radius: 0.032, alpha: 1 });
-  if (t === 'scrim') Object.assign(base, { from: 'top', color: '#000000', alpha: 0.3, size: 0.25 });
-  if (t === 'grain') Object.assign(base, { alpha: 0.05 });
-  state.layers = (state.layers || []).concat([base]);
-  renderLayerEditor();
-});
-
-$('#cardLayerList').addEventListener('click', (e) => {
-  const mv = e.target.closest('[data-lmove]');
-  const del = e.target.closest('[data-ldel]');
-  if (mv) {
-    const i = parseInt(mv.dataset.lmove, 10);
-    const down = mv.dataset.dir === 'down';
-    const j = down ? i + 1 : i - 1;
-    if (j < 0 || j >= state.layers.length) return;
-    const arr = state.layers;
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-    renderLayerEditor();
-  } else if (del) {
-    const i = parseInt(del.dataset.ldel, 10);
-    state.layers.splice(i, 1);
-    renderLayerEditor();
-  }
-});
-
-$('#cardLayerList').addEventListener('change', (e) => {
+// 输入时就补 #（不打字也要能直接粘 6 位）
+$('#cardStyleList').addEventListener('input', (e) => {
   const el = e.target;
-  const i = el.dataset && el.dataset.li;
-  const k = el.dataset && el.dataset.lk;
-  if (i === undefined || !k) return;
-  const idx = parseInt(i, 10);
-  let v = el.type === 'checkbox' ? el.checked : el.value;
-  if (el.type === 'number') v = v === '' ? undefined : parseFloat(v);
-  if (k === 'stops') {
-    try { v = JSON.parse(v); } catch (err) { toast('stops 必须是 JSON 数组', 'warning'); return; }
+  if (!el.classList.contains('style-hex')) return;
+  const v = (el.value || '').trim();
+  if (/^[0-9a-fA-F]{6}$/.test(v)) {
+    el.value = '#' + v.toLowerCase();
+    if (el.selectionStart === v.length) el.setSelectionRange(7, 7);
   }
-  if (k === 'src') {
-    const imgs = (state.layerInfo && state.layerInfo.images) || [];
-    const hit = imgs.find((x) => x.name === v);
-    v = hit ? hit.path || ('backgrounds_custom/' + hit.name) : v;
-  }
-  state.layers[idx][k] = v;
+  // 3 位简写不在这里展开：等失焦/回车（change）时统一补成 6 位，避免打字过程被改写
 });
-
-$('#cardLayersPreview').addEventListener('click', async () => {
-  await renderPreviewWithLayers();
+$('#cardStyleList').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-style-reset]');
+  if (!btn) return;
+  saveStyleToken(btn.dataset.styleReset, 'default');
 });
-
-async function renderPreviewWithLayers() {
-  const btn = $('#cardRunBtn');
-  btn.classList.add('is-loading');
+$('#cardStyleReset').addEventListener('click', async () => {
+  let d = null;
   try {
-    const body = {
-      card: $('#cardKind').value,
-      source: $('#cardSource').value,
-      scale: parseFloat($('#cardScale').value) || 0,
-      layers: state.layers || [],
-    };
-    if (body.source === 'channel') body.chat_key = $('#cardChannel').value;
-    const data = await postAction('card_preview', body);
-    if (!data) return;
-    const img = $('#cardPreviewImg');
-    img.src = data.image;
-    img.hidden = false;
-    $('#cardPreviewEmpty').hidden = true;
-    const m = data.meta || {};
-    $('#cardPreviewMeta').textContent =
-      `${m.card} · ${m.count} 条档案 · ${fmtBytes(m.bytes)} · ${m.layers || 0} 层外观`;
-  } catch (err) {
-    toast(err.message || '渲染失败', 'error');
-  } finally {
-    btn.classList.remove('is-loading');
+    d = await postAction('card_style', { clear: true });
+  } catch (e) {
+    // 400/500 不能静默：提示后端原因，并把界面拉回服务端状态
+    _actionError(e, '恢复默认配色');
+    state.cardInfo = null;
+    await loadCards({ fresh: true });
+    return;
   }
-}
-
-$('#cardLayersSave').addEventListener('click', async () => {
-  const name = (prompt('模板名（会保存到插件数据目录 card_layers/ 并立即启用）', 'my-look') || '').trim();
-  if (!name) return;
-  const d = await postAction('card_layers', { name, layers: state.layers || [] });
-  if (!d) return;
-  state.layerInfo = null;
-  await loadCardLayers({ fresh: true });
-  toast('已保存并启用模板：' + name, 'success');
-  await renderPreviewWithLayers();
+  if (!d) {                       // 401：postAction 已弹密钥框与提示
+    state.cardInfo = null;
+    await loadCards({ fresh: true });
+    return;
+  }
+  state.cardInfo = null;
+  renderStyleList(d.style || {});
+  const badge = $('#cardStyleBadge');
+  if (badge) badge.textContent = '默认';
+  toast('配色已恢复默认', 'success');
+  await runCardPreview();
 });
+$('#cardStylePreview').addEventListener('click', () => runCardPreview());
+
 
 /* ---- 背景 ---- */
 let _bgTimer = 0;
 async function saveBg(patch, rerender) {
-  const d = await postAction('card_bg', patch);
-  if (!d) return;
+  let d = null;
+  try {
+    d = await postAction('card_bg', patch);
+  } catch (e) {
+    // H2：业务错误（400/500）不能静默 —— 提示后回滚界面
+    _actionError(e, '保存背景设置');
+    state.cardInfo = null;
+    await loadCards({ fresh: true });      // 用服务端状态覆盖掉本地的错误值
+    return false;
+  }
+  if (!d) {
+    // H1：401 —— postAction 已弹密钥框与提示；这里回滚下拉，别让用户以为设定成功了
+    state.cardInfo = null;
+    await loadCards({ fresh: true });
+    return false;
+  }
   state.cardInfo = null;
   await loadCards({ fresh: true });
-  if (rerender) await runCardPreview();
+  if (rerender === true) await runCardPreview();   // L2：只有明确要渲染时才渲
+  return true;
 }
 
+if ($('#cardBgScope')) $('#cardBgScope').addEventListener('change', async () => { await loadCards({ fresh: true }); });
+if ($('#cardBgAnchor')) $('#cardBgAnchor').addEventListener('change', async (e) => {
+  const label = e.target.options[e.target.selectedIndex].textContent;
+  const ok = await saveBg({ anchor: e.target.value }, true);
+  if (ok) toast('裁剪锚点：' + label, 'success');
+});
+if ($('#cardBgInk')) $('#cardBgInk').addEventListener('change', async (e) => {
+  const label = e.target.options[e.target.selectedIndex].textContent;
+  const ok = await saveBg({ ink: e.target.value }, true);
+  if (ok) toast('文字配色：' + label, 'success');
+});
 $('#cardBgSelect').addEventListener('change', async (e) => {
-  await saveBg({ name: e.target.value }, true);
-  toast(e.target.value ? '背景已切换：' + e.target.value : '已恢复内置渐变', 'success');
+  const name = e.target.value;
+  const ok = await saveBg({ name, card: ($('#cardBgScope') ? $('#cardBgScope').value : 'all') }, true);
+  if (ok) toast(name ? '背景已切换：' + name : '已恢复内置渐变', 'success');
 });
 
 function _bgSliderChanged() {
   const blur = parseFloat($('#cardBgBlur').value) || 0;
   const dim = parseInt($('#cardBgDim').value, 10) || 0;
+  const glassEl = $('#cardBgGlass');
+  const glass = glassEl ? parseInt(glassEl.value, 10) : -1;
+  const gbEl = $('#cardBgGlassBlur');
+  const glassBlur = gbEl ? parseInt(gbEl.value, 10) : -1;
   $('#cardBgBlurOut').textContent = blur;
   $('#cardBgDimOut').textContent = dim === 0 ? '自动' : (dim > 0 ? '+' : '') + dim;
-  clearTimeout(_bgTimer);
-  _bgTimer = setTimeout(async () => {
-    await saveBg({ blur, dim }, 'keep');
-  }, 350);
+  const gOut = $('#cardBgGlassOut');
+  if (gOut) gOut.textContent = glass < 0 ? '自动' : glass + '%';
+  const gbOut = $('#cardBgGlassBlurOut');
+  if (gbOut) gbOut.textContent = glassBlur < 0 ? '自动' : glassBlur + 'px';
+  return { blur, dim, glass, glass_blur: glassBlur };
 }
-$('#cardBgBlur').addEventListener('input', _bgSliderChanged);
-$('#cardBgDim').addEventListener('input', _bgSliderChanged);
+/* L2：拖动过程只落盘不重渲；松手才渲一张 —— 避免"拖一下停一下"每次都渲 */
+function _bgSliderInput() {
+  const patch = _bgSliderChanged();
+  clearTimeout(_bgTimer);
+  _bgTimer = setTimeout(() => { saveBg(patch, false); }, 350);
+}
+function _bgSliderCommit() {
+  const patch = _bgSliderChanged();
+  clearTimeout(_bgTimer);
+  saveBg(patch, true);
+}
+$('#cardBgBlur').addEventListener('input', _bgSliderInput);
+$('#cardBgDim').addEventListener('input', _bgSliderInput);
+$('#cardBgGlass').addEventListener('input', _bgSliderInput);
+$('#cardBgGlassBlur').addEventListener('input', _bgSliderInput);
+$('#cardBgBlur').addEventListener('change', _bgSliderCommit);
+$('#cardBgDim').addEventListener('change', _bgSliderCommit);
+$('#cardBgGlass').addEventListener('change', _bgSliderCommit);
+$('#cardBgGlassBlur').addEventListener('change', _bgSliderCommit);
 
 $('#cardBgUploadBtn').addEventListener('click', () => $('#cardBgFile').click());
 $('#cardBgFile').addEventListener('change', async (e) => {
@@ -5282,7 +5357,9 @@ $('#cardBgFile').addEventListener('change', async (e) => {
   const btn = $('#cardBgUploadBtn');
   btn.classList.add('is-loading');
   try {
-    const res = await fetch('./api/card_bg?name=' + encodeURIComponent(file.name), {
+    const _scope = $('#cardBgScope') ? $('#cardBgScope').value : 'all';
+    const res = await fetch('./api/card_bg?name=' + encodeURIComponent(file.name)
+      + '&card=' + encodeURIComponent(_scope || 'all'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/octet-stream', ...(state.key ? { 'X-WebUI-Key': state.key } : {}) },
       body: buf,
