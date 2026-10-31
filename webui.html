@@ -73,6 +73,9 @@
   --text-soft: #56524a;
   --muted: #8b8474;
   --faint: #b3ac9c;
+  --text-mute: var(--muted);   /* 二级文字别名：日程页一直在用这个未定义的变量 */
+  --success: #2f6f5e;
+  --danger: #b4453a;
   --accent: #2f6f5e;
   --accent-strong: #235445;
   --accent-soft: rgba(47, 111, 94, 0.1);
@@ -110,6 +113,9 @@
   --text-soft: #b7b2a7;
   --muted: #807a6f;
   --faint: #5d584f;
+  --text-mute: var(--muted);
+  --success: #4ad19a;
+  --danger: #ff6b6b;
   --accent: #63b7a4;
   --accent-strong: #8bd0bd;
   --accent-soft: rgba(99, 183, 164, 0.13);
@@ -493,6 +499,19 @@ main { min-width: 0; padding: 32px 34px 70px; }
 .metric-label { color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: 0.09em; }
 .metric-value { display: flex; align-items: baseline; gap: 6px; margin: 8px 0 3px; font-size: 26px; font-weight: 650; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
 .metric-value small { color: var(--muted); font-size: 11px; font-weight: 450; letter-spacing: 0; }
+/* 指标副行：日程页在用，之前没定义 → 继承成正文样式 */
+.metric-sub { margin-top: 2px; font-size: 11px; color: var(--muted); letter-spacing: 0.02em; }
+/* 长值（越界词列表）：折行 + 两行封顶，别被 .metric 的 overflow:hidden 硬切 */
+.metric-value.wrap {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 15px;
+  line-height: 1.45;
+  white-space: normal;
+  word-break: break-word;
+}
 .metric-note { min-height: 17px; overflow: hidden; color: var(--muted); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
 .meter { height: 3px; margin-top: 12px; overflow: hidden; border-radius: 3px; background: var(--surface-3); }
 .meter > i { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width 0.5s ease; }
@@ -693,6 +712,19 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
   margin-bottom: 10px;
   border-bottom: 1px solid var(--line);
 }
+.life-select {
+  height: 28px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-soft);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.life-select:hover { border-color: var(--line-strong); }
+.life-select:focus { outline: none; border-color: var(--accent-border); }
 .life-day { cursor: pointer; transition: background 0.14s ease, border-color 0.14s ease; }
 .life-day:hover { background: var(--surface-2); }
 /* 绿色高光只属于"真实的今天"（随日期自动挪）；用户选中的其它天用中性底色 */
@@ -784,7 +816,8 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 .life-day.today .life-day-sum { color: var(--text-soft); }
 @media (max-width: 720px) {
   .life-row { grid-template-columns: 78px 1fr; height: 46px; }
-  .life-feel { display: none; }
+  /* 只隐藏时间轴里的体感列；「这几天」的「N 段」也用 .life-feel，别一起吃掉 */
+  .life-row .life-feel { display: none; }
   .life-day { grid-template-columns: 84px 1fr; height: 54px; }
   .life-split { grid-template-columns: 1fr; gap: 18px; }
 }
@@ -2434,7 +2467,7 @@ body.is-scrolling .dialog-foot {
           <p class="page-desc">今天在过什么日子：一整天的时间轴、此刻的状态、抽到的素材与昨夜余韵。</p>
         </div>
         <div class="head-actions">
-          <select class="input sm" id="lifeRebuildDays" title="一次重排几天">
+          <select class="life-select" id="lifeRebuildDays" title="一次重排几天">
             <option value="1">1 天</option>
             <option value="2">2 天</option>
             <option value="3" selected>3 天</option>
@@ -3931,7 +3964,8 @@ const LIFE_PACK_FIELDS = [
 async function loadLifePack() {
   let pack;
   try {
-    pack = await api('life_pack');
+    pack = await load('life_pack');
+    if (!pack) return;
   } catch (e) {
     $('#lifePack').innerHTML = `<div class="empty-inline">读取失败：${esc(e.message || '未知错误')}</div>`;
     return;
@@ -3976,11 +4010,12 @@ async function saveLifePack() {
   const old = btn.textContent;
   btn.textContent = '保存中…';
   try {
-    const res = await api('life_pack', { method: 'POST', body });
+    const res = await postAction('life_pack', body);
+    if (!res) return;                                  // 401：已弹密钥框并登记重放
     renderLifePack(res.pack || {});
     toast('抽词配置已保存（下次生成生效）', 'success', 2200);
   } catch (e) {
-    toast('保存失败：' + (e.message || '未知错误'), 'error', 3200);
+    _actionError(e, '保存抽词配置');
   } finally {
     btn.disabled = false;
     btn.textContent = old;
@@ -4001,13 +4036,14 @@ async function rebuildLife() {
   const old = btn.textContent;
   btn.textContent = '生成中…';
   try {
-    const res = await api('life_rebuild', { method: 'POST', body: { days } });
+    const res = await postAction('life_rebuild', { days });
+    if (!res) return;                                  // 401：已弹密钥框并登记重放
     const bad = (res.days || []).filter((r) => r.source === 'template').length;
     toast(bad ? `重排完成，其中 ${bad} 天走了兜底模板` : `已重排 ${days} 天`, bad ? 'warning' : 'success', 2600);
     state.lifeDay = '';
     await loadLife();
   } catch (e) {
-    toast('生成失败：' + (e.message || '未知错误'), 'error', 4000);
+    _actionError(e, '重新生成日程');
   } finally {
     btn.disabled = false;
     btn.textContent = old;
@@ -4093,7 +4129,9 @@ document.addEventListener('visibilitychange', () => {
 async function loadLife() {
   let data;
   try {
-    data = await api('life_state');
+    // 走 load()：401 自动弹密钥框并登记重放；403/业务错误给 toast
+    data = await load('life_state');
+    if (!data) return;
   } catch (e) {
     $('#lifeMetrics').innerHTML = '';
     $('#lifeTimeline').innerHTML = `<div class="empty-inline">读取失败：${esc(e.message || '未知错误')}</div>`;
@@ -4133,7 +4171,7 @@ function renderLife(d) {
   $('#lifeMetrics').innerHTML = cards.map(([k, v, sub]) => `
     <div class="metric">
       <div class="metric-label">${esc(k)}</div>
-      <div class="metric-value">${esc(String(v))}</div>
+      <div class="metric-value${k === '越界词' ? ' wrap' : ''}">${esc(String(v))}</div>
       ${sub ? `<div class="metric-sub">${esc(sub)}</div>` : ''}
     </div>`).join('');
 
@@ -4433,8 +4471,10 @@ async function loadOverview() {
 function _warnIfNoPillow(data) {
   const pil = (data || {}).render && (data.render.pillow || null);
   if (!pil || pil.ok !== false) return;
-  if (sessionStorage.getItem('np_pil_warned')) return;
-  sessionStorage.setItem('np_pil_warned', '1');
+  try {
+    if (sessionStorage.getItem('np_pil_warned')) return;
+  } catch (e) { /* 隐私模式下 storage 会抛：这条提醒只是锦上添花，吞掉 */ }
+  try { sessionStorage.setItem('np_pil_warned', '1'); } catch (e) { /* 同上 */ }
   toast('图片卡片不可用：' + (pil.reason || '未检测到 Pillow') + ' —— 三张卡会回退为文字版', 'error', 8000);
 }
 
@@ -5561,8 +5601,13 @@ async function loadCards(opts = {}) {
   }
 
   const chSel = $('#cardChannel');
+  // 2.4.3 的修复：重建下拉前记住选中值 —— 否则改背景/字体触发重渲染后，
+  // 预览频道被重置成第一项，下次渲染悄悄用了错频道。
+  const prevChannel = chSel.value || state.cardChannel || '';
   chSel.innerHTML = (info.channels || []).map((c) => `<option value="${esc(c.chat_key)}">${esc(c.chat_key)}（${c.count} 人）</option>`).join('')
     || '<option value="">（没有可用频道）</option>';
+  if (prevChannel && [...chSel.options].some((o) => o.value === prevChannel)) chSel.value = prevChannel;
+  state.cardChannel = chSel.value;
   $('#cardChannelWrap').hidden = $('#cardSource').value !== 'channel';
 
   const cur = fonts.find((f) => f.name === font.name);
@@ -6021,6 +6066,8 @@ $('#cardFontFile').addEventListener('change', async (e) => {
 
 async function runCardPreview() {
   const btn = $('#cardRunBtn');
+  // 连点/并发：只认最后一次请求，慢请求不许盖掉新图
+  const seq = (state.cardPreviewSeq = (state.cardPreviewSeq || 0) + 1);
   btn.classList.add('is-loading');
   try {
     const body = {
@@ -6033,6 +6080,7 @@ async function runCardPreview() {
       if (!body.chat_key) { toast('先选一个频道', 'warning'); return; }
     }
     const data = await postAction('card_preview', body);
+    if (seq !== state.cardPreviewSeq) return;          // 已被更新的请求取代
     if (!data) return;
     const img = $('#cardPreviewImg');
     img.src = data.image;
@@ -6042,9 +6090,17 @@ async function runCardPreview() {
     $('#cardPreviewMeta').textContent =
       `${m.card} · ${m.count} 条档案 · ${fmtBytes(m.bytes)}${m.font ? ' · 字体 ' + m.font : ''}`;
   } catch (err) {
-    toast(err.message || '渲染失败', 'error');
+    if (seq === state.cardPreviewSeq) {
+      toast(err.message || '渲染失败', 'error');
+      // 失败不该停在上一次的旧图：清图、把占位放回来
+      const img = $('#cardPreviewImg');
+      img.removeAttribute('src');
+      img.hidden = true;
+      $('#cardPreviewEmpty').hidden = false;
+      $('#cardPreviewMeta').textContent = '';
+    }
   } finally {
-    btn.classList.remove('is-loading');
+    if (seq === state.cardPreviewSeq) btn.classList.remove('is-loading');
   }
 }
 
@@ -6249,6 +6305,8 @@ $('#memoClearExpired').addEventListener('click', async () => {
   if (res) loadMemo();
 });
 $('#memoSaveBtn').addEventListener('click', async () => {
+  // 慢网连点会生成重复笔记：同一次保存只允许一个在飞
+  if (state.memoSaving) return;
   const title = $('#memoTitle').value.trim();
   const content = $('#memoContent').value.trim();
   if (!title || !content) { toast('标题和内容不能为空', 'error'); return; }
@@ -6256,7 +6314,16 @@ $('#memoSaveBtn').addEventListener('click', async () => {
   //    搜索态里切到频道 B 再保存会静默写进搜索前的旧频道 A，且当前列表看不到。
   const ck = ($('#memoChannel') && $('#memoChannel').value) || state.memoChannel;
   if (!ck) { toast('请先在上方选择一个频道', 'warning'); return; }
-  const res = await mutate('memo', {
+  state.memoSaving = true;
+  const _memoBtn = $('#memoSaveBtn');
+  if (_memoBtn) {
+    _memoBtn.dataset.text = _memoBtn.textContent;
+    _memoBtn.disabled = true;
+    _memoBtn.textContent = '保存中…';
+  }
+  let res = null;
+  try {
+    res = await mutate('memo', {
     chat_key: ck,
     title, content,
     tags: $('#memoTags').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
@@ -6277,7 +6344,14 @@ $('#memoSaveBtn').addEventListener('click', async () => {
       });
     },
     okMsg: '笔记已保存',
-  });
+    });
+  } finally {
+    state.memoSaving = false;
+    if (_memoBtn) {
+      _memoBtn.disabled = false;
+      _memoBtn.textContent = _memoBtn.dataset.text || '保存笔记';
+    }
+  }
   if (res) { $('#memoTitle').value = ''; $('#memoContent').value = ''; $('#memoTags').value = ''; loadMemo(); }
 });
 
