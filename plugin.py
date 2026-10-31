@@ -493,9 +493,11 @@ class FavorabilityConfig(ConfigBase):
     # 追加身份级锚点，记录「他怎么长成现在这样」。**只增不改种子**，且受硬频率闸约束
     # （审慎累积、绝不每轮都长）。空层不注入任何内容（persona_prompt 与旧版逐字节一致）。
     ANCHOR_ENABLED: bool = _fav_field(
-        True, "启用身份锚点（tier4）",
-        "让角色自己沉淀身份级的长期锚点（这一世形成的自我认知/重要承诺）。"
-        "只增不覆盖前三档种子；无锚点时不注入任何内容。",
+        False, "启用身份锚点（tier4）",
+        "**默认关闭**。开启后：每轮注入「身份锚点」段落（含用法指引约 300 字/轮），"
+        "并允许模型调用 `沉淀身份锚点` 写全局永久条目（受每日/间隔/总量硬闸约束）。"
+        "实测代价：日均约 67 轮 × 300 字 ≈ 2 万字/天，两周产出 1 条 —— "
+        "所以默认关，需要「角色自己长出身份认知」这条能力时再开。",
         en_title="Enable Identity Anchors (tier 4)",
         en_desc="Let the character grow identity-level anchors at runtime; never overwrites the tier 1-3 seeds; injects nothing when empty",
     )
@@ -4249,9 +4251,14 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
                 1 for e in doc.entries
                 if e.kind == tier4.NOTE_KIND and e.scope == _ctx.chat_key and not e.is_expired()
             )
+            # 这里要报「实际注入的条数」，不是「库里有多少条」：
+            # 关闭锚点后库里仍存着旧条目，旧写法会一直播「锚点 1 条」，
+            # 排查时看日志会以为还在注入（我自己就被这条日志误导过一次）。
+            _n_anchor = (sum(1 for e in doc.entries if e.kind == tier4.ANCHOR_KIND)
+                         if anchor_cfg.get("enabled") else 0)
+            _anchor_tag = "" if anchor_cfg.get("enabled") else "（已关闭）"
             plugin.logger.info(
-                f"[persona] tier4 注入：锚点 {sum(1 for e in doc.entries if e.kind == tier4.ANCHOR_KIND)} 条 / "
-                f"笔记 {n_live} 条可用",
+                f"[persona] tier4 注入：锚点 {_n_anchor} 条{_anchor_tag} / 笔记 {n_live} 条可用",
             )
     except Exception as e:  # noqa: BLE001
         plugin.logger.warning(f"[persona] tier4 块渲染失败，本轮跳过: {e}")
@@ -5139,7 +5146,10 @@ async def anchor_memory(
     plugin.logger.debug(f"[persona] 锚点工具被调用：{len(str(content or ''))} 字")
     if not cfg["enabled"]:
         plugin.logger.info("[persona] 锚点写入被拒：功能已关闭（ANCHOR_ENABLED=false）")
-        return "本次未沉淀：身份锚点功能已关闭（ANCHOR_ENABLED=false）。"
+        return (
+            "本次未沉淀：身份锚点功能默认关闭（ANCHOR_ENABLED=false）。"
+            "你不需要再尝试这条路径；需要长期保留的事实请用 `save_note` 记在当前频道。"
+        )
 
     clean_content = _one_line(content, cfg["max_content"] + 1)
     if not clean_content:

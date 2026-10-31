@@ -6392,6 +6392,11 @@ function renderAnchor(data) {
   const m = data.meta || {};
   $('#anchorMeta').innerHTML = `共 ${m.total != null ? m.total : data.items.length} 条 · 今日新增 ${m.day_count || 0} · 权重上限 ${m.salience_max || 5}`;
   const list = $('#anchorList');
+  if ((data.meta || {}).enabled === false) {
+    list.innerHTML = '<div class="empty-inline">身份锚点功能已关闭（ANCHOR_ENABLED=false）。'
+      + '开启后每轮会注入约 300 字指引，模型才可能沉淀新条目；长期事实请用「频道笔记」。</div>';
+    return;
+  }
   if (!data.items.length) { list.innerHTML = '<div class="empty-inline">还没有锚点——锚点由模型在对话中自行沉淀</div>'; return; }
   // 上限跟后端走（salience_max），缺省才用 5；别再写死
   const max = Math.max(1, Math.min(9, Number(m.salience_max) || 5));

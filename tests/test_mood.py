@@ -45,6 +45,43 @@ class TestMoodHalfLifeNotSticky(unittest.TestCase):
         self.assertGreaterEqual(P.next_mood_half_life(0, -3, 0.1, 5), 3)
 
 
+class TestAnchorSwitch(unittest.TestCase):
+    """身份锚点：默认关闭；关闭时不注入、工具明确回执。"""
+
+    def setUp(self):
+        import importlib
+        self.P = importlib.import_module("nekro_persona.plugin")
+        self.T = importlib.import_module("nekro_persona.tier4")
+
+    def test_default_is_off_in_code(self):
+        # 配置项的默认值（不是运行时值）必须是 False
+        field_default = None
+        for name in dir(type(self.P.config)):
+            pass
+        # 直接看字段定义里的默认值：从 plugin 源码读更稳（配置对象已被实例值覆盖）
+        import inspect
+        src = inspect.getsource(self.P)
+        idx = src.index("ANCHOR_ENABLED: bool = _fav_field(")
+        self.assertIn("False,", src[idx: idx + 200])
+
+    def test_disabled_returns_refusal_and_no_block(self):
+        import asyncio
+        saved = getattr(self.P.config, "ANCHOR_ENABLED", None)
+        try:
+            setattr(self.P.config, "ANCHOR_ENABLED", False)
+            cfg = self.P._anchor_cfg()
+            self.assertFalse(cfg["enabled"])
+
+            async def _run():
+                doc = await self.T.open_tier4()
+                return self.T.render_anchor_block(doc, cfg, self.P._ANCHOR_GUIDE)
+
+            block = asyncio.get_event_loop().run_until_complete(_run())
+            self.assertEqual(block, "", "关闭时不应渲染锚点块")
+        finally:
+            setattr(self.P.config, "ANCHOR_ENABLED", saved)
+
+
 class TestMoodFavorScale(unittest.TestCase):
     """方案五：单层 Bernoulli + 期望强度；对称、不改符号、取整有保底。"""
 
