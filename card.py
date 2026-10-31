@@ -130,7 +130,7 @@ _FONT_CANDIDATES = [
 
 _PIL_MIRRORS = ["https://mirrors.aliyun.com/pypi/simple/", "https://pypi.org/simple", None]
 
-# Pillow 可用性状态（2.5.8）：给 WebUI 与文本兜底用，让"没装 Pillow"不再静默
+# Pillow 可用性状态（2.6.0）：给 WebUI 与文本兜底用，让"没装 Pillow"不再静默
 _PIL_STATE: dict = {"ok": None, "reason": "", "version": ""}
 
 
@@ -1334,7 +1334,7 @@ _DRAW_METHODS = frozenset({
 
 
 class _HiddenAwareDraw:
-    """最外层 draw 包装：fill / outline 是 _HIDDEN 时**整条绘制跳过**（2.5.1 的 #0 语义）。
+    """最外层 draw 包装：fill / outline 是 _HIDDEN 时**整条绘制跳过**（2.6.0 的 #0 语义）。
 
     放在最外层是为了"一处收口"：布局代码里 60 多个绘制点不用各自判空。
     """
@@ -2350,7 +2350,7 @@ def _render_favorability_rank_impl(
         pool: list = []
         if uid:
             # 只有长数字 ID（如 QQ 号）才截后四位；短/非数字 ID 取后四位会切出
-            # 无意义碎片（admin_1 → in_1），故原样显示。
+            # 无意义碎片（user_10001 → 001），故原样显示。
             short = uid[-4:] if (uid.isdigit() and len(uid) > 4) else uid
             # ⚠️ 昵称已经回退成这个 ID 时跳过：否则同一标识在同一行出现两次
             #    （名字区 `123456789` + 胶囊 `ID:6789`），既冗余又难看。

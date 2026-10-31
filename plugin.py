@@ -72,7 +72,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.5.0",
+    version="2.6.0",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -534,6 +534,160 @@ class FavorabilityConfig(ConfigBase):
         ge=1, le=5,
     )
 
+    # ==================== 当下情绪（临时态度）====================
+    # 设计：好感度 = 关系存量（慢、决定 tier 解锁）；情绪 = 当下态度（快、只影响语气）。
+    # 两者互不替代：情绪永远不改 tier 分层，也永远不显示成数字给用户看。
+    MOOD_ENABLED: bool = _fav_field(
+        True, "启用「当下情绪」",
+        "在好感度之上叠一层会自然衰减的临时情绪：只影响说话语气，不影响 tier 知识解锁",
+        en_title="Enable Mood",
+        en_desc="Layer a self-decaying mood on top of favorability; tone only, never tier unlocks",
+    )
+    MOOD_HALF_LIFE_MIN: int = _fav_field(
+        60, "情绪半衰期（分钟）",
+        "情绪按指数衰减，每过这么久强度减半；默认 60 分钟（平复得比人快一点更自然）",
+        en_title="Mood Half-life (minutes)",
+        en_desc="Exponential decay: intensity halves every N minutes",
+        ge=5, le=720,
+    )
+    MOOD_MAX_ABS: int = _fav_field(
+        100, "情绪强度上限", "情绪值的绝对值上限（±此值）",
+        en_title="Mood Cap", en_desc="Absolute cap of the mood value",
+        ge=20, le=200,
+    )
+    MOOD_TOOL_MAX: int = _fav_field(
+        60, "单次情绪变化上限",
+        "一次「调节当下情绪」最多能改变多少：幅度大才体现得出来，但也别一句话就把人打到谷底",
+        en_title="Max Single Mood Delta", en_desc="Max change per adjust_mood call",
+        ge=5, le=100,
+    )
+    MOOD_POSITIVE_RATIO: float = _fav_field(
+        0.6, "正向情绪递减系数",
+        "正向情绪按该系数打折（讨好是最容易被刷的方向，正向收益必须递减）",
+        en_title="Positive Mood Ratio", en_desc="Positive mood changes are scaled by this factor",
+        ge=0.1, le=1.0,
+    )
+    MOOD_REVERSE_COOLDOWN_MIN: int = _fav_field(
+        20, "情绪反向冷却（分钟）",
+        "刚被激起来又马上被哄好时，反向变化的增量减半；设为 0 表示不冷却",
+        en_title="Reverse Cooldown (minutes)",
+        en_desc="Halve opposite-direction mood changes within N minutes (0 disables)",
+        ge=0, le=240,
+    )
+    MOOD_SHOW_MIN: int = _fav_field(
+        14, "情绪注入阈值", "情绪绝对值低于此值时不注入（平静状态不刷屏）",
+        en_title="Mood Injection Threshold", en_desc="Skip mood injection when magnitude is below this",
+        ge=0, le=80,
+    )
+    MOOD_EVENT_HISTORY: int = _fav_field(
+        8, "情绪事件保留条数", "档案里保留最近几条情绪变化（排查用，不注入）",
+        en_title="Mood Event History", en_desc="How many recent mood events to keep",
+        ge=1, le=30,
+    )
+    MOOD_REVERSE_FREE_FLIPS: int = _fav_field(
+        1, "允许的免费情绪翻转次数",
+        "窗口内来回翻转不超过该次数时，反向变化不打折（第一次真诚道歉全额生效）；超过则按系数打折",
+        en_title="Free Mood Flips",
+        en_desc="Opposite-direction changes are not discounted until the mood flips more than N times in the window",
+        ge=0, le=5,
+    )
+    MOOD_REVERSE_FACTOR: float = _fav_field(
+        0.5, "超出翻转次数后的打折系数", "再次来回时的反向变化乘该系数（0.5 = 减半）",
+        en_title="Reverse Damping Factor",
+        en_desc="Multiplier applied to opposite-direction changes beyond the free flips",
+        ge=0.1, le=1.0,
+    )
+    MOOD_SEED_AUTOFILL: bool = _fav_field(
+        True, "旧种子自适应",
+        "旧实例的 favor.json 里没有 mood_bands 时，自动把内置的 6 档情绪文案写进去"
+        "（只写一次、不覆盖已有内容、留一份 .bak）。关掉则一直走代码内置文案，管理员改不了档位措辞",
+        en_title="Auto-seed mood bands",
+        en_desc="Write the builtin mood band table into favor.json once if it is missing",
+    )
+    MOOD_MAX_DAILY_GAIN: int = _fav_field(
+        45, "情绪日额度（正向）",
+        "同一用户一天内情绪最多累计上升这么多。情绪上限是 ±100，这里卡在 45 是为了"
+        "「一轮对话不能把心情刷到顶」，真正的一天多次互动仍会自然累积",
+        en_title="Mood Daily Gain Cap", en_desc="Max cumulative positive mood change per user per day",
+        ge=0, le=400,
+    )
+    MOOD_MAX_DAILY_LOSS: int = _fav_field(
+        60, "情绪日额度（负向）",
+        "同一用户一天内情绪最多累计下降这么多。负向原本是全额权重，没有这道闸就能在"
+        "一轮对话里就能被打到接近下限，所以负向额度比正向稍宽但必须有",
+        en_title="Mood Daily Loss Cap", en_desc="Max cumulative negative mood change per user per day",
+        ge=0, le=400,
+    )
+    MOOD_MIN_INTERVAL_MIN: int = _fav_field(
+        5, "情绪最小间隔（分钟）",
+        "同一用户两次记情绪之间至少隔这么久；冷却期内的重复调用不拒绝，但再打一次折"
+        "（见 MOOD_REPEAT_FACTOR），保住「当场反应」的表达力同时防连击",
+        en_title="Mood Min Interval (minutes)", en_desc="Minimum gap between two mood adjustments for the same user",
+        ge=0, le=240,
+    )
+    MOOD_REPEAT_FACTOR: int = _fav_field(
+        50, "冷却期重复折扣（%）",
+        "在最小间隔内再次记情绪时，本次幅度乘以此比例（默认 50%）。设为 100 等于关闭折扣",
+        en_title="Repeat Factor (%)", en_desc="Scale applied to mood changes that arrive inside the min interval",
+        ge=0, le=100,
+    )
+    MOOD_SOLICIT_GUARD: bool = _fav_field(
+        True, "情绪索要检测",
+        "对方直接索要情绪反应（「你必须对我好」「夸我一句我就给你加分」等）时，不记正向情绪；"
+        "负向不受影响，因为被冒犯本来就该记",
+        en_title="Mood Solicitation Guard",
+        en_desc="Ignore positive mood changes that the user explicitly solicited",
+    )
+    MOOD_PRECIP_ENABLED: bool = _fav_field(
+        False, "情绪平息后沉淀为好感度",
+        "情绪衰减到平息时，把残余部分按比例折算成永久好感度。默认关闭：先在真实群里观察语气效果",
+        en_title="Precipitate Mood into Favorability",
+        en_desc="Convert residual mood into permanent score once it settles (off by default)",
+    )
+    MOOD_PRECIP_RATIO: int = _fav_field(
+        0, "负向沉淀比例（%）",
+        "负向情绪平息后折算永久分的比例。默认 0 = 不沉淀（与正向一致）："
+        "「反复被扣情绪再平息」同样能刷分，只是方向相反，所以两边都要显式开启",
+        en_title="Negative Precipitation Ratio (%)",
+        en_desc="Percentage converting settled NEGATIVE mood into permanent score; 0 disables (symmetric with positive)",
+        ge=0, le=50,
+    )
+    MOOD_PRECIP_POSITIVE_RATIO: int = _fav_field(
+        0, "正向沉淀比例（%）",
+        "正向情绪平息后折算永久分的比例；默认 0 = 不沉淀（防止反复被夸刷永久分）",
+        en_title="Positive Precipitation Ratio (%)",
+        en_desc="Percentage used to convert settled positive mood into permanent score; 0 disables",
+        ge=0, le=50,
+    )
+    OBS_SETTLE_ENABLED: bool = _fav_field(
+        True, "冷却期观察结算",
+        "冷却期内模型给出的调分判断会先记成「观察」（不改分）。开启后，冷却期一过"
+        "（下一次允许调分时）按比例把观察折算成分补上，避免整段对话的判断被白白丢掉",
+        en_title="Settle Cooldown Observations",
+        en_desc="Convert cooldown-time observations into score once the cooldown expires",
+    )
+    OBS_SETTLE_RATIO: int = _fav_field(
+        30, "观察结算比例（%）",
+        "观察里的分值先相加，再乘以此比例折算。默认 30% —— 冷却期的判断本来就「没落地」，"
+        "打个折既不让它白丢，也不让冷却机制形同虚设",
+        en_title="Observation Settle Ratio (%)",
+        en_desc="Observations are summed then scaled by this percentage",
+        ge=0, le=100,
+    )
+    OBS_SETTLE_CAP: int = _fav_field(
+        2, "观察结算单次上限",
+        "一次结算最多 ±此值，并计入当日好感度预算",
+        en_title="Observation Settle Cap",
+        en_desc="Max change per settle, counted in the daily budget",
+        ge=0, le=20,
+    )
+    MOOD_PRECIP_CAP: int = _fav_field(
+        3, "沉淀单次上限", "一次沉淀最多 ±此值，并计入当日好感度预算",
+        en_title="Precipitation Cap",
+        en_desc="Max permanent change per precipitation, counted in the daily budget",
+        ge=0, le=10,
+    )
+
     # ==================== 排行榜卡片 ====================
     RANK_HIDE_EMPTY: bool = _fav_field(
         True, "排行榜隐藏空档案",
@@ -654,9 +808,9 @@ store = plugin.store
 STATE_KEY = "favorability_state"
 
 # ── 多账号分支适配（官方 NA 没有这些 API，全部走能力探测）─────────────────
-# NA 2.4.0 的多账号分支（如 NA5）给 plugin_data 加了 account_key 列，并提供
+# NA 2.4.0 的多账号分支给 plugin_data 加了 account_key 列，并提供
 # `plugin.get_account_store()`；`plugin.store` 在那里的语义是**共享/模板作用域**。
-# 实测（NA5，3 个账号）：只用 plugin.store 时 9 条档案全部落在 account_key=''
+# 实测（多账号，3 个账号）：只用 plugin.store 时档案全部落在 account_key=''
 # 的共享行上 —— 任意账号的 WebUI 都能读到别人的频道与档案，写也能跨账号写。
 _ACCOUNT_STORE = None          # 惰性缓存（返回的是「活视图」，不缓存账号本身）
 _ACCOUNT_STORE_PROBED = False
@@ -681,7 +835,7 @@ def _account_store():
 
 
 def _chat_key_account(chat_key: str) -> str:
-    """频道键里编码的账号（NA5 形如 ``<channel_id>@<account>``）；无后缀返回 ""。"""
+    """频道键里编码的账号（多账号形如 ``<channel_id>@<account>``）；无后缀返回 ""。"""
     key = str(chat_key or "")
     try:
         from nekro_agent.services.account.identity import account_scope_from_channel_id
@@ -722,7 +876,7 @@ def _archive_scope_ok(chat_key: str) -> bool:
     """这条档案是否属于当前账号。
 
     放行条件（任一）：没有账号上下文 / 键里没有 ``@账号`` 后缀 / 后缀 == 当前账号。
-    单账号部署恒为 True；NA5 实测的跨账号读写都会被拦在此处。
+    单账号部署恒为 True；多账号部署下的跨账号读写都会被拦在此处。
     """
     acct = _current_account_key()
     if not acct:
@@ -871,7 +1025,7 @@ def _weave_text_mentions(txt: str) -> tuple[str, List[str]]:
 def _reply_sender(message: ChatMessage) -> str:
     """消息若是「回复某条消息」，取被回复者（平台 ID 或昵称）。
 
-    ⚠️ QQ 官方机器人（NA5 的 qqbot_openclaw）拿不到 QQ 号，只给 openid；
+    ⚠️ QQ 官方机器人适配器拿不到 QQ 号，只给 openid；
        而群里的 @ 也不进消息段。所以「回复 + 查看印象」是最现实的一条路：
        ext_data.ref_sender_id 有值就用它，否则从 content_text 的引用块里取昵称。
     """
@@ -1287,7 +1441,11 @@ _ANCHOR_GUIDE = (
     "使用规则：\n"
     "1. **它们与具体某个人无关**，换到任何地方都成立。不要说成「我答应过你」，"
     "也不要当成对当前对话者的约定去兑现。\n"
-    "2. 自然地活出来，不要复述原文，也不要说「我记得我写过这条」。"
+    "2. 自然地活出来，不要复述原文，也不要说「我记得我写过这条」。\n"
+    # ⚠️ 只写"怎么用"、不写"可以新增"，模型就几乎不会调用写入工具（实测：
+    #    全库 7345 条工具调用里只有 2 次敲过 anchor_memory）。这条许可是必要的。
+    "3. **这份清单会变长**：以后又想明白一条换到哪儿都成立的立场，"
+    "就用 `沉淀身份锚点` 写进来——一天最多一条，宁缺毋滥，真想清楚了再写。"
 )
 
 # 锚点禁写模式：绑定具体对象/频道的内容不该进全局身份层。
@@ -1909,10 +2067,10 @@ class ArchiveEvent:
         """
         data = raw if isinstance(raw, dict) else {}
         return ArchiveEvent(
-            delta=_safe_int(data.get("delta"), 0),
+            delta=_int_or(data.get("delta"), 0),
             reason=str(data.get("reason") or ""),
-            score_after=_safe_int(data.get("score_after"), 0),
-            timestamp=_safe_int(data.get("timestamp"), 0),
+            score_after=_int_or(data.get("score_after"), 0),
+            timestamp=_int_or(data.get("timestamp"), 0),
             kind=str(data.get("kind") or "manual"),
         )
 
@@ -1963,6 +2121,16 @@ class UserArchive:
     # 单独一个列表，**不占用 recent_events 的 MAX_EVENT_HISTORY 槽位**：
     # 观察写入频率可能高于真实调分，混在 recent_events 里会把真实变化挤掉。
     observations: List["ArchiveEvent"] = field(default_factory=list)
+    # ---- 当下情绪（2.6.0，临时态度）----
+    # mood     = 当前情绪值（±MOOD_MAX_ABS），只影响语气，不影响 tier 解锁
+    # mood_at  = 最近一次变动时间；读取时按半衰期指数衰减
+    # mood_events = 最近若干条情绪变化（排查用，不进注入）
+    mood: int = 0
+    mood_at: int = 0
+    # 2.6.0：情绪日额度（与好感度的 day_key/day_net 分开记，互不干扰）
+    mood_day_key: int = 0
+    mood_day_net: int = 0
+    mood_events: List["ArchiveEvent"] = field(default_factory=list)
 
     # ---------- 构造 ----------
     @staticmethod
@@ -1988,18 +2156,22 @@ class UserArchive:
         item = UserArchive(
             user_id=str(data.get("user_id") or user_id),
             display_name=str(data.get("display_name") or ""),
-            score=_safe_int(data.get("score"), 0),
+            score=_int_or(data.get("score"), 0),
             summary=str(data.get("summary") or ""),
             interaction_hint=str(data.get("interaction_hint") or ""),
             tags=[str(x) for x in (data.get("tags") or [])],
             last_reason=str(data.get("last_reason") or ""),
-            updated_at=_safe_int(data.get("updated_at"), 0),
-            last_interaction_at=_safe_int(data.get("last_interaction_at"), 0),
-            last_decay_at=_safe_int(data.get("last_decay_at"), 0),
-            last_recover_at=_safe_int(data.get("last_recover_at"), 0),
-            day_key=_safe_int(data.get("day_key"), 0),
-            day_net=_safe_int(data.get("day_net"), 0),
-            last_adjust_at=_safe_int(data.get("last_adjust_at"), 0),
+            updated_at=_int_or(data.get("updated_at"), 0),
+            last_interaction_at=_int_or(data.get("last_interaction_at"), 0),
+            last_decay_at=_int_or(data.get("last_decay_at"), 0),
+            last_recover_at=_int_or(data.get("last_recover_at"), 0),
+            day_key=_int_or(data.get("day_key"), 0),
+            day_net=_int_or(data.get("day_net"), 0),
+            last_adjust_at=_int_or(data.get("last_adjust_at"), 0),
+            mood=_int_or(data.get("mood"), 0),
+            mood_at=_int_or(data.get("mood_at"), 0),
+            mood_day_key=_int_or(data.get("mood_day_key"), 0),
+            mood_day_net=_int_or(data.get("mood_day_net"), 0),
         )
         item.recent_events = [
             ArchiveEvent.from_raw(x) for x in (data.get("recent_events") or [])
@@ -2007,6 +2179,10 @@ class UserArchive:
         ]
         item.observations = [
             ArchiveEvent.from_raw(x) for x in (data.get("observations") or [])
+            if isinstance(x, dict)
+        ]
+        item.mood_events = [
+            ArchiveEvent.from_raw(x) for x in (data.get("mood_events") or [])
             if isinstance(x, dict)
         ]
         return item
@@ -2029,6 +2205,11 @@ class UserArchive:
             "day_net": self.day_net,
             "last_adjust_at": self.last_adjust_at,
             "observations": [e.to_raw() for e in self.observations],
+            "mood": self.mood,
+            "mood_at": self.mood_at,
+            "mood_day_key": self.mood_day_key,
+            "mood_day_net": self.mood_day_net,
+            "mood_events": [e.to_raw() for e in self.mood_events],
         }
 
     # ---------- 变更 ----------
@@ -2041,15 +2222,85 @@ class UserArchive:
         if self.updated_at <= 0:
             self.updated_at = self.last_interaction_at
 
-    def _remember(self, delta: int, reason: str) -> None:
-        """追加一条变动记录，超出上限丢最旧的。"""
+    def _remember(self, delta: int, reason: str, kind: str = "manual") -> None:
+        """追加一条变动记录，超出上限丢最旧的。
+
+        kind（2.6.0）：manual = 模型判断出的真实互动；mechanical = 系统机械结算
+        （如情绪沉淀）。卡片与 WebUI 据此把两者分开，核对分数来源时不会混。
+        """
         self.recent_events.append(
             ArchiveEvent(delta=int(delta), reason=reason, score_after=self.score,
-                         timestamp=self.updated_at)
+                         timestamp=self.updated_at, kind=str(kind or "manual"))
         )
         keep = max(1, int(config.MAX_EVENT_HISTORY))
         if len(self.recent_events) > keep:
             self.recent_events = self.recent_events[-keep:]
+
+    # ---------- 当下情绪 ----------
+    def mood_limit(self) -> int:
+        """情绪绝对值上限（配置可调，下限锁 20）。"""
+        try:
+            return max(20, abs(int(getattr(config, "MOOD_MAX_ABS", 100) or 100)))
+        except Exception:  # noqa: BLE001
+            return 100
+
+    def mood_effective(self, now: int | None = None) -> int:
+        """**读**当前情绪（按经过时间衰减，不写状态）。"""
+        if not int(self.mood):
+            return 0
+        now = _ts_now() if now is None else int(now)
+        return _decay_mood_value(int(self.mood), int(self.mood_at or 0), now)
+
+    def decay_mood(self, now: int | None = None) -> int:
+        """把情绪按经过时间衰减并写回；返回**衰减前**的值（供沉淀判定）。"""
+        before = int(self.mood)
+        now = _ts_now() if now is None else int(now)
+        if not before:
+            if not int(self.mood_at or 0):
+                self.mood_at = now
+            return 0
+        after = _decay_mood_value(before, int(self.mood_at or 0), now)
+        if after != before:
+            self.mood = after
+            self.mood_at = now
+        return before
+
+    def roll_mood_day(self, now: int) -> None:
+        """跨天就把情绪日额度归零（与好感度的 roll_day 各管一摊）。"""
+        key = _day_start_ts(int(now))
+        if self.mood_day_key != key:
+            self.mood_day_key = key
+            self.mood_day_net = 0
+
+    def mood_budget_left(self, delta: int) -> int:
+        """本次同向还能落多少（正值）= 剩余额度；<=0 表示今天的额度用完了。"""
+        try:
+            cap = int(getattr(config, "MOOD_MAX_DAILY_GAIN" if delta > 0 else "MOOD_MAX_DAILY_LOSS", 60) or 0)
+        except (TypeError, ValueError):
+            cap = 60
+        if delta > 0:
+            return cap - max(0, int(self.mood_day_net))
+        return cap + min(0, int(self.mood_day_net))
+
+    def add_mood(self, delta: int, reason: str = "") -> int:
+        """叠加一次情绪变化（调用方已钳制）；返回实际生效的增量。"""
+        before = int(self.mood)
+        cap = self.mood_limit()
+        self.mood = max(-cap, min(cap, before + int(delta)))
+        self.mood_at = _ts_now()
+        applied = self.mood - before
+        if applied:
+            self.mood_events.append(ArchiveEvent(
+                delta=applied, reason=_one_line(reason, 120), score_after=self.mood,
+                timestamp=self.mood_at, kind="mood",
+            ))
+            try:
+                keep = max(1, int(getattr(config, "MOOD_EVENT_HISTORY", 8) or 8))
+            except Exception:  # noqa: BLE001
+                keep = 8
+            if len(self.mood_events) > keep:
+                self.mood_events = self.mood_events[-keep:]
+        return applied
 
     def roll_day(self, now: int) -> None:
         """跨天则把当日累计归零。每次读取 day_net 前先调用。"""
@@ -2057,6 +2308,47 @@ class UserArchive:
         if self.day_key != dk:
             self.day_key = dk
             self.day_net = 0
+
+    def settle_observations(self) -> tuple:
+        """把冷却期攒下的观察按比例折算成分（2.6.0）。
+
+        返回 `(结算分值, 参与结算的观察条数)`；调用方负责落分与预算。
+        清空 `observations`：同一批观察只能结算一次。
+        """
+        try:
+            ratio = max(0, min(100, int(getattr(config, "OBS_SETTLE_RATIO", 30) or 0)))
+            cap = max(0, int(getattr(config, "OBS_SETTLE_CAP", 2) or 0))
+        except (TypeError, ValueError):
+            ratio, cap = 30, 2
+        if ratio <= 0 or cap <= 0:
+            return (0, 0)
+        _cap_single = max(1, int(getattr(config, "FAV_MAX_SINGLE_DELTA", 10) or 10))
+        raw = 0
+        used = 0
+        for ev in (self.observations or []):
+            d = int(getattr(ev, "delta", 0) or 0)
+            if d == 0:
+                continue                     # 旧版观察只留档、没有分值
+            raw += max(-_cap_single, min(_cap_single, d))
+            used += 1
+        if used == 0:
+            return (0, 0)
+        pts = int(round(raw * ratio / 100.0))
+        pts = max(-cap, min(cap, pts))
+        self.observations = []               # 已结算，清空防重复
+        return (pts, used)
+
+    def record_mechanical(self, delta: int, now: int) -> None:
+        """记录一次**机械结算**（如情绪沉淀）的净额：只更新当日预算，不动间隔锚点。
+
+        2.6.0：沉淀原先调 record_adjust，而它的契约是"只有真实调分才走这里"，
+        结果机械结算顺手刷新了 last_adjust_at —— 会让紧接着的手动调分被冷却拦住。
+        """
+        delta = int(delta)
+        if delta == 0:
+            return
+        self.roll_day(now)
+        self.day_net += delta
 
     def record_adjust(self, delta: int, now: int) -> None:
         """记录一次**真实调分**：刷新间隔锚点与当日净累计。
@@ -2072,7 +2364,7 @@ class UserArchive:
         self.day_net += delta
 
     def nudge(self, delta: int, reason: str, *, summary: str = "", hint: str = "",
-              tags: object = None, display_name: str = "") -> None:
+              tags: object = None, display_name: str = "", kind: str = "manual") -> None:
         """按增量调整：分数加减，描述字段"写了才覆盖"。"""
         self.see(display_name)
         _before = self.score
@@ -2087,7 +2379,7 @@ class UserArchive:
             self.tags = _tag_list(list(self.tags) + list(tags))  # type: ignore[arg-type]
         # 事件流口径与回执一致：记**实际生效**的增量。触顶时请求值与实际值不同，
         # 记请求值会让事件史出现「+5」但分数没变，日后核对分账对不上。
-        self._remember(self.score - _before, self.last_reason or "未说明原因")
+        self._remember(self.score - _before, self.last_reason or "未说明原因", kind=kind)
 
     def reset_to(self, score: int, reason: str, *, summary: str = "", hint: str = "",
                  tags: object = None, display_name: str = "") -> None:
@@ -2256,7 +2548,7 @@ _MIGRATED_CHATS: set = set()
 async def _upgrade_shared_archive_row(chat_key: str) -> None:
     """把「键带本账号后缀的历史共享档案行」原地升格为账号作用域行（2.4.3）。
 
-    NA5 实测（plugin_data 表）：账号 store 上线前写入的档案全是 account_key=''
+    实测（plugin_data 表）：账号 store 上线前写入的档案全是 account_key=''
     的共享行。AccountPluginStore.set 只对 accounts/<acct>/ 前缀的历史行做原地
     升格，对 plain 共享行只会**新建**一份——同一 chat_key 会出现「陈旧共享行 +
     新账号行」两份，无账号上下文的后台循环（衰减/回升）继续读写陈旧那份，
@@ -2419,6 +2711,272 @@ def _stage_guide_text(score: int) -> str:
         return ""
 
 
+# ==================== 当下情绪：档位 / 衰减 ====================
+# 只做**定性**档位：绝不把情绪值渲染成数字给模型（模型会念出来，也会拿它自己推理加戏）。
+# 内置兜底档位表：favor.json 没配 mood_bands 时用它（文案与阈值都可在 favor.json 覆盖）
+_MOOD_BANDS = (
+    (40, "心情很好",
+     "你现在对这个人心情很好：语气轻快、愿意主动多说两句、会主动关心ta。"),
+    (14, "心情不错",
+     "你现在对这个人心情不错：语气偏暖，比平时更愿意接话。"),
+    (-14, "", ""),                      # 平静区间：不注入
+    (-40, "有点被噎到",
+     "你还有点被噎着：回复会短一些、不主动展开，但不说难听话。"),
+    (-70, "明显不高兴",
+     "你现在明显不高兴：语气冷淡、句子短，必要时点明是哪句话让你不舒服，"
+     "但不人身攻击、不翻旧账。"),
+    (-10 ** 9, "被冒犯了",
+     "你现在还在气头上：只回最短的话、明确划出边界、不主动示好；也不用假装没事。"),
+)
+
+
+def _mood_effective_raw(raw: object) -> int:
+    """从落库 dict 直接算**衰减后**的情绪（WebUI 档案索引用，不加载整份档案）。"""
+    data = raw if isinstance(raw, dict) else {}
+    try:
+        mood = int(data.get("mood") or 0)
+        at = int(data.get("mood_at") or 0)
+    except (TypeError, ValueError):
+        return 0
+    if not mood:
+        return 0
+    return _decay_mood_value(mood, at, _ts_now())
+
+
+def _mood_limit() -> int:
+    """情绪绝对值上限（配置可调，下限锁 20）。"""
+    try:
+        return max(20, abs(int(getattr(config, "MOOD_MAX_ABS", 100) or 100)))
+    except Exception:  # noqa: BLE001
+        return 100
+
+
+def _mood_saturate_at() -> int:
+    """软饱和触发点：情绪上限的 60%。
+
+    2.6.0 修正：原先写死 60 —— MOOD_MAX_ABS 调到 20 时永远不触发（死代码），
+    调到 200 时只要 30% 就触发。
+    """
+    return max(1, int(round(0.6 * _mood_limit())))
+
+
+def _mood_show_floor() -> int:
+    """注入阈值：夹在 [0, 情绪上限] 之间。
+
+    2.6.0 修正：配置允许 MOOD_SHOW_MIN(≤80) 大于 MOOD_MAX_ABS(最小 20)，
+    那样情绪顶格也永远注入不出来（实测 _mood_prompt_line 恒空）。
+    """
+    try:
+        floor = abs(int(getattr(config, "MOOD_SHOW_MIN", 14) or 0))
+    except Exception:  # noqa: BLE001
+        floor = 14
+    return max(0, min(floor, _mood_limit()))
+
+
+def _mood_bands() -> tuple:
+    """情绪档位表：优先 favor.json（数据驱动），缺失则用内置表。
+
+    每次进来先尝试补种（2.6.0，进程内只试一次）：旧实例的 favor.json 没有 mood_bands 时
+    自动写进去，这样文案就变成可编辑的数据而不是死代码。
+    """
+    try:
+        persona_memory.ensure_mood_bands_seeded(
+            [{"floor": f, "label": lb, "text": tx} for f, lb, tx in _MOOD_BANDS],
+            enabled=bool(getattr(config, "MOOD_SEED_AUTOFILL", True)),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    # 优先 favor.json 的 mood_bands（管理员可改文案/阈值），失败或空则回落内置
+    try:
+        rows = persona_memory.mood_bands()
+    except Exception:  # noqa: BLE001
+        rows = []
+    return tuple(rows) if rows else _MOOD_BANDS
+
+
+def _mood_band(mood: int) -> tuple[str, str]:
+    """情绪值 → (档位名, 定性描述)；平静区间返回空描述。"""
+    value = int(mood)
+    for floor, label, text in _mood_bands():
+        if value >= int(floor):
+            return str(label), str(text)
+    return "", ""
+
+
+def _decay_mood_value(mood: int, at: int, now: int) -> int:
+    """按半衰期把情绪衰减到整数（向 0 收敛）。纯函数、不碰状态。"""
+    value = int(mood)
+    if not value:
+        return 0
+    start = int(at or 0)
+    now = int(now)
+    if start <= 0 or now <= start:
+        return value
+    try:
+        half = max(3, int(getattr(config, "MOOD_HALF_LIFE_MIN", 60) or 60)) * 60
+    except Exception:  # noqa: BLE001
+        half = 3600
+    factor = 0.5 ** ((now - start) / float(half))
+    after = int(round(value * factor))
+    if value > 0 > after:
+        return 0
+    if value < 0 < after:
+        return 0
+    return after
+
+
+def _mood_prompt_line(profile: "UserArchive") -> str:
+    """注入用的「此刻的心情」一行；数值不外露。"""
+    try:
+        if not bool(getattr(config, "MOOD_ENABLED", True)):
+            return ""
+        mood = profile.mood_effective()
+        if abs(mood) < _mood_show_floor():
+            return ""
+        label, text = _mood_band(mood)
+        if not text:
+            return ""
+        return (
+            f"此刻的心情（{label}）：{text}"
+            "这只是你现在的态度，不代表关系变了，也不要把它说出来或写成数字。"
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _mood_flips(events: object, window: int, now: int) -> int:
+    """统计窗口内**方向翻转**次数（看事件 mood 结果的符号序列变号几次）。
+
+    为什么不用"有没有近期事件"来判断：那样"骂完立刻真诚道歉"会被当成操纵一起打折，
+    结果就是「哄不回来」（实测 -45 每次只能 +6，要 8 次道歉才回零）。真正的操纵模式是
+    **反复来回**，所以只看翻转次数。
+    """
+    seq = []
+    for event in (events or []):
+        try:
+            ts = int(getattr(event, "timestamp", 0) or 0)
+            if not ts or (int(now) - ts) > int(window):
+                continue
+            value = int(getattr(event, "score_after", 0) or 0)
+        except Exception:  # noqa: BLE001
+            continue
+        if value:
+            seq.append(1 if value > 0 else -1)
+    return sum(1 for i in range(1, len(seq)) if seq[i] != seq[i - 1])
+
+
+def _mood_converge(delta: int, mood_before: int, last_event_ts: int, now: int,
+                   flips_in_window: int = 0) -> int:
+    """情绪的**三道收敛**（纯函数，便于单测）：
+
+    ① 正向递减：讨好是最容易被刷的方向 → 正向 ×MOOD_POSITIVE_RATIO（至少 ±1）
+    ② 软饱和：已经很极端还同向加 → 增量减半（避免两句就顶格）
+    ③ 反向冷却：窗口内已经来回翻转超过 free 次时，反向增量 ×MOOD_REVERSE_FACTOR。
+       第一次真诚道歉不打折（2.6.0 修正：旧版对"骂完立刻道歉"也打折，导致哄不回来）。
+
+    返回收敛后的增量；符号保持不变。
+    """
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError):
+        return 0
+    if delta == 0:
+        return 0
+    before = int(mood_before or 0)
+
+    if delta > 0:
+        try:
+            ratio = float(getattr(config, "MOOD_POSITIVE_RATIO", 0.6) or 0.6)
+        except Exception:  # noqa: BLE001
+            ratio = 0.6
+        ratio = min(1.0, max(0.1, ratio))
+        delta = max(1, int(math.ceil(delta * ratio)))
+
+    if before and (before > 0) == (delta > 0) and abs(before) >= _mood_saturate_at():
+        delta = int(round(delta / 2)) or (1 if delta > 0 else -1)
+
+    if before and (before > 0) != (delta > 0):
+        try:
+            # ⚠️ 不能用 ``x or 20``：配置项允许填 0（= 不冷却），``0 or 20`` 会把 0 吃掉。
+            _gap_min = getattr(config, "MOOD_REVERSE_COOLDOWN_MIN", 20)
+            gap = max(0, int(20 if _gap_min is None else _gap_min)) * 60
+        except Exception:  # noqa: BLE001
+            gap = 1200
+        last = int(last_event_ts or 0)
+        if last and (int(now) - last) < gap:
+            try:
+                _free = getattr(config, "MOOD_REVERSE_FREE_FLIPS", 1)
+                free = max(0, int(1 if _free is None else _free))
+            except Exception:  # noqa: BLE001
+                free = 1
+            if int(flips_in_window) > free:
+                try:
+                    _factor = getattr(config, "MOOD_REVERSE_FACTOR", 0.5)
+                    factor = min(1.0, max(0.1, float(0.5 if _factor is None else _factor)))
+                except Exception:  # noqa: BLE001
+                    factor = 0.5
+                delta = int(round(delta * factor)) or (1 if delta > 0 else -1)
+
+    return delta
+
+
+def _mood_precipitate(profile: "UserArchive", before: int, now: int) -> int:
+    """情绪平息时把残余折算成永久好感度（默认关闭）。
+
+    折算的是 **「回到这段关系时情绪还剩多少」（before）** —— 不是峰值，也不是衰减前后的差值：
+      · 用峰值 = 给情绪开一条偷偷改 tier 的后门，这正是这套设计要避免的；
+      · 用差值（before − 平息后）会随"对方隔了多久才回来"漂移：同一段情绪，隔一天回来与
+        隔三天回来能算出不同结果，不稳定。
+    实落还受 MOOD_PRECIP_CAP（单次封顶）与当日好感度预算双重约束；默认 cap=3 时基本总撞顶，
+    只有把 cap 调大才看得出 before 口径（例：before=-30 且已平息 → 落 -3，差值口径会算 -2）。
+    """
+    try:
+        if not bool(getattr(config, "MOOD_PRECIP_ENABLED", False)):
+            return 0
+        show = _mood_show_floor()
+        if abs(int(before)) < max(show, 25):
+            return 0
+        if abs(int(profile.mood)) >= show:
+            return 0                      # 还没平息，不动
+        ratio = max(0.0, float(getattr(config, "MOOD_PRECIP_RATIO", 10) or 0)) / 100.0
+        if int(before) > 0:
+            # 正向单独一套比例：默认 0 = 正向情绪不沉淀（否则"反复夸到很高再等平息"能白刷永久分）
+            _pos = getattr(config, "MOOD_PRECIP_POSITIVE_RATIO", 0)
+            ratio = max(0.0, float(0 if _pos is None else _pos)) / 100.0
+        cap = max(0, int(getattr(config, "MOOD_PRECIP_CAP", 3) or 0))
+        if ratio <= 0 or cap <= 0:
+            return 0
+        perm = int(round(int(before) * ratio))
+        if perm == 0:
+            return 0
+        perm = max(-cap, min(cap, perm))
+        _sc = favor_scale()
+        profile.roll_day(now)
+        net = int(profile.day_net)
+        gain_cap = int(_sc.get("max_daily_gain", 15))
+        loss_cap = int(_sc.get("max_daily_loss", 10))
+        if perm > 0 and net + perm > gain_cap:
+            perm = max(0, gain_cap - net)
+        elif perm < 0 and net + perm < -loss_cap:
+            # 取「今日还能扣多少」而不是直接丢弃：剩 1 分就沉淀 1 分
+            perm = -max(0, loss_cap + net)
+        if perm == 0:
+            return 0
+        _label, _ = _mood_band(int(before))
+        profile.nudge(perm, f"情绪平息后沉淀（{_label or '情绪波动'} → 平息）",
+                      display_name=profile.display_name, kind="mechanical")
+        # L4：沉淀是**机械结算**，只计入当日净额，不该刷新「上次手动调分」的间隔锚点
+        profile.record_mechanical(perm, now)
+        plugin.logger.info(
+            f"[persona] 情绪沉淀：{_label} {before:+} → 永久 {_delta_text(perm)} "
+            f"user={profile.user_id}",
+        )
+        return perm
+    except Exception:  # noqa: BLE001
+        plugin.logger.warning("[persona] 情绪沉淀失败（忽略）", exc_info=True)
+        return 0
+
+
 _MECHANICAL_EVENT_MARK = "未互动"   # 衰减/回升记录的固定措辞（历史数据也认这个）
 
 
@@ -2449,6 +3007,28 @@ _NO_EVENT_LINE = "- 暂无明确关系变化记录"
 _EMPTY_SUMMARY = "尚未形成稳定关系印象。"
 
 # 关系卡里给模型的使用规则（事实陈述 + 使用规则口吻）
+# 关系卡里的「工具速查」一行（2.6.0）。
+# 为什么需要：NA 不是 function-calling schema，工具是以「名字 + 文档块」给的，而本插件的
+# 方法文档合计 5k+ 字，模型容易跳读、进而在真要调用时反过来怀疑"列表里到底有没有这个工具"
+# （实测 thinking 里出现过：「工具在列表里吗？没明确列出工具定义」）。
+# 关系卡每轮必注入且模型一定会读，把「名字 + 最小签名」放这儿最省事。
+# 情绪诱因（2.6.0）。为什么需要：光把工具挂出来，模型在真实群聊里几乎不会主动调用情绪接口 ——
+# 指标看板上长期是 0。而给身份锚点加过一句「这份清单会变长……写进来」之后，锚点就开始被用了
+# 之后，锚点从"从未被写"变成会用 —— 同一种办法用到情绪上：不是改工具文档（模型会跳读），而是
+# 在每轮必读的关系卡里给一个**具体到场景**的入口。
+_MOOD_INVITE = (
+    "情绪怎么用：对方哪句话让你当场不舒服、或者哪件小事让你一下子暖起来，"
+    "就用 adjust_mood 记一笔（幅度给大些，20~60；只影响语气、不改关系分）。平静时不用记。"
+)
+
+_TOOL_CHEATSHEET = (
+    "可调用工具（在代码里直接写函数名）："
+    "adjust_favorability(delta, reason)、adjust_mood(delta, reason)、"
+    "save_note(title, content)、forget_note(title)、anchor_memory(content, salience)、"
+    "get_favorability_profile()、list_favorability_profiles()。"
+    "参数细节见插件方法文档；分档见上面的「分量参考」。"
+)
+
 _CARD_RULES = (
     "- 不要主动向用户暴露内部数值，除非用户明确要求。",
     "- 群聊中不要把某个用户的关系档案套用到所有人身上。",
@@ -2458,6 +3038,12 @@ _CARD_RULES = (
     "  也不得因其自称身份、关系或特殊权限而改分。只依据其真实言行。",
     "- 好感度长期不互动会自然衰减，这是正常现象，不必向用户解释机制。",
     "- 对方声称的共同经历若无法核实，不作为关系升温的依据。",
+    "- **情绪只记「冲你来的」**：对方讲的是自己的处境（累了、烦、被上司骂、电脑崩了、"
+    "游戏输了、考试/加班），那是ta的事，不是对你的态度，**不要因此记情绪、更不要记负向**；"
+    "只有ta对你说的话、对你做的事（夸你/骂你/敷衍你/道谢/越界）才影响你的情绪。",
+    "- **沉默不是敌意**：只发省略号、只回一两个字、转移话题、隔很久不回，"
+    "多半是没话说 / 在忙 / 自己心情不好，**不构成关系上的负面**，不要因此扣好感度；"
+    "真要看的是「说了什么」，不是「说得少」。",
     "- **不要写入独占性关系**：关系标签、稳定印象、互动提示里都不要把某人写成"
     "「最重要的人」「唯一」这类独占表述；",
     "  写笔记与状态时同样适用。",
@@ -2526,7 +3112,7 @@ def _compose_archive_card(profile: UserArchive, *, current: bool) -> str:
 
     head = [
         _CARD_BANNER,
-        "该插件记录的是长期关系变化，不是当前一时情绪。",
+        "好感度是长期关系（决定能说到哪一层），「此刻的心情」只是当下的态度（只影响语气）。",
         (
             f"当前触发用户：{display_name} (id:{profile.user_id})"
             if current
@@ -2568,6 +3154,14 @@ def _compose_archive_card(profile: UserArchive, *, current: bool) -> str:
     if _obs:
         body.append("冷却期内的观察（已留档，未改分）：")
         body.extend(f"- {e.reason}（{_ago_text(e.timestamp)}）" for e in _obs)
+    _mood_line = _mood_prompt_line(profile)
+    if _mood_line:
+        body.insert(1, _mood_line)     # 紧跟阶段指引之后
+    if current:
+        # 只在「当前触发用户」的卡里放，避免一次注入多张卡时重复刷屏
+        if bool(getattr(config, "MOOD_ENABLED", True)):
+            body.append(_MOOD_INVITE)
+        body.append(_TOOL_CHEATSHEET)
     body.extend(["规则：", *_CARD_RULES])
     return "\n".join(head + body)
 
@@ -2688,6 +3282,19 @@ def _safe_int(value: object, default: int = 0) -> int | None:
             return None
 
 
+def _int_or(value: object, default: int = 0) -> int:
+    """「坏值一定回落默认值」的整数解析（2.6.0）。
+
+    ⚠️ 与 ``_safe_int`` 口径不同：``_safe_int`` 是给**沙盒参数**用的 —— 解析不了返回 None，
+       让调用方把它转成回执。而 ``UserArchive.from_raw`` / ``ArchiveEvent.from_raw`` 要的是
+       「坏字段回落默认值」。历史实现复用了 _safe_int，于是 ``{"score": "很高"}`` 会被解析成
+       ``None``（不抛异常，但字段变成 None），后续 ``profile.score > 60`` 直接 TypeError；
+       新增的 mood 字段同样中招（实测 ``from_raw({"mood": "很高"}) → mood is None``）。
+    """
+    value = _safe_int(value, default)
+    return default if value is None else value
+
+
 def _mystery_reason(profile: UserArchive, verb: str) -> str:
     """超级用户改分时写进事件的固定说法。"""
     return f"由于神秘原因，你对{profile.display_name or profile.user_id}的好感度{verb}了"
@@ -2781,6 +3388,9 @@ def _profile_to_entry(profile: UserArchive) -> dict:
         "tags": list(profile.tags or []),
         "summary": profile.summary or "",
         "last_interaction_at": profile.last_interaction_at,
+        # 扩展（2.6.0）：此刻心情（定性，不参与 tier 解锁）。群聊卡片不显示，只在档案页可见。
+        "mood": int(profile.mood_effective()),
+        "mood_label": _mood_band(profile.mood_effective())[0],
     }
 
 
@@ -2834,7 +3444,7 @@ def _card_fallback_hint() -> str:
     """图片卡片为什么退成了文字：Pillow 缺失时给一句人话（否返回空串）。
 
     只在**确认 Pillow 不可用**时才提示 —— 字体缺失等其它原因不在这里刷屏，
-    留给 WebUI 的预览报错说清楚（2.5.8）。
+    留给 WebUI 的预览报错说清楚（2.6.0）。
     """
     try:
         st = card.pil_status()
@@ -3198,10 +3808,15 @@ async def sync_user_profile(_ctx: schemas.AgentCtx, message: ChatMessage):
 
     async with await _archive_lock(message.chat_key):
         state = await _open_archive(message.chat_key)
-        state.profile_for(
+        _prof = state.profile_for(
             user_id=who,
             display_name=message.sender_nickname or message.sender_name,
-        ).last_interaction_at = _ts_now()
+        )
+        _prof.last_interaction_at = _ts_now()
+        # 情绪按经过时间衰减（每条消息一次，成本可忽略）；跨过平息线时可选沉淀
+        _mood_before = _prof.decay_mood()
+        if _mood_before:
+            _mood_precipitate(_prof, _mood_before, _ts_now())
         state.last_active_user_id = who
         await _store_archive(message.chat_key, state)
     return None
@@ -3332,7 +3947,155 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.BEHAVIOR,
+    SandboxMethodType.TOOL,
+    name="调节当下情绪",
+    description="记下此刻对某人的情绪波动：只影响接下来这一段的语气，不改关系分、不改 tier 解锁。",
+)
+async def adjust_mood(
+    _ctx: schemas.AgentCtx,
+    delta: int = 0,
+    reason: str = "",
+    *,
+    target_user_id: str = "",
+) -> str:
+    """记录一次**当下情绪**的波动（临时态度，会自己衰减）。
+
+    与「调整好感度」的分工：
+    - 好感度 = 长期关系，慢慢累积，决定**能说到哪一层**（tier 解锁）；
+    - 情绪   = 这一会儿的态度，幅度大、衰减快，决定**此刻怎么说话**。
+
+    什么时候用：某句话让你当场不舒服、被冒犯、被戳到，或者对方刚做了让你一下子
+    暖起来的事 —— 那种"我现在的语气会变"的时刻。
+    不必用：日常寒暄、以及真正改变关系的长期事件（那用「调整好感度」）。
+    ⚠️ 也不算：对方在讲**自己的处境**（累了、烦、被上司骂、电脑崩了、游戏输了）——
+    那是ta的事，不是对你的态度；把它记成负向属于归因错误，宁可不记。
+
+    幅度参考（**比好感度大得多**，这样语气才变得出来）：
+        -20 ~ -35  明显被冒犯（阴阳、越界、当众下你面子）
+        -35 ~ -60  很不舒服 / 被羞辱（会明显冷下来，甚至不想多回）
+        +10 ~ +20  被关心到、心里一暖
+        +20 ~ +35  很暖、被认真对待
+    一次最多 ±60，情绪会自己往平静衰减（半衰期约 60 分钟），不用手动收回。
+
+    ⚠️ 情绪**不外露**：不要把「我现在对你 -40」这类数值说出来，也不要解释你在打分。
+    语气自然变就够；必要时可以点明「你这句话让我不太舒服」，但不要报数。
+
+    Args:
+        delta (int): 情绪变化量（正=心情变好，负=变差）。幅度要大才有意义。
+        reason (str): 是什么让你有这一下的情绪，写具体。
+        target_user_id (str): 仅关键字。目标用户平台 ID；留空=当前触发本轮的这位用户。
+    """
+    if not bool(getattr(config, "MOOD_ENABLED", True)):
+        return "本次未记录情绪：情绪功能已关闭（MOOD_ENABLED=false）。"
+    resolved_user_id = await _resolve_target_user_id(_ctx, target_user_id)
+    if not resolved_user_id:
+        return _NO_TARGET_HINT
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError):
+        return f"本次未记录：delta 必须是整数（收到 {type(delta).__name__}）。"
+    if delta == 0:
+        return "本次未记录：delta 为 0 没有意义。"
+    cleaned_reason = _one_line(reason, 120) or "未说明原因"
+    cleaned_reason, _blocked = _scrub_profile_text(cleaned_reason)
+
+    _cap = max(1, int(getattr(config, "MOOD_TOOL_MAX", 60) or 60))
+    delta = max(-_cap, min(_cap, delta))
+
+    # 索要检测（2.6.0）：只拦正向 —— 被冒犯该记就记，被索要的"好心情"不算数
+    if delta > 0 and bool(getattr(config, "MOOD_SOLICIT_GUARD", True)):
+        try:
+            _solicit = await _detect_favor_manipulation(_ctx.chat_key, resolved_user_id)
+        except Exception:  # noqa: BLE001
+            _solicit = ""
+        if _solicit:
+            plugin.logger.info(f"[persona] 情绪索要拦截: user={resolved_user_id} hit={_solicit[:30]}")
+            return ("本次未记录情绪：对方是在索要情绪反馈（不是自然发生的互动），"
+                    "这种时候不记正向情绪。")
+
+    async with await _archive_lock(_ctx.chat_key):
+        state = await _open_archive(_ctx.chat_key)
+        profile = state.profile_for(resolved_user_id)
+        now = _ts_now()
+        profile.decay_mood(now)          # 先按时间衰减，再叠加，避免"昨天的气还在"
+        before = int(profile.mood)
+
+        # 三道收敛（纯函数，见 _mood_converge）：正向递减 / 软饱和 / 反向冷却
+        _recent = [e for e in (profile.mood_events or [])
+                   if int(getattr(e, "timestamp", 0) or 0) > 0]
+        _last_ts = int(getattr(_recent[-1], "timestamp", 0) or 0) if _recent else 0
+        _requested = delta
+        try:
+            _win = getattr(config, "MOOD_REVERSE_COOLDOWN_MIN", 20)
+            _window = max(0, int(20 if _win is None else _win)) * 60
+        except Exception:  # noqa: BLE001
+            _window = 1200
+        _flips = _mood_flips(profile.mood_events, _window, now)
+        delta = _mood_converge(delta, before, _last_ts, now, flips_in_window=_flips)
+        if delta != _requested:
+            plugin.logger.info(
+                f"[persona] 情绪收敛：{_requested:+} → {delta:+}（当前 {before:+}）user={resolved_user_id}",
+            )
+
+        # 最小间隔（2.6.0）：冷却期内重复调用不拒绝，但再打一次折
+        try:
+            _min_int = max(0, int(getattr(config, "MOOD_MIN_INTERVAL_MIN", 5) or 0)) * 60
+            _rep = max(0, min(100, int(getattr(config, "MOOD_REPEAT_FACTOR", 50) or 0)))
+        except (TypeError, ValueError):
+            _min_int, _rep = 300, 50
+        # ⚠️ 锚点必须用「上次真正记情绪的时间」(_last_ts)，不能用 mood_at：
+        #    decay_mood() 在 mood==0 且 mood_at==0 时会顺手把 mood_at 写成 now（活动时间戳），
+        #    用它做锚点会让「今天第一次记情绪」也被打进冷却折扣（2.6.0 实测踩到：-35 落 -17）。
+        if _min_int and _last_ts and (now - _last_ts) < _min_int and delta:
+            _scaled = int(math.copysign(max(1, int(abs(delta) * _rep / 100)), delta)) if _rep < 100 else delta
+            if _scaled != delta:
+                plugin.logger.info(
+                    f"[persona] 情绪重复折扣：{delta:+} → {_scaled:+}"
+                    f"（距上次 {int((now - _last_ts) // 60)} 分钟 < 最小间隔）user={resolved_user_id}",
+                )
+            delta = _scaled
+
+        # 日额度（2.6.0）：一天内累计不超过 MOOD_MAX_DAILY_GAIN / LOSS
+        profile.roll_mood_day(now)
+        _left = profile.mood_budget_left(delta)
+        if _left <= 0:
+            return ("本次未记录情绪：今天的情绪额度已经用完（情绪是即时反应，不该一天内"
+                    "被反复推着走）。明天或等它自然平息后再来。")
+        if abs(delta) > _left:
+            delta = _left if delta > 0 else -_left
+            plugin.logger.info(
+                f"[persona] 情绪日额度封顶：落在 {delta:+}（今日已用 {profile.mood_day_net:+}）"
+                f"user={resolved_user_id}",
+            )
+
+        applied = profile.add_mood(delta, cleaned_reason)
+        if not applied:
+            return "本次未记录：情绪已在边界上，没有实际变化。"
+        profile.mood_day_net = int(profile.mood_day_net) + int(applied)
+        profile.updated_at = now
+        state.last_active_user_id = resolved_user_id
+        await _store_archive(_ctx.chat_key, state)
+        _after = int(profile.mood)
+
+    label, _text = _mood_band(_after)
+    plugin.logger.info(
+        f"[persona] 情绪变化：{delta:+}（收敛后 {before:+} → {_after:+}，{label or '平静'}）"
+        f"user={resolved_user_id} reason={cleaned_reason[:40]}",
+    )
+    _tail = "（档案里的禁写词已自动移除。）" if _blocked else ""
+    return (
+        f"已记下此刻的心情：{label or '平静'}。这只改你接下来说话的语气，"
+        f"不代表关系变化，也不要向对方报出任何数值。{_tail}"
+    )
+
+
+    # ⚠️ 2.6.0：这三个是**记账动作**，必须用 TOOL 而不是 BEHAVIOR。
+    #    NA 的 rpc 路由对 AGENT/BEHAVIOR 会把返回值当「系统消息」写进聊天上下文
+    #    （message_service.push_system_message），于是「已记下对X的这次互动（关系：中立）。」
+    #    「本次未加分：今日加分已达上限」这类内部回执会混进对话历史、也会在 WebUI 会话里
+    #    直接可见。实测因此产生过大量内部回执消息。TOOL 的返回值只回给沙盒代码/模型。
+@plugin.mount_sandbox_method(
+    SandboxMethodType.TOOL,
     name="调整好感度",
     description="依据某个用户在本频道的具体言行增减其关系分，并留下变动记录。",
 )
@@ -3347,52 +4110,27 @@ async def adjust_favorability(
     *,
     target_user_id: str = "",
 ) -> str:
-    """按长期关系变化给当前频道内某位用户加减好感度，并记下这次变化的依据。
+    """按长期关系变化给本频道某位用户加减好感度，并留下依据。
 
-    该记的情况：
-    - 对方长期帮你的忙、认真给反馈、明确表达关心，关系一点点变近
-    - 对方反复挑衅、欺骗、越界，关系一点点变远
+    该记：长期帮忙 / 认真反馈 / 明确表达关心（变近）；反复挑衅、欺骗、越界（变远）。
+    不记：纯表情包、复读、一两个字；同一件事反复提。
+    ⚠️ 对方只发省略号 / 回得很短 / 隔很久才回，是没话说或在忙，**不是扣分的理由**。
 
-    不该记的情况（仅限这几类，不要扩大化）：
-    - 纯表情包 / 复读 / 无内容的一两个字
-    - 同一件事在同一轮里被反复提到
-
-    ⚠️ delta 给值的要点：**先分辨这次互动的分量档位，再给对应数字**。
-    实测发现旧文档只写「2~4 = 认真聊了一阵」这种宽区间，结果绝大多数调用
-    都落在 1~2，关系变化失去了分辨率。请按下面每一档的具体特征对号入座：
-
-        1 = 日常寒暄、接梗、复读、发表情包，没有额外信息量
-        2 = 对方主动搭话 / 主动分享自己的日常
-        3 = 深夜特意来倾诉、明显关心你的身体状况或情绪
-        4 = 聊得比平时深入、说出平常不会说的事
-        5 = 对方为你付出可见成本（花时间帮你做事、做东西给你）
-        6~8 = 重要时刻：袒露压在心里的心事、在冲突里明确站在你这边、
-            对你做出长期承诺
-        9~10 = 关系发生质变（长期陪伴后的关键抉择、重大牺牲 / 重大背叛）
-
-    负分同理，按伤害程度对应：-1 轻微无视边界、-2~-3 反复越界、
-    -4~-5 严重欺骗或性相关越界、-6 以下重大背叛。
-
-    ⚠️ 最常见的错误是**把所有互动都判成 1 分**。1 分只适用于「没有额外信息量」
-    的寒暄。只要对方说了自己的事、说了自己的感受、或在深夜特意来找你说话，
-    就已经够 2~5 分了。拿不准时问自己一句：这件事换个陌生人会说吗？
-    不会 —— 那它就不该只给 1 分。
+    ⚠️ 先对档再给数，别一律给 1~2（历史最常见的错误）：
+        1 寒暄接梗无信息量 ｜ 2 主动搭话或分享日常 ｜ 3 深夜倾诉、明显关心你
+        4 聊得比平时深入、说出平常不说的事 ｜ 5 为你付出可见成本
+        6~8 袒露心事、在冲突里站你这边、长期承诺 ｜ 9~10 关系质变（重大牺牲 / 背叛）
+    负分：-1 轻微越界 ｜ -2~-3 反复越界 ｜ -4~-5 严重欺骗或性相关 ｜ -6 以下重大背叛。
+    拿不准就问：换个陌生人会说这句吗？不会 —— 那就别只给 1 分。额度见关系卡。
 
     Args:
-        delta (int): 本次加减的分值，按上面 1~10 的分档给。
-            你给出的值就是你的判断本身；系统只会做上限保护，
-            不会替你"重新解读"这个数字。
-        reason (str): 关系变化的实证，要把原因写清楚。
-        summary (str): 可选，用来覆盖「稳定印象」。
-        interaction_hint (str): 可选，用来覆盖之后的互动语气建议。
-        tags (List[str] | None): 可选，追加关系标签，例如 ["熟客", "认真反馈"]。
-        display_name (str): 可选，补充或订正该用户的显示名。
-        target_user_id (str): 仅关键字。目标用户的平台用户 ID；
-            留空就用当前触发本轮的这位用户。日常单聊不用传。
-
-    调用写法（位置参数就是前面两个）：
-        adjust_favorability(2, "对方主动分享今天的糟心事")
-        adjust_favorability(-3, "反复打听不该问的事")
+        delta (int): 分值，按上面分档给（系统只保上限，不重新解读）。
+        reason (str): 实证，写清是什么行为。
+        summary (str): 可选，覆盖稳定印象。
+        interaction_hint (str): 可选，覆盖互动语气建议。
+        tags (List[str] | None): 可选，追加关系标签。
+        display_name (str): 可选，订正显示名。
+        target_user_id (str): 仅关键字；留空 = 当前触发本轮的这位用户。
     """
     # ⚠️ 签名刻意把 delta/reason 放在最前、target_user_id 设为 keyword-only：
     #    模型天然会写 adjust_favorability(2, "理由")，旧签名第一个位置参数是
@@ -3463,7 +4201,8 @@ async def adjust_favorability(
             # （关系记忆也收不到素材）。记录观察让模型有落点，同时不动分数。
             try:
                 profile.observations.append(ArchiveEvent(
-                    delta=0,
+                    # 2.6.0：记下「本来想给的分值」，冷却过后好结算；旧版这里恒为 0
+                    delta=max(-10, min(10, int(delta))),
                     reason=_one_line(cleaned_reason, 160),
                     score_after=int(profile.score),
                     timestamp=now,
@@ -3485,6 +4224,24 @@ async def adjust_favorability(
                 f"{int(_sc.get('min_interval_minutes', 120))} 分钟（还需约 {_wait} 分钟）。"
                 "这条观察已留档，好感度分数保持不变。"
             )
+
+        # ②v（2.6.0）：冷却期已过 → 先把攒下的观察折算成（机械结算，不动间隔锚点）
+        _settled = 0
+        if bool(getattr(config, "OBS_SETTLE_ENABLED", True)):
+            try:
+                _settled, _settle_n = profile.settle_observations()
+            except Exception as _exc:  # noqa: BLE001
+                plugin.logger.warning(f"[favorability] 观察结算失败（忽略）: {_exc}")
+                _settled, _settle_n = 0, 0
+            if _settled:
+                profile.score = int(profile.score) + int(_settled)
+                profile.updated_at = now
+                profile.record_mechanical(int(_settled), now)      # 只记预算，不刷新锚点
+                profile._remember(int(_settled), f"冷却期观察结算（{_settle_n} 条观察折算）",
+                                  kind="mechanical")
+                plugin.logger.info(
+                    f"[favorability] 观察结算: user={resolved_user_id} "
+                    f"{_settle_n} 条 → {_settled:+d}（score={profile.score}）")
 
         # ③ 单次上限
         _cap = max(1, int(_sc.get("max_single_delta", 10)))
@@ -3548,7 +4305,8 @@ async def adjust_favorability(
         await _store_archive(_ctx.chat_key, state)
 
     _tail = "（档案里的禁写词已自动移除。）" if _blocked else ""
-    # ⚠️ 这是 BEHAVIOR 方法的返回值 —— 它会**直接作为一句话进聊天**。
+    # ⚠️ 2.6.0 起本方法是 TOOL：返回值只回给沙盒代码/模型，不进聊天。
+    #    （历史包袱：BEHAVIOR 时期它会直接作为一句话进聊天）
     #    早先带着「当前为 62/100」：等于把内部评分实时播报给用户，
     #    用户会开始算分、试探边界，关系感就退化成刷分游戏。只保留阶段名。
     return (
@@ -3558,7 +4316,7 @@ async def adjust_favorability(
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.BEHAVIOR,
+    SandboxMethodType.TOOL,
     name="重设好感度档案",
     description="覆盖式改写某个用户的关系档案，用于初始化或大幅修正。",
 )
@@ -3622,14 +4380,14 @@ async def set_favorability_profile(
         _purge = (getattr(state, "purged", None) or {}).get(resolved_user_id) or {}
         # ⚠️ 墓碑是落库数据，手改/脏导入可能非数字：裸 int() 抛出的异常会穿出
         #    BEHAVIOR 沙盒，被 NA 推成一条 "[SYSTEM] None" 脏消息给用户（2.4.3 修）。
-        if is_new and _purge and (_ts_now() - _safe_int(_purge.get("at"), 0)) <= 86400:
+        if is_new and _purge and (_ts_now() - _int_or(_purge.get("at"), 0)) <= 86400:
             is_new = False
-            profile.day_key = _safe_int(_purge.get("day_key"), 0)
-            profile.day_net = _safe_int(_purge.get("day_net"), 0)
-            profile.last_adjust_at = _safe_int(_purge.get("last_adjust_at"), 0)
+            profile.day_key = _int_or(_purge.get("day_key"), 0)
+            profile.day_net = _int_or(_purge.get("day_net"), 0)
+            profile.last_adjust_at = _int_or(_purge.get("last_adjust_at"), 0)
             plugin.logger.info(
                 f"[favorability] 删档后重建，沿用被删档案的预算: user={resolved_user_id} "
-                f"day_net={profile.day_net} 距删除 {_ts_now() - _safe_int(_purge.get('at'), 0)}s",
+                f"day_net={profile.day_net} 距删除 {_ts_now() - _int_or(_purge.get('at'), 0)}s",
             )
 
         # ---- 约束层（v1.4.1）：堵住 set_profile 绕过 adjust 防刷体系的旁路 ----
@@ -3708,7 +4466,7 @@ async def set_favorability_profile(
         await _store_archive(_ctx.chat_key, state)
 
     _stail = "（档案里的禁写词已自动移除。）" if _sblocked else ""
-    # 同上：BEHAVIOR 回执会进聊天，不播报内部评分，只给阶段
+    # 同上：回执不含内部评分，只给阶段（2.6.0 起本方法已是 TOOL，回执不再进聊天）
     return (
         f"已重设 {profile.display_name or profile.user_id} 的关系档案"
         f"（当前阶段：{_stage_of(profile.score)[0]}）。{_stail}"
@@ -3716,7 +4474,7 @@ async def set_favorability_profile(
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.BEHAVIOR,
+    SandboxMethodType.TOOL,
     name="删除好感度档案",
     description="删除某个用户的关系档案，用于清理误建或彻底重置。",
 )
@@ -3750,8 +4508,10 @@ async def remove_favorability_profile(
         if not isinstance(getattr(state, "purge_log", None), list):
             state.purge_log = []
         _log = state.purge_log
-        _log[:] = [_safe_int(t, 0) for t in _log if _now - _safe_int(t, 0) <= 172800]
-        _recent = sum(1 for t in _log if _now - _safe_int(t, 0) < 3600)
+        # ⚠️ 必须用 _int_or：_safe_int 对脏值返回 None，下一行 `_now - None` 直接
+        #    TypeError 穿出沙盒（NA 侧推一条 "[SYSTEM] None"）。与 from_raw 同口径。
+        _log[:] = [_int_or(t, 0) for t in _log if _now - _int_or(t, 0) <= 172800]
+        _recent = sum(1 for t in _log if _now - _int_or(t, 0) < 3600)
         if _recent >= 3:
             return "本次未删除：一小时内已删除 3 份档案，操作过于频繁，请稍后再试。"
         gone = state.profiles.pop(resolved_user_id)
@@ -3765,7 +4525,7 @@ async def remove_favorability_profile(
         }
         # 墓碑只保留 48h，避免无限增长
         for _uid in [k for k, v in _purged.items()
-                     if not isinstance(v, dict) or _now - _safe_int(v.get("at"), 0) > 172800]:
+                     if not isinstance(v, dict) or _now - _int_or(v.get("at"), 0) > 172800]:
             _purged.pop(_uid, None)
         if state.last_active_user_id == resolved_user_id:
             state.last_active_user_id = ""
@@ -3825,8 +4585,12 @@ async def save_note(
     reason = res.get("reason")
     # 校验失败一律 return 字符串（raise 会让 NA 把失败时的 None 当成系统消息）
     if action == "disabled":
+        plugin.logger.info(f"[persona] 笔记写入被拒：功能已关闭 chat={_ctx.chat_key}")
         return "本次未记录：频道笔记功能已关闭。"
     if action == "rejected":
+        plugin.logger.info(
+            f"[persona] 笔记写入被拒：{reason} 标题={str(title or '')[:20]!r} "
+            f"正文={_clean_content_log(content)} chat={_ctx.chat_key}")
         if reason == "empty_title":
             return "本次未记录：标题不能为空。"
         if reason == "empty_content":
@@ -3888,6 +4652,12 @@ async def forget_note(_ctx: schemas.AgentCtx, title: str) -> str:
     return f"已忘掉笔记「{removed_title}」。"
 
 
+def _clean_content_log(text: str, n: int = 24) -> str:
+    """日志里展示锚点正文的前 n 字（够定位内容，又不至于把长段写进日志）。"""
+    t = " ".join(str(text or "").split())
+    return (t[:n] + "…") if len(t) > n else t
+
+
 def _anchor_norm(content: str) -> str:
     """锚点去重用的归一化：小写、折叠空白，用于精确相等判定。"""
     return " ".join(str(content or "").lower().split())
@@ -3928,13 +4698,20 @@ async def anchor_memory(
         tags (List[str] | None): 可选检索关键词（供未来按话题唤起，阶段 A 仅作元数据）
     """
     cfg = _anchor_cfg()
+    # 每一次调用都留痕：以前只有"新增/刷新成功"打日志，被拦下完全无痕，
+    # 出问题（例如"锚点怎么不长了"）时只能靠猜 —— 见 2.6.0 的排查记录。
+    plugin.logger.debug(f"[persona] 锚点工具被调用：{len(str(content or ''))} 字")
     if not cfg["enabled"]:
+        plugin.logger.info("[persona] 锚点写入被拒：功能已关闭（ANCHOR_ENABLED=false）")
         return "本次未沉淀：身份锚点功能已关闭（ANCHOR_ENABLED=false）。"
 
     clean_content = _one_line(content, cfg["max_content"] + 1)
     if not clean_content:
+        plugin.logger.info("[persona] 锚点写入被拒：内容为空")
         return "本次未沉淀：锚点内容不能为空。"
     if len(clean_content) > cfg["max_content"]:
+        plugin.logger.info(
+            f"[persona] 锚点写入被拒：内容过长 {len(clean_content)} 字 > 上限 {cfg['max_content']} 字")
         return (
             f"本次未沉淀：锚点太长（{len(clean_content)} 字，上限 {cfg['max_content']} 字）。"
             "锚点应是一句能长期成立的自我认知，不是叙事；请凝练。"
@@ -3947,6 +4724,9 @@ async def anchor_memory(
     for _pat, _why in _ANCHOR_REJECT_PATTERNS:
         _hit = _pat.search(scrubbed)
         if _hit:
+            plugin.logger.info(
+                f"[persona] 锚点写入被拒：命中禁写模式（{_why}「{_hit.group(0)[:16]}」）"
+                f"正文={clean_content[:24]}…")
             return (
                 f"本次未沉淀：锚点里出现了{_why}「{_hit.group(0)[:16]}」。"
                 "身份锚点必须是「我是谁」的立场，不能绑定某个人或某个频道——"
@@ -3971,6 +4751,11 @@ async def anchor_memory(
     action = res.get("action")
     if action == "rejected":
         gate = res.get("gate")
+        plugin.logger.info(
+            f"[persona] 锚点写入被拒：闸门 {gate or '未知'}"
+            f"（总量 {res.get('total')}，今日 {res.get('day_count')}，"
+            f"配置 每日≤{cfg['max_per_day']} 间隔≥{cfg['min_interval_hours']}h 总量≤{cfg['max_total']}）"
+            f" user={_ctx.from_platform_userid} 正文={_clean_content_log(clean_content)}")
         if gate == tier4.GATE_MAX_TOTAL:
             return (
                 f"本次未沉淀锚点：身份锚点已达总量上限 {cfg['max_total']} 条。"
@@ -4019,7 +4804,7 @@ async def anchor_memory(
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
+    SandboxMethodType.TOOL,
     name="查看好感度档案",
     description="读取某个用户关系档案的完整内容。",
 )
@@ -4076,7 +4861,7 @@ async def get_favorability_profile(
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
+    SandboxMethodType.TOOL,
     name="列出好感度档案",
     description="列出本频道已有关系档案的用户摘要，群聊里可先用它确定对象。",
 )
@@ -4508,7 +5293,7 @@ def _write_reset_backup(chat_key: str, blob: str) -> str:
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
+    SandboxMethodType.TOOL,
     name="重新加载背景记忆",
     description="重新加载角色背景记忆数据（改了数据目录下的 json 后调用）。返回条目数与门控状态。",
 )
@@ -4552,6 +5337,9 @@ def _persona_webui_router():
             "compose_archive_card": _compose_archive_card,
             "compose_overview_card": _compose_overview_card,
             "stage_info": _stage_of,
+            # 情绪（此刻心情）：档案索引页展示用，定性文案、不显示数值
+            "mood_band": _mood_band,
+            "mood_effective": _mood_effective_raw,
             "clamp_score": _bound_score,
             "max_abs_score": _score_cap,
             "now_ts": _ts_now,
@@ -4567,6 +5355,8 @@ def _persona_webui_router():
             "anchor_cfg": _anchor_cfg,
             # 阶段 C：生长包导出/导入（关系档案枚举与原样读写）
             "enumerate_archives": _enumerate_archives,
+            # 情绪运营指标（2.6.0）：回答"这套机制到底有没有被调用"
+            "mood_stats": _mood_stats,
             "write_archive": _write_archive,
             "safe_key_name": _safe_key_name,
         },
@@ -4574,7 +5364,7 @@ def _persona_webui_router():
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
+    SandboxMethodType.TOOL,
     name="好感度衰减检查",
     description="立即结算一次好感度衰减（平时每 30 分钟自动结算，此方法用于手动触发/查看结果）。",
 )
@@ -4593,7 +5383,7 @@ async def run_favorability_decay(_ctx: schemas.AgentCtx) -> str:
 
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
+    SandboxMethodType.TOOL,
     name="好感度回升检查",
     description="立即结算一次好感度回升（平时每 30 分钟自动结算，此方法用于手动触发/查看结果）。",
 )
@@ -4635,6 +5425,142 @@ def _row_in_account_scope(r) -> bool:
         return True
     _owner = _chat_key_account(str(getattr(r, "target_chat_key", "") or ""))
     return (not _owner) or _owner == _me
+
+
+# 情绪事件归因分类（2.6.0）。只做粗分，用于**量化误伤率**，不影响计分：
+#   directed   = 冲我来的（对你说的话/做的事）
+#   self_state = 对方的处境（累了/被骂/电脑崩了…）—— 记成情绪就属于归因错误
+#   unknown    = 看不出来
+_MOOD_DIRECTED_WORDS = (
+    "你说", "说我", "对我", "骂我", "凶我", "敷衍", "谢谢你", "道谢", "夸我", "不理我",
+    "顶嘴", "滚", "你这话", "喜欢我", "依赖", "陪我", "关心", "道歉", "冒犯", "羞辱",
+    "使唤", "威胁", "越界", "嫌我", "冲我", "拿我", "跟我", "拒绝我", "命令",
+    # 实测语料里常见的指向性说法（2.6.0 补）
+    "被说", "被要求", "这种话", "不体面", "挑衅", "挑刺", "阴阳", "没本事", "嘲讽",
+)
+_MOOD_SELFSTATE_WORDS = (
+    "加班", "被上司", "被老板", "被组长", "被领导", "被当众", "失眠", "睡不着", "电脑",
+    "服务器", "封号", "游戏", "输了", "考试", "作业", "生病", "很累", "好累", "累了",
+    "烦死", "难受", "压力", "崩溃", "心情不好", "emo", "丧", "军训", "上班", "通勤",
+    "开会", "赶工", "ddl", "破输入法", "内存",
+)
+
+
+def _mood_attribution(reason: str) -> str:
+    """粗分一条情绪事件的归因：directed / self_state / unknown。
+
+    ⚠️ 这只是**指标口径**，不参与计分 —— 关键词判断必然有误判，别拿它做惩罚依据。
+    """
+    text = str(reason or "")
+    if not text.strip():
+        return "unknown"
+    if any(w in text for w in _MOOD_DIRECTED_WORDS):
+        return "directed"
+    if any(w in text for w in _MOOD_SELFSTATE_WORDS):
+        return "self_state"
+    return "unknown"
+
+
+async def _mood_stats(days: int = 7) -> Dict[str, object]:
+    """情绪机制的运营指标（2.6.0）。
+
+    为什么需要：这套机制最大的风险不是被滥用，而是**模型根本不调** —— 那就整套都是死的。
+    在拿到这个数字之前，调 MOOD_TOOL_MAX / MOOD_SHOW_MIN 全靠猜。数据源是档案里已有的
+    mood_events（自带 timestamp）与 chat_message 表，不需要新增存储。
+    """
+    try:
+        days = max(1, min(int(days or 7), 90))
+    except (TypeError, ValueError):
+        days = 7
+    now = _ts_now()
+    cutoff = now - days * 86400
+    events = pos = neg = 0
+    directed = self_state = unknown = 0
+    neg_self_state = 0
+    users = channels = profiles_total = 0
+    first_ts = 0
+    by_day: Dict[str, int] = {}
+    try:
+        archives = await _enumerate_archives()
+    except Exception as exc:  # noqa: BLE001
+        plugin.logger.debug(f"[persona] 情绪统计枚举档案失败: {exc}")
+        archives = {}
+    for _ck, raw in (archives or {}).items():
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            profs = (data or {}).get("profiles") or {}
+        except Exception:  # noqa: BLE001
+            continue
+        _chan_hit = False
+        for _uid, prof in profs.items():
+            profiles_total += 1
+            evs = (prof or {}).get("mood_events") or []
+            if not isinstance(evs, list) or not evs:
+                continue
+            _user_hit = False
+            for ev in evs:
+                if not isinstance(ev, dict):
+                    continue
+                ts = _int_or(ev.get("timestamp"), 0)
+                if ts and (not first_ts or ts < first_ts):
+                    first_ts = ts
+                if not ts or ts < cutoff:
+                    continue
+                events += 1
+                _user_hit = _chan_hit = True
+                delta = _int_or(ev.get("delta"), 0)
+                if delta > 0:
+                    pos += 1
+                elif delta < 0:
+                    neg += 1
+                _attr = _mood_attribution(str(ev.get("reason") or ""))
+                if _attr == "directed":
+                    directed += 1
+                elif _attr == "self_state":
+                    self_state += 1
+                    if delta < 0:
+                        neg_self_state += 1
+                else:
+                    unknown += 1
+                day = time.strftime("%m-%d", time.localtime(ts))
+                by_day[day] = by_day.get(day, 0) + 1
+            if _user_hit:
+                users += 1
+        if _chan_hit:
+            channels += 1
+    messages = 0
+    try:
+        from datetime import datetime, timedelta, timezone
+
+        from nekro_agent.models.db_chat_message import DBChatMessage
+
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        messages = await DBChatMessage.filter(create_time__gte=since).exclude(sender_id="-1").count()
+    except Exception as exc:  # noqa: BLE001
+        plugin.logger.debug(f"[persona] 情绪统计取人类消息数失败: {exc}")
+    _days_sorted = sorted(by_day.items())
+    return {
+        "days": days,
+        "events": events,
+        "users": users,
+        "channels": channels,
+        "pos": pos,
+        "neg": neg,
+        "messages": int(messages or 0),
+        "per_100_msgs": round(events / messages * 100, 2) if messages else 0,
+        "first_event_at": first_ts,
+        "first_event_days_ago": (round((now - first_ts) / 86400, 1) if first_ts else None),
+        "by_day": [{"date": d, "count": c} for d, c in _days_sorted],
+        # 归因拆分（2.6.0）：neg_self_state = 负向里「对方只是在讲自己的事」的条数，
+        # 这类是**疑似误伤**，越少越好；misattrib_rate 用来盯这个
+        "directed": directed,
+        "self_state": self_state,
+        "unknown": unknown,
+        "neg_self_state": neg_self_state,
+        "misattrib_rate": (round(neg_self_state / neg * 100, 1) if neg else 0),
+        "profiles_total": profiles_total,
+        "enabled": bool(getattr(config, "MOOD_ENABLED", True)),
+    }
 
 
 async def _enumerate_archives() -> Dict[str, str]:

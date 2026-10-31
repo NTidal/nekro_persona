@@ -311,7 +311,7 @@ _TIER_LABEL = {"tier1": "1 档·身份", "tier2": "2 档·往事", "tier3": "3 �
 
 
 def _render_unavailable_detail(pil_state: dict, font_name: str = "") -> str:
-    """渲染返回 None 时给人看的原因（2.5.8）。三种情况分别给不同文案：
+    """渲染返回 None 时给人看的原因（2.6.0）。三种情况分别给不同文案：
 
     1. Pillow 不可用 → 说明会自动回退文字版，并给出 pip install pillow 的修法；
     2. Pillow 正常但没有中文字体 → 引导上传/放置字体；
@@ -702,6 +702,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         for key in (
             "enabled", "stages", "avoid", "rubric",
             "stage_guides", "stage_guide_common",   # 扩展：分档互动指引
+            "mood_bands",                          # 扩展：情绪档位表（定性文案，不含数值）
         ):
             if key in patch:
                 data[key] = patch[key]
@@ -845,7 +846,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         from nekro_agent.models.db_plugin_data import DBPluginData
 
         rows = await DBPluginData.filter(plugin_key=plugin.key).all()
-        # ⚠️ 多账号分支（NA5）：plugin_data 有 account_key 列。不过滤会把**所有账号**
+        # ⚠️ 多账号分支：plugin_data 有 account_key 列。不过滤会把**所有账号**
         #    的频道键/人数/最高分列给当前账号（实测三账号都看到同样的 173 人/9 频道）。
         #    口径与 /api/index 一致：本账号行 + 键带本账号后缀 + 无后缀历史行可见。
         _acct = helpers.get("account_key", lambda: "")() if helpers else ""
@@ -972,7 +973,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
 
         return {
             "render": {
-                # 渲染后端状态（2.5.8）：Pillow 缺失时概览页据此提醒一次
+                # 渲染后端状态（2.6.0）：Pillow 缺失时概览页据此提醒一次
                 "pillow": (lambda: _card.pil_status())() if hasattr(_card, "pil_status") else {},
             },
             "plugin": {
@@ -1339,10 +1340,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         from nekro_agent.models.db_plugin_data import DBPluginData
 
         rows = await DBPluginData.filter(plugin_key=plugin.key).all()
-        # ⚠️ 多账号分支：以前这里把**所有账号**的档案行都列出来（NA5 实测三个账号都看到
+        # ⚠️ 多账号分支：以前这里把**所有账号**的档案行都列出来（实测三个账号都看到
         #    同样的 173 人 / 9 频道）。现在按当前账号过滤：
         #      · 行 account_key == 当前账号（新写入的权威形态）；
-        #      · 键带 @账号 后缀且等于当前账号（NA5 频道键自带账号）；
+        #      · 键带 @账号 后缀且等于当前账号（多账号频道键自带账号）；
         #      · 无后缀的共享/历史行仍然都可见（单账号部署与历史数据不能凭空消失）。
         acct = helpers.get("account_key", lambda: "")()
         if acct:
@@ -1379,6 +1380,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 except (TypeError, ValueError):
                     continue
                 stage, _ = stage_info(sc)
+                _mood = helpers["mood_effective"](p)
                 all_items.append({
                     "chat_key": ck,
                     "kind": k,
@@ -1386,6 +1388,9 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     "display_name": str(p.get("display_name") or ""),
                     "score": sc,
                     "stage": stage,
+                    # 此刻心情：只给档案页看，定性文案（不显示数值）
+                    "mood": _mood,
+                    "mood_label": helpers["mood_band"](_mood)[0],
                     "tags": [str(x) for x in (p.get("tags") or [])],
                     "summary": str(p.get("summary") or ""),
                     "last_interaction_at": last_interaction_at,
@@ -1437,6 +1442,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             if user_id and str(uid) != str(user_id):
                 continue
             stage, hint = stage_info(int(p.score))
+            _mood = int(p.mood_effective())
             profs.append(
                 {
                     "user_id": uid,
@@ -1444,6 +1450,18 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     "score": int(p.score),
                     "stage": stage,
                     "hint": hint,
+                    # 此刻心情（档案详情弹窗用）：定性文案，不显示数值
+                    "mood": _mood,
+                    "mood_label": helpers["mood_band"](_mood)[0],
+                    # 2.6.0：情绪事件（排查"bot 为什么突然变冷淡"的唯一线索）
+                    "mood_events": [
+                        {
+                            "delta": int(getattr(ev, "delta", 0) or 0),
+                            "reason": str(getattr(ev, "reason", "") or ""),
+                            "at": int(getattr(ev, "timestamp", 0) or 0),
+                        }
+                        for ev in (p.mood_events or [])[-5:]
+                    ],
                     "tags": list(p.tags or []),
                     "summary": p.summary or "",
                     "last_reason": p.last_reason or "",
@@ -3191,7 +3209,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         }
 
     def _render_unavailable(lenient_font: str = "") -> HTTPException:
-        """渲染返回 None 时给出**准确**原因（2.5.8）。
+        """渲染返回 None 时给出**准确**原因（2.6.0）。
 
         以前只有一句「没找到中文字体」—— Pillow 缺失的用户会被指到字体上去，
         真正的修法（pip install pillow）永远看不到。
@@ -3452,6 +3470,36 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "ok": True,
             "meta": meta,
             "image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+        }
+
+    @router.get("/api/mood_stats", summary="情绪运营指标：近 N 天事件数 / 涉及人数 / 每百条消息")
+    async def api_mood_stats(request: Request, days: int = 7) -> Dict[str, Any]:
+        _check_key(request)
+        try:
+            return await helpers["mood_stats"](days)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"统计失败: {exc}") from exc
+
+    @router.get("/api/mood_bands", summary="情绪档位表：当前生效的定性描述与来源")
+    async def api_mood_bands(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        # ⚠️ 运行时导入：webui 与 plugin 互相引用，模块顶层 import 会成环；
+        #    也不能写 `from . import plugin`（包里的 plugin 属性被 NekroPlugin 实例覆盖）。
+        from . import memory as _memory
+        from .plugin import _mood_bands
+
+        rows = _mood_bands()
+        # 来源判定要看 favor.json 里**有没有**配 mood_bands；用内容比对会被"文案一致"骗过去
+        try:
+            _configured = bool(_memory.mood_bands())
+        except Exception:  # noqa: BLE001
+            _configured = False
+        return {
+            "source": "favor.json" if _configured else "builtin",
+            "bands": [
+                {"floor": int(floor), "label": str(label), "text": str(text)}
+                for floor, label, text in rows
+            ],
         }
 
     @router.get("/api/card_style", summary="卡片 DIY 配色：可用 token + 当前值")

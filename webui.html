@@ -680,6 +680,17 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 }
 .mini-btn:hover { color: var(--text); border-color: var(--accent-border); background: var(--surface-hover); }
 .mini-btn.danger:hover { color: var(--vermilion); border-color: var(--vermilion-border); background: var(--vermilion-soft); }
+#overviewMood .metric-note { white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.5; }
+.mood-bars { display: flex; align-items: flex-end; gap: 4px; height: 52px; margin-top: 12px; padding: 0 2px; }
+.mood-bar { flex: 1 1 0; min-width: 4px; max-width: 26px; border-radius: 3px 3px 0 0; background: linear-gradient(180deg, var(--accent-strong), rgba(255,255,255,.08)); opacity: .85; }
+.mood-log { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+.mood-log summary { cursor: pointer; color: var(--text-soft); font-size: 12.5px; }
+.mood-log ul { margin: 8px 0 0; padding-left: 16px; display: grid; gap: 6px; }
+.mood-log li { font-size: 12.5px; color: var(--text); line-height: 1.5; }
+.mood-log li small { color: var(--faint); margin-left: 6px; }
+.mood-log .mood-pos { color: var(--success, #4ad19a); }
+.mood-log .mood-neg { color: var(--danger, #ff6b6b); }
+.mood-log-tip { margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .score-input { width: 76px; min-height: 30px !important; padding: 5px 8px !important; text-align: center; font-variant-numeric: tabular-nums; }
 .score-value { min-width: 40px; color: var(--text); font-family: var(--font-mono); font-size: 13px; font-variant-numeric: tabular-nums; }
 .user-cell { display: flex; align-items: center; gap: 10px; min-width: 150px; }
@@ -2249,13 +2260,23 @@ body.is-scrolling .dialog-foot {
       </div>
       <div class="two-col">
         <div class="card">
+          <div class="card-head">
+            <div><h2 class="card-title">情绪（当下心情）</h2></div>
+            <button class="btn sm" type="button" data-goto="favor">档案里看详情</button>
+          </div>
+          <div class="card-body" id="overviewMood"><div class="empty-inline">加载中…</div></div>
+        </div>
+        <div class="card">
           <div class="card-head"><div><h2 class="card-title">运行状态</h2><div class="card-subtitle">衰减 / 回升 / 生命周期 / 备忘录</div></div></div>
           <div class="card-body" id="overviewRuntime"></div>
         </div>
+      </div>
+      <div class="two-col">
         <div class="card">
           <div class="card-head"><div><h2 class="card-title">数据目录</h2><div class="card-subtitle">背景数据解析状态</div></div></div>
           <div class="card-body" id="overviewDir"></div>
         </div>
+        <div class="card"></div>
       </div>
     </section>
 
@@ -3857,6 +3878,7 @@ async function loadOverview() {
   renderOverviewGating(data);
   renderOverviewRuntime(data);
   renderOverviewDir(data);
+  renderOverviewMood();
   _warnIfNoPillow(data);
   setNavCount('memory', (data.tier1.count || 0) + (data.tier2.count || 0) + (data.tier3.count || 0));
   loadChannels();
@@ -3960,6 +3982,36 @@ function renderOverviewRuntime(data) {
     statusLine('记忆生命周期', lc.enabled ? `半衰期 ${lc.half_life_days} 天 · 下限 ${lc.floor}` : '已关闭') +
     statusLine('频道笔记', m.enabled ? `上限 ${m.max_items} 条 · 注入 ${m.inject_recent}+${m.inject_matched} 条` : '已关闭') +
     statusLine('防白嫖护栏', (data.guard || {}).desc || '—');
+}
+
+async function renderOverviewMood() {
+  const box = $('#overviewMood');
+  if (!box) return;
+  const d = await load('mood_stats?days=7');
+  if (!d) { box.innerHTML = '<div class="empty-inline">统计暂不可用</div>'; return; }
+  const days = d.days || 7;
+  const bars = (d.by_day || []).map((x) => {
+    const h = Math.min(100, 8 + x.count * 14);
+    return `<span class="mood-bar" title="${esc(x.date)}：${x.count} 条" style="height:${h}%"></span>`;
+  }).join('');
+  const _ago = d.first_event_days_ago;
+  const first = (_ago === null || _ago === undefined)
+    ? '<b>未发生</b>'
+    : (_ago < 1 ? '<b>今天</b>' : `<b>${_ago}</b><small>天前</small>`);
+  box.innerHTML = `
+    <div class="metric-grid">
+      ${metric(`近 ${days} 天事件`, d.events || 0, '条', `涉及 ${d.users || 0} 人 / ${d.channels || 0} 个频道`)}
+      ${metric('每 100 条消息', String(d.per_100_msgs ?? 0), '次', `窗口内人类消息 ${d.messages || 0} 条`)}
+      <div class="metric ${(d.events ? '' : 'warning')}">
+        <div class="metric-label">首次自发调用</div>
+        <div class="metric-value">${first}</div>
+        <div class="metric-note">${d.first_event_at ? new Date(d.first_event_at * 1000).toLocaleString() : '还没有任何情绪事件'}</div>
+      </div>
+    </div>
+    <div class="mood-bars" title="近 ${days} 天每天的情绪事件数">${bars}</div>
+    <div class="mood-log-tip">${d.events ? `冲它来的 ${d.directed || 0} 条 / 对方的处境（疑似误伤）${d.self_state || 0} 条 / 看不出 ${d.unknown || 0} 条；负向误伤率 ${d.misattrib_rate ?? 0}%；共扫过 ${d.profiles_total || 0} 份档案。` : '窗口内没有情绪事件：要么没触发过，要么 MOOD_ENABLED 关着。'}</div>`;
+  // 本卡片是异步渲染的，跑在 FX.countUp() 之后 → 这里必须补一次，否则数字停在 0
+  try { FX.countUp(); } catch (e) { /* FX 未初始化时忽略 */ }
 }
 
 function renderOverviewDir(data) {
@@ -4421,7 +4473,7 @@ function renderFavor() {
       </td>
       <td data-label="频道"><span class="mono chat-key" title="${esc(x.chat_key)}">${esc(x.chat_key)}</span></td>
       <td data-label="分数"><span class="score-value" style="color:${scoreColorVar(x.score)}">${x.score}</span></td>
-      <td data-label="阶段"><span class="badge ${stageClass(x.score)}">${esc(x.stage || '—')}</span></td>
+      <td data-label="阶段"><span class="badge ${stageClass(x.score)}">${esc(x.stage || '—')}</span>${x.mood_label ? `<span class="chip" title="此刻心情：只影响语气，不参与解锁">${esc(x.mood_label)}</span>` : ''}</td>
       <td data-label="标签"><div class="badge-row">${(x.tags || []).map((t) => `<span class="chip">${esc(t)}</span>`).join('') || '<span class="muted">—</span>'}</div></td>
       <td data-label="稳定印象"><div class="summary-text" title="${esc(x.summary || '')}">${esc(x.summary || '—')}</div></td>
       <td data-label="操作" class="actions-cell"><div class="table-actions"><button class="mini-btn" type="button" data-act="open">档案</button></div></td>
@@ -4505,7 +4557,7 @@ function openProfileDialog(chatKey, p, maxAbs) {
         <div class="avatar">${esc((p.display_name || '?').slice(0, 1))}</div>
         <div class="profile-summary-copy">
           <strong>${esc(p.display_name || '未命名')}</strong>
-          <small>阶段：${esc(p.stage || '—')} · ${esc(p.hint || '')}</small>
+          <small>阶段：${esc(p.stage || '—')} · 此刻心情：${esc(p.mood_label || '平静')} · ${esc(p.hint || '')}</small>
         </div>
         <div class="spacer"></div>
         <div class="row">
@@ -4517,6 +4569,15 @@ function openProfileDialog(chatKey, p, maxAbs) {
         <div class="profile-field"><span>标签</span><strong>${esc((p.tags || []).join('、') || '—')}</strong></div>
         <div class="profile-field"><span>最近变动</span><strong>${esc(p.last_reason || '—')}</strong></div>
       </div>
+      ${(p.mood_events && p.mood_events.length) ? `
+      <details class="mood-log">
+        <summary>情绪记录（最近 ${p.mood_events.length} 条）</summary>
+        <ul>${p.mood_events.slice().reverse().map((e) => `
+          <li><b class="${e.delta > 0 ? 'mood-pos' : 'mood-neg'}">${e.delta > 0 ? '+' : ''}${e.delta}</b>
+            <span>${esc(e.reason || '（未写原因）')}</span>
+            <small>${e.at ? new Date(e.at * 1000).toLocaleString() : ''}</small></li>`).join('')}</ul>
+        <div class="mood-log-tip">情绪只影响语气，不影响 tier 解锁；这里是模型当时给出的理由，用于排查"为什么突然变冷淡"。</div>
+      </details>` : ''}
       <div class="field-label">稳定印象<textarea class="textarea" id="pfSummary">${esc(p.summary || '')}</textarea></div>
       <div class="field-label">个人互动提示<textarea class="textarea" id="pfHint" style="min-height:70px">${esc(p.interaction_hint || '')}</textarea></div>
       <div class="field-label">标签（逗号分隔）<input class="field" id="pfTags" value="${esc((p.tags || []).join('，'))}"></div>
@@ -4748,7 +4809,7 @@ function collectRubric() {
 
 /* ⚠️ 后端 rubric 是结构化对象 {header, intro, items:[[分值,说明]...], rules:[字符串...]}，
    不是扁平的 {维度: 说明}。旧实现按扁平渲染并原样回存，保存时 rules 变成字符串，
-   后端按字符迭代 → 规则被逐字拆开、items 整组丢失（NA1 的评分细则就是这样没的）。 */
+   后端按字符迭代 → 规则被逐字拆开、items 整组丢失（线上实例的评分细则就是这样没的）。 */
 function renderRubric(rubric) {
   const rb = rubric || {};
   $('#rubricHeader').value = rb.header || '';
@@ -5005,7 +5066,7 @@ async function loadCards(opts = {}) {
         + `　·　raqm ${be.raqm ? '✓' : '—'}　·　${src}`;
       beLine.classList.toggle('warn', be.coverage_source !== 'cmap');
     } else {
-      // 2.5.8：说清后果与修法，而不是只丢一句"未就绪"
+      // 2.6.0：说清后果与修法，而不是只丢一句"未就绪"
       const why = (info.pillow && info.pillow.reason) || '未检测到 Pillow';
       beLine.innerHTML = `图片卡片不可用：${esc(why)}　——　三张卡都会自动回退为文字版。`
         + `<br>修法：在 NA 容器里执行 <code>pip install pillow</code>（或重装插件触发自动安装）后重试。`;

@@ -688,6 +688,93 @@ def favor_stage_table() -> List[tuple]:
     return list(rows)
 
 
+_MOOD_BAND_CACHE: Dict[str, Any] = {"at": 0.0, "rows": []}
+
+
+_MOOD_SEED_STATE: Dict[str, Any] = {"done": False}
+
+
+def ensure_mood_bands_seeded(builtin: List[Dict[str, Any]], enabled: bool = True) -> str:
+    """旧种子自适应：favor.json 里没有 mood_bands 时，把内置档位表写进去。
+
+    为什么需要（2.6.0）：档位文案本来就有一份内置的（plugin._MOOD_BANDS），但**数据驱动那份**
+    只存在于新种子 favor.json 里。旧实例升级时种子不会自动更新，于是线上一直走内置兜底：
+    管理员改不了文案、`/api/mood_bands` 也一直报 source=builtin。线上实例升级时就撞上了这个坑
+    （单测 109 条里专门检查"种子必须含 mood_bands"，升级旧实例时直接红）。
+
+    行为：
+      · 只在 `mood_bands` 缺失/为空时写，**已有内容一律不动**（尊重管理员自定义）；
+      · 写前留一份 `favor.json.bak_before_mood_seed`（只留一次），临时文件 + 原子替换；
+      · 每个进程只尝试一次（`_MOOD_SEED_STATE`），失败只告警，绝不影响启动；
+      · 成功后失效 5 秒缓存，下一次 mood_bands() 就走数据文件。
+
+    返回：seeded / already / disabled / no-file / bad-root / error / skipped
+    """
+    if not enabled:
+        return "disabled"
+    if _MOOD_SEED_STATE.get("done"):
+        return "skipped"
+    _MOOD_SEED_STATE["done"] = True
+    favor = _favor_file()
+    if not favor.is_file():
+        return "no-file"
+    try:
+        raw = favor.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return "bad-root"
+        if data.get("mood_bands"):
+            return "already"
+        rows = [dict(b) for b in (builtin or []) if isinstance(b, dict)]
+        if not rows:
+            return "error"
+        data["mood_bands"] = rows
+        bak = favor.parent / (favor.name + ".bak_before_mood_seed")
+        if not bak.exists():
+            bak.write_text(raw, encoding="utf-8")
+        tmp = favor.parent / (favor.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(favor)
+        _MOOD_BAND_CACHE.update({"at": 0.0, "rows": []})
+        logger.info(f"[persona] 旧种子自适应：已把 {len(rows)} 档内置情绪档位写进 favor.json"
+                    f"（原文件备份为 {bak.name}）")
+        return "seeded"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[persona] 旧种子自适应失败（忽略，继续用内置档位）: {exc}")
+        return "error"
+
+
+def mood_bands() -> List[tuple]:
+    """(floor, label, text) 情绪档位表，按 floor **降序**；配置在 favor.json 的 mood_bands。
+
+    与 favor_stage_table 同款 5 秒 TTL：注入路径每轮都会调用，不能每次读盘。
+    未配置 / 解析失败 → 返回空列表，由 plugin 回落到内置表（绝不抛）。
+    """
+    now = time.monotonic()
+    if now - float(_MOOD_BAND_CACHE.get("at") or 0.0) < 5.0:
+        return list(_MOOD_BAND_CACHE.get("rows") or [])
+    rows: List[tuple] = []
+    try:
+        cfg = load_favor_cfg()
+        for band in (cfg.get("mood_bands") or []):
+            if not isinstance(band, dict):
+                continue
+            floor = _as_stage_max(band.get("floor"))     # 坏值 → None（跳过该档，绝不抛）
+            if floor is None:
+                continue
+            rows.append((
+                floor,
+                str(band.get("label") or "").strip(),
+                str(band.get("text") or "").strip(),
+            ))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[persona] 情绪档位表读取失败，回落内置: {exc}")
+        rows = []
+    rows.sort(key=lambda r: r[0], reverse=True)
+    _MOOD_BAND_CACHE.update({"at": now, "rows": rows})
+    return list(rows)
+
+
 def _as_stage_max(value: Any) -> Optional[int]:
     """档位 max 解析：坏值返回 None（跳过该档），绝不抛。"""
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -1129,7 +1216,7 @@ def _order_by_heat(scored: List["ScoredEntry"], tier: int, now: float,
 
 
 # 嵌入失败冷却（monotonic 秒）。端点整段挂掉时，若不做冷却，每次加载都会把
-# 待嵌条目重新逐条重试一遍 —— 实测 NA4 端点 500 时单个 3 档轮次就打出了 842 次
+# 待嵌条目重新逐条重试一遍 —— 实测端点报错时，单个 3 档轮次就打出了数百次
 # 失败请求，而数据目录每变一次就会再来一轮。冷却期内直接跳过待嵌部分（缓存里
 # 已有的向量照用，检索靠关键字 + 部分向量兜底），避免无意义的自我 DoS。
 _EMBED_COOLDOWN_SECONDS = 600.0
@@ -1553,7 +1640,7 @@ async def _vectorize(items: List[Dict[str, Any]], label: str, dir_key: Path,
                 _consec_fail += 1
                 if _consec_fail >= 3:
                     # 端点整段不可用（如网关 5xx）时，逐条重试等于把请求数乘以条目数：
-                    # NA4 实测 322 条待嵌 → 一轮打出 842 次失败请求，而数据目录一变就再来一轮。
+                    # 实测数百条待嵌 → 一轮打出数百次失败请求，而数据目录一变就再来一轮。
                     # 连续 3 条全失败即判定不可用，中止本轮并进冷却。
                     _EMBED_FAIL_UNTIL = time.monotonic() + _EMBED_COOLDOWN_SECONDS
                     logger.warning(
