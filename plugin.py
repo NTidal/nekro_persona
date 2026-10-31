@@ -36,6 +36,7 @@
 
 from __future__ import annotations
 
+import random
 import asyncio
 import threading
 import hashlib
@@ -603,6 +604,44 @@ class FavorabilityConfig(ConfigBase):
         "（只写一次、不覆盖已有内容、留一份 .bak）。关掉则一直走代码内置文案，管理员改不了档位措辞",
         en_title="Auto-seed mood bands",
         en_desc="Write the builtin mood band table into favor.json once if it is missing",
+    )
+    MOOD_FAVOR_ENABLED: bool = _fav_field(
+        True, "情绪影响好感度倍率",
+        "心情越好，正面/负面事件的调整幅度被放大的概率与倍率越高（反之同理）。"
+        "设计见 mood_favor_scale()：单层 Bernoulli + 期望强度，只影响幅度、不改符号。",
+        en_title="Mood scales favor delta", en_desc="Mood modulates the magnitude of favor changes",
+    )
+    MOOD_FAVOR_GATE_MAX: float = _fav_field(
+        0.6, "情绪倍率触发上限",
+        "情绪走到极端时，这条倍率生效的概率上限（0.6 = 六成）。别设 1：完全由情绪决定的时刻应当罕见。",
+        en_title="Mood gate max", en_desc="Max probability that mood affects the delta", ge=0.0, le=1.0,
+    )
+    MOOD_FAVOR_K_MAX: float = _fav_field(
+        0.6, "情绪倍率幅度",
+        "生效时对基础分值最多乘多少：0.6 = 最大 ×1.6 / ×0.4。同号放大、异号缩小。",
+        en_title="Mood multiplier max", en_desc="Max relative magnitude change when triggered",
+        ge=0.0, le=2.0,
+    )
+    MOOD_FAVOR_NORM: float = _fav_field(
+        50.0, "情绪归一分母",
+        "情绪值除以它再钳到 ±1。情绪上限是 100，但日常多在 ±20~40，所以 50 比 100 更有存在感。",
+        en_title="Mood normalization", en_desc="Divisor mapping mood into [-1, 1]",
+        ge=10.0, le=200.0,
+    )
+    MOOD_FAVOR_MID: float = _fav_field(
+        0.25, "触发阈值",
+        "|x| 低于它时基本不触发（心情没到那份上就别让情绪插嘴）。",
+        en_title="Gate midpoint", en_desc="Below this |x| the mood gate rarely fires", ge=0.0, le=1.0,
+    )
+    MOOD_FAVOR_SLOPE: float = _fav_field(
+        6.0, "触发曲线陡度",
+        "sigmoid 的斜率：越大越像「过了阈值就介入」，越小越平滑。",
+        en_title="Gate slope", en_desc="Steepness of the sigmoid gate", ge=1.0, le=20.0,
+    )
+    MOOD_FAVOR_KNEE: float = _fav_field(
+        0.8, "倍率饱和点",
+        "|x| 到它时倍率吃满；再极端也不再变大（避免情绪把一次判罚推到失真）。",
+        en_title="Multiplier knee", en_desc="|x| at which the multiplier saturates", ge=0.2, le=1.0,
     )
     MOOD_MAX_DAILY_GAIN: int = _fav_field(
         45, "情绪日额度（正向）",
@@ -4623,6 +4662,30 @@ async def adjust_favorability(
             plugin.logger.info(f"[favorability] 单次调整钳制: {delta} → {_capped} (user={resolved_user_id})")
             delta = _capped
 
+        # ③v（方案五）情绪 → 倍率：心情越好/越差，这次调整被放大或缩小的概率与幅度越高
+        if bool(getattr(config, "MOOD_FAVOR_ENABLED", True)):
+            try:
+                _mood_now = int(profile.mood_effective(now))
+                _delta_before = int(delta)
+                delta, _mf = mood_favor_scale(int(delta), _mood_now)
+                if delta != _delta_before:
+                    plugin.logger.info(
+                        f"[favorability] 情绪倍率: {_delta_before:+} → {delta:+}"
+                        f"（mood={_mood_now:+} x={_mf.get('x')} p={_mf.get('p')} "
+                        f"k={_mf.get('k')} dir={_mf.get('dir'):+d} hit={_mf.get('hit')}）"
+                        f"user={resolved_user_id}",
+                    )
+                elif _mf.get("hit"):
+                    plugin.logger.info(
+                        f"[favorability] 情绪倍率命中但幅度未变（取整/保底）: "
+                        f"{_delta_before:+}（mood={_mood_now:+} k={_mf.get('k')}）"
+                        f"user={resolved_user_id}",
+                    )
+                # 放大后仍不许超过单次上限
+                delta = max(-_cap, min(_cap, int(delta)))
+            except Exception as _mfe:  # noqa: BLE001
+                plugin.logger.warning(f"[favorability] 情绪倍率跳过（不影响本次记录）: {_mfe}")
+
         # ④ 边际递减
         #    取整方向很关键：正分向上取整、负分向下取整。
         #    用 round() 会让 delta=1 在高档位变成 0，等价于"这次互动不存在"——
@@ -5826,6 +5889,67 @@ def by_day_rows(by_day: Dict[str, int]) -> List[Dict[str, Any]]:
     """
     return [{"date": day[5:], "full": day, "count": count}
             for day, count in sorted((by_day or {}).items(), key=lambda kv: kv[0])]
+
+
+def _round_half_away(value: float) -> int:
+    """四舍五入但"远离零"：Python 的 round 是银行家舍入，-2.5 会变 -2。"""
+    return int(math.copysign(math.floor(abs(value) + 0.5), value))
+
+
+def mood_favor_scale(base: int, mood: int, *,
+                     roll: Optional[float] = None) -> "tuple[int, dict]":
+    """情绪 → 好感度调整倍率（方案五：单层 Bernoulli + 期望强度）。
+
+    形状（都只看 |x|，正负对称）：
+        x   = clamp(mood / NORM, -1, 1)                  NORM=50
+        a   = |x|
+        p   = GATE_MAX · σ( SLOPE·(a − MID) )             门控概率
+        k   = K_MAX · min(1, a / KNEE)                    倍率幅度
+      同号（正情绪+加分 / 负情绪+扣分）→ ×(1+k)；异号 → ×(1−k)
+
+    只有**一层**随机：Bernoulli(p) 命中才按该倍率取整，否则原样返回 base。
+    于是 E[final] = base·(1 + p·k·dir)，随机性在、可解释性也在。
+
+    取整保底：base≠0 时最终 |final| ≥ 1 —— 否则 base=1 × 1.1 会被 round 抹成 0，
+    "明明夸了一句却不涨"。
+    """
+    info: dict = {"mood": int(mood), "base": int(base), "p": 0.0, "k": 0.0,
+                  "dir": 0, "hit": False, "final": int(base)}
+    if not base or not mood:
+        return int(base), info
+    try:
+        norm = max(10.0, float(getattr(config, "MOOD_FAVOR_NORM", 50.0) or 50.0))
+        gate_max = max(0.0, min(1.0, float(getattr(config, "MOOD_FAVOR_GATE_MAX", 0.6) or 0.0)))
+        k_max = max(0.0, float(getattr(config, "MOOD_FAVOR_K_MAX", 0.6) or 0.0))
+        mid = max(0.0, min(1.0, float(getattr(config, "MOOD_FAVOR_MID", 0.25) or 0.0)))
+        slope = max(1.0, float(getattr(config, "MOOD_FAVOR_SLOPE", 6.0) or 6.0))
+        knee = max(0.2, min(1.0, float(getattr(config, "MOOD_FAVOR_KNEE", 0.8) or 0.8)))
+    except (TypeError, ValueError):
+        return int(base), info
+
+    x = max(-1.0, min(1.0, float(mood) / norm))
+    a = abs(x)
+    p = gate_max / (1.0 + math.exp(-slope * (a - mid)))
+    k = k_max * min(1.0, a / knee)
+    info.update({"x": round(x, 4), "a": round(a, 4), "p": round(p, 4), "k": round(k, 4)})
+    if k <= 0 or p <= 0:
+        return int(base), info
+
+    dir_ = 1 if (base > 0) == (mood > 0) else -1
+    hit = (random.random() if roll is None else float(roll)) < p
+    info.update({"dir": dir_, "hit": bool(hit)})
+    if not hit:
+        return int(base), info
+
+    raw = base * (1.0 + dir_ * k)
+    final = _round_half_away(raw)
+    if final == 0:
+        final = 1 if base > 0 else -1          # 保底：别让"轻微"变成"没有"
+    # 倍率只在 ±(1+k_max) 内，符号绝不允许翻转
+    if (final > 0) != (base > 0):
+        final = base
+    info["final"] = int(final)
+    return int(final), info
 
 
 def next_mood_half_life(current: int, delta: int, half_mult: float, base: int) -> int:

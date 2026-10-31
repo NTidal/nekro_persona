@@ -45,6 +45,73 @@ class TestMoodHalfLifeNotSticky(unittest.TestCase):
         self.assertGreaterEqual(P.next_mood_half_life(0, -3, 0.1, 5), 3)
 
 
+class TestMoodFavorScale(unittest.TestCase):
+    """方案五：单层 Bernoulli + 期望强度；对称、不改符号、取整有保底。"""
+
+    def setUp(self):
+        import importlib
+        self.P = importlib.import_module("nekro_persona.plugin")
+
+    def _cfg(self, **over):
+        saved = {}
+        for k, v in over.items():
+            saved[k] = getattr(self.P.config, k, None)
+            setattr(self.P.config, k, v)
+        self.addCleanup(lambda: [setattr(self.P.config, k, v) for k, v in saved.items()])
+
+    def test_neutral_mood_changes_nothing(self):
+        final, info = self.P.mood_favor_scale(3, 0, roll=0.0)
+        self.assertEqual(final, 3)
+        self.assertFalse(info["hit"])
+
+    def test_positive_mood_amplifies_gain_when_hit(self):
+        final, info = self.P.mood_favor_scale(2, 20, roll=0.0)      # x=0.4 → k=0.3, p≈0.43
+        self.assertTrue(info["hit"])
+        self.assertEqual(final, 3)                                   # 2×1.3=2.6→3
+        self.assertEqual(info["dir"], 1)
+
+    def test_positive_mood_softens_penalty_when_hit(self):
+        final, info = self.P.mood_favor_scale(-2, 20, roll=0.0)      # 异号 → 缩小惩罚
+        self.assertEqual(info["dir"], -1)
+        self.assertEqual(final, -1)                                  # 2×0.7=1.4→1
+
+    def test_negative_mood_aggravates_penalty_when_hit(self):
+        final, info = self.P.mood_favor_scale(-2, -40, roll=0.0)     # x=-0.8 → k=0.6
+        self.assertEqual(info["dir"], 1)
+        self.assertEqual(final, -3)                                  # 2×1.6=3.2→3
+
+    def test_negative_mood_weakens_gain_when_hit(self):
+        final, _ = self.P.mood_favor_scale(2, -40, roll=0.0)
+        self.assertEqual(final, 1)                                   # 2×0.4=0.8→1（保底）
+
+    def test_miss_returns_base_untouched(self):
+        final, info = self.P.mood_favor_scale(2, 40, roll=0.999)
+        self.assertFalse(info["hit"])
+        self.assertEqual(final, 2)
+
+    def test_rounding_floor_keeps_small_gain_alive(self):
+        final, _ = self.P.mood_favor_scale(1, 8, roll=0.0)           # 1.0x 附近，round 会变 1
+        self.assertEqual(final, 1)
+
+    def test_sign_never_flips(self):
+        for base in (-5, -1, 1, 5):
+            for mood in (-100, -20, 20, 100):
+                final, _ = self.P.mood_favor_scale(base, mood, roll=0.0)
+                self.assertEqual(final > 0, base > 0, f"base={base} mood={mood}")
+
+    def test_gate_probability_matches_curve(self):
+        self._cfg(MOOD_FAVOR_GATE_MAX=0.6, MOOD_FAVOR_MID=0.25, MOOD_FAVOR_SLOPE=6.0,
+                  MOOD_FAVOR_NORM=50.0, MOOD_FAVOR_K_MAX=0.6, MOOD_FAVOR_KNEE=0.8)
+        _, info = self.P.mood_favor_scale(2, 20, roll=0.0)
+        self.assertAlmostEqual(info["p"], 0.6 / (1 + 2.718281828 ** (-6 * (0.4 - 0.25))), places=3)
+        self.assertAlmostEqual(info["k"], 0.3, places=3)
+
+    def test_disabled_switch_is_not_here(self):
+        """开关在调用点判断（MOOD_FAVOR_ENABLED），纯函数本身不读它。"""
+        final, _ = self.P.mood_favor_scale(2, 40, roll=0.0)
+        self.assertGreaterEqual(final, 2)
+
+
 class TestByDayRows(unittest.TestCase):
     """by_day 按完整日期排序：跨年不会把 1 月排到 12 月前面。"""
 
