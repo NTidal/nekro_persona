@@ -24,6 +24,45 @@ HALF = 3600          # 默认半衰期 60 分钟
 NO_DIGIT = re.compile(r"\d")
 
 
+class TestMoodHalfLifeNotSticky(unittest.TestCase):
+    """半衰期覆盖只属于「这一次负向情绪」：负向写、非负向清零。"""
+
+    def test_negative_event_writes_override(self):
+        import importlib
+        P = importlib.import_module("nekro_persona.plugin")
+        self.assertEqual(P.next_mood_half_life(0, -8, 1.5, 60), 90)
+        self.assertEqual(P.next_mood_half_life(0, -8, 0.8, 60), 48)
+
+    def test_positive_event_clears_override(self):
+        import importlib
+        P = importlib.import_module("nekro_persona.plugin")
+        self.assertEqual(P.next_mood_half_life(90, 5, 1.5, 60), 0)
+        self.assertEqual(P.next_mood_half_life(90, 0, 1.5, 60), 0)
+
+    def test_clamped_to_minimum(self):
+        import importlib
+        P = importlib.import_module("nekro_persona.plugin")
+        self.assertGreaterEqual(P.next_mood_half_life(0, -3, 0.1, 5), 3)
+
+
+class TestByDayRows(unittest.TestCase):
+    """by_day 按完整日期排序：跨年不会把 1 月排到 12 月前面。"""
+
+    def test_cross_year_order(self):
+        import importlib
+        P = importlib.import_module("nekro_persona.plugin")
+        rows = P.by_day_rows({"2026-01-02": 3, "2025-12-31": 5, "2026-01-01": 1})
+        self.assertEqual([r["full"] for r in rows],
+                         ["2025-12-31", "2026-01-01", "2026-01-02"])
+        self.assertEqual([r["date"] for r in rows], ["12-31", "01-01", "01-02"])
+        self.assertEqual([r["count"] for r in rows], [5, 1, 3])
+
+    def test_empty(self):
+        import importlib
+        P = importlib.import_module("nekro_persona.plugin")
+        self.assertEqual(P.by_day_rows({}), [])
+
+
 class TestMemoryLogWorldFilter(unittest.TestCase):
     """memory_log 的世界观过滤：越界记忆宁可丢掉，也不让它进第 ⑤ 段注入。"""
 

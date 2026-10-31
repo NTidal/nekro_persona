@@ -869,6 +869,37 @@ class TestSalvage(unittest.TestCase):
         self.assertEqual(state.plans[dates[2]].source, "template")
 
 
+class TestBlockCachePrune(unittest.TestCase):
+    """块缓存键里带日期：过期日期的条目必须被裁掉，否则随天数线性增长。"""
+
+    def setUp(self):
+        L._BLOCK_CACHE.clear()
+        L._CACHE_DAY = ""
+        self.addCleanup(lambda: (L._BLOCK_CACHE.clear(), setattr(L, "_CACHE_DAY", "")))
+
+    def test_prune_keeps_only_today(self):
+        L._BLOCK_CACHE[("ch1", "2026-06-14", True, False, 1)] = (1.0, "旧")
+        L._BLOCK_CACHE[("ch1", "2026-06-15", True, False, 1)] = (2.0, "今")
+        L._BLOCK_CACHE[("ch2", "2026-06-15", False, True, 3)] = (3.0, "今2")
+        dropped = L.prune_block_cache("2026-06-15")
+        self.assertEqual(dropped, 1)
+        self.assertEqual(sorted(k[1] for k in L._BLOCK_CACHE), ["2026-06-15", "2026-06-15"])
+
+    def test_prune_is_idempotent(self):
+        L._BLOCK_CACHE[("ch1", "2026-06-15", True, False, 1)] = (1.0, "x")
+        self.assertEqual(L.prune_block_cache("2026-06-15"), 0)
+        self.assertEqual(L.prune_block_cache("2026-06-15"), 0)
+
+    def test_block_for_prunes_on_day_change(self):
+        engine, _, _ = make_engine()
+        old_day = L._shift_date(L._today(), -1)
+        L._BLOCK_CACHE[("chan", old_day, True, False, 1)] = (0.0, "昨天的块")
+        L._CACHE_DAY = old_day
+        run(engine.block_for("chan", score=30))
+        self.assertNotIn(("chan", old_day, True, False, 1), L._BLOCK_CACHE)
+        self.assertEqual(L._CACHE_DAY, L._today())
+
+
 class TestSegmentMood(unittest.TestCase):
     """段级初始 mood：生成时就给，夹在 ±15，存得住、读得回、能用上。"""
 

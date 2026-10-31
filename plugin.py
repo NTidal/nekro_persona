@@ -2319,8 +2319,10 @@ class UserArchive:
     # 2.6.0：情绪日额度（与好感度的 day_key/day_net 分开记，互不干扰）
     mood_day_key: int = 0
     mood_day_net: int = 0
-    # 2.6.0 之后：「这一次情绪」的半衰期（分钟）。0 = 用配置默认。
+    # 「最近一次**负向**情绪」的残留半衰期（分钟）。0 = 用配置默认。
     # 关系越深，同一句冒犯的气散得越慢（信任是缓冲，不是免疫力）。
+    # ⚠️ 只在负向事件时写入、在下一次**非负向**事件时清零 —— 它描述的是"这一次的余韵"，
+    #    不是永久设置。旧实现在正向事件后也不清，导致之后的高兴也按长半衰期衰减。
     mood_half_life: int = 0
     mood_events: List["ArchiveEvent"] = field(default_factory=list)
 
@@ -4370,9 +4372,11 @@ async def adjust_mood(
 
         # 当下状态加权（B3）：同一句话落在什么样的日子里，读出来的分量不一样。
         # 只调幅度与耐久，不改符号；乘数钳在 [0.5, 1.35]，主导权仍在收敛与日额度。
+        # ⚠️ _bias 必须先在外层初始化：下面的半衰期逻辑在 try 之外也要读它，
+        #    否则 engine() 抛异常时这里会 NameError（被自己的 except 吞掉，静默失效）。
+        _bias = None
         try:
             _life_eng = persona_life.engine()
-            _bias = None
             if _life_eng is not None and _life_eng.on:
                 _life_state = await _life_eng.load()
                 if _life_state.plan is not None and _life_state.date == persona_life._today():
@@ -4382,15 +4386,29 @@ async def adjust_mood(
                 _pre = delta
                 delta = int(round(delta * _bias.factor))
                 delta = delta or (1 if _pre > 0 else -1)
-                if delta < 0:
-                    _base_half = max(3, int(getattr(config, "MOOD_HALF_LIFE_MIN", 60) or 60))
-                    profile.mood_half_life = int(round(_base_half * _bias.half_life_mult))
                 plugin.logger.info(
                     f"[persona] 情绪加权：{_pre:+} → {delta:+}"
                     f"（{_bias.describe()}；半衰期 ×{_bias.half_life_mult:g}）user={resolved_user_id}",
                 )
         except Exception as _bias_exc:  # noqa: BLE001
             plugin.logger.warning(f"[persona] 情绪加权跳过（不影响本次记录）: {_bias_exc}")
+
+        # 半衰期覆盖只属于「这一次负向情绪」：负向写、非负向清零。
+        # 旧实现只在负向时写、永不清零 → 一次冒犯之后连正向情绪也按长半衰期衰减。
+        try:
+            _base_half = max(3, int(getattr(config, "MOOD_HALF_LIFE_MIN", 60) or 60))
+            _mult = _bias.half_life_mult if _bias is not None else 1.0
+            _want = next_mood_half_life(int(profile.mood_half_life or 0), delta, _mult, _base_half)
+            if _want and delta < 0:
+                profile.mood_half_life = _want
+            elif not _want and int(profile.mood_half_life or 0):
+                plugin.logger.info(
+                    f"[persona] 情绪半衰期覆盖清零（非负向事件 {delta:+}）"
+                    f"user={resolved_user_id}",
+                )
+                profile.mood_half_life = 0
+        except Exception as _half_exc:  # noqa: BLE001
+            plugin.logger.warning(f"[persona] 半衰期覆盖更新跳过: {_half_exc}")
 
         # 最小间隔（2.6.0）：冷却期内重复调用不拒绝，但再打一次折
         try:
@@ -5801,6 +5819,26 @@ _MOOD_SELFSTATE_WORDS = (
 )
 
 
+def by_day_rows(by_day: Dict[str, int]) -> List[Dict[str, Any]]:
+    """{YYYY-MM-DD: count} → 前端数组，**按完整日期排序**（跨年不会把 1 月排到 12 月前）。
+
+    date 给前端显示（MM-DD），full 留给排查用。
+    """
+    return [{"date": day[5:], "full": day, "count": count}
+            for day, count in sorted((by_day or {}).items(), key=lambda kv: kv[0])]
+
+
+def next_mood_half_life(current: int, delta: int, half_mult: float, base: int) -> int:
+    """算下一次该写的 half-life 覆盖值（纯函数，便于单测）。
+
+    - 负向事件：按关系深浅给一个倍数（信任是缓冲，气散得慢）
+    - 非负向事件：清零，交回配置默认 —— 高兴的事不该被上一次的余韵拖着走
+    """
+    if int(delta) < 0:
+        return max(3, int(round(max(3, int(base)) * float(half_mult or 1.0))))
+    return 0
+
+
 def _mood_attribution(reason: str) -> str:
     """粗分一条情绪事件的归因：directed / self_state / unknown。
 
@@ -5877,7 +5915,8 @@ async def _mood_stats(days: int = 7) -> Dict[str, object]:
                         neg_self_state += 1
                 else:
                     unknown += 1
-                day = time.strftime("%m-%d", time.localtime(ts))
+                # ⚠️ 按**完整日期**分桶："MM-DD" 跨年会把 1 月排到 12 月前
+                day = time.strftime("%Y-%m-%d", time.localtime(ts))
                 by_day[day] = by_day.get(day, 0) + 1
             if _user_hit:
                 users += 1
@@ -5889,11 +5928,12 @@ async def _mood_stats(days: int = 7) -> Dict[str, object]:
 
         from nekro_agent.models.db_chat_message import DBChatMessage
 
-        since = datetime.now(timezone.utc) - timedelta(days=days)
+        # cutoff 与上面事件统计用**同一个**时间点（都是 epoch 推出来的），
+        # 避免一处 localtime、一处 now(UTC) 各算一遍导致窗口差几小时
+        since = datetime.fromtimestamp(cutoff, tz=timezone.utc)
         messages = await DBChatMessage.filter(create_time__gte=since).exclude(sender_id="-1").count()
     except Exception as exc:  # noqa: BLE001
         plugin.logger.debug(f"[persona] 情绪统计取人类消息数失败: {exc}")
-    _days_sorted = sorted(by_day.items())
     return {
         "days": days,
         "events": events,
@@ -5905,7 +5945,7 @@ async def _mood_stats(days: int = 7) -> Dict[str, object]:
         "per_100_msgs": round(events / messages * 100, 2) if messages else 0,
         "first_event_at": first_ts,
         "first_event_days_ago": (round((now - first_ts) / 86400, 1) if first_ts else None),
-        "by_day": [{"date": d, "count": c} for d, c in _days_sorted],
+        "by_day": by_day_rows(by_day),
         # 归因拆分（2.6.0）：neg_self_state = 负向里「对方只是在讲自己的事」的条数，
         # 这类是**疑似误伤**，越少越好；misattrib_rate 用来盯这个
         "directed": directed,

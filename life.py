@@ -1649,6 +1649,11 @@ class Engine:
         # 缓存键要带上「说得多细」和「要不要收着」—— 同一频道不同用户档位不同，
         # 只按 chat_key 缓存会把 A 的细化版本发给还不熟的 B。
         cache_key = (chat_key, date_key, int(score) >= 20, int(mood) <= -30, self._horizon())
+        # 跨天时先裁掉昨天的条目（O(1) 判断，只有换天那一刻才真的扫一遍）
+        if date_key != _CACHE_DAY:
+            dropped = prune_block_cache(date_key)
+            if dropped:
+                logger.info(f"[life] 清理过期块缓存 {dropped} 条（{_CACHE_DAY} → {date_key}）")
         cached = _BLOCK_CACHE.get(cache_key)
         if cached is not None and ts - cached[0] < BLOCK_CACHE_TTL:
             return cached[1]
@@ -1692,6 +1697,24 @@ class Engine:
 _ENGINE: Optional[Engine] = None
 _BLOCK_CACHE: Dict[Any, Tuple[float, str]] = {}
 _ROLLING: set = set()
+#: 上一次清理块缓存时的日期。只在跨天时清，不是每轮都扫一遍。
+_CACHE_DAY = ""
+
+
+def prune_block_cache(today: str) -> int:
+    """丢掉非今天的缓存条目，返回清理条数。
+
+    缓存键里含日期（同一频道不同档位/不同天各一份），过期日期的条目**再也不会被命中**，
+    只是留在字典里。长期运行的实例会按「频道数 × 天数 × 4」缓慢增长，
+    所以每天第一次用到时按日期整批裁掉。
+    """
+    global _CACHE_DAY
+    _CACHE_DAY = today
+    stale = [k for k in list(_BLOCK_CACHE)
+             if isinstance(k, tuple) and k and k[1] != today]
+    for key in stale:
+        _BLOCK_CACHE.pop(key, None)
+    return len(stale)
 _LAST_TICK = 0.0
 
 
