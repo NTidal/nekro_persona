@@ -689,12 +689,18 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 }
 .life-day { cursor: pointer; transition: background 0.14s ease, border-color 0.14s ease; }
 .life-day:hover { background: var(--surface-2); }
-.life-day.on {
+/* 绿色高光只属于"真实的今天"（随日期自动挪）；用户选中的其它天用中性底色 */
+.life-day.today {
+  background: var(--accent-soft);
   border-left-color: var(--accent);
-  background: var(--surface-2);
   box-shadow: inset 0 0 0 1px var(--accent-border);
 }
-.life-day.on .life-day-sum { color: var(--text-soft); }
+.life-day.today .life-day-sum { color: var(--text-soft); }
+.life-day.on:not(.today) {
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.life-day.on:not(.today) .life-day-sum { color: var(--text-soft); }
 .life-day:focus-visible { outline: 2px solid var(--accent-border); outline-offset: 2px; }
 .life-pack-grid { display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .life-field { display: grid; gap: 6px; }
@@ -746,20 +752,30 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 .life-day {
   display: grid;
   grid-template-columns: 92px 74px 1fr;
-  align-items: baseline;
+  align-items: center;
   gap: 10px;
-  padding: 8px 10px;
+  /* 行高固定：摘要一行/两行都一样高，切换与新增天时不会跳动 */
+  height: 58px;
+  padding: 0 10px;
   border-radius: 8px;
   border-left: 2px solid transparent;
 }
 .life-day.today { background: var(--accent-soft); border-left-color: var(--accent); }
 .life-day-date { font-variant-numeric: tabular-nums; font-size: 11.5px; color: var(--text-soft); }
-.life-day-sum { font-size: 12px; color: var(--text-mute); line-height: 1.55; }
+.life-day-sum {
+  font-size: 12px;
+  color: var(--text-mute);
+  line-height: 1.5;
+  display: -webkit-box;          /* 两行封顶，配合固定行高才排得齐 */
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .life-day.today .life-day-sum { color: var(--text-soft); }
 @media (max-width: 720px) {
   .life-row { grid-template-columns: 78px 1fr; height: 46px; }
   .life-feel { display: none; }
-  .life-day { grid-template-columns: 84px 1fr; }
+  .life-day { grid-template-columns: 84px 1fr; height: 54px; }
   .life-split { grid-template-columns: 1fr; gap: 18px; }
 }
 
@@ -3992,6 +4008,13 @@ async function rebuildLife() {
 
 /* ---------------- 日程（生活时间轴） ---------------- */
 /* ---------------- 日程：此刻由真实时间算 ---------------- */
+function lifeTodayKey() {
+  const d = new Date();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
 function lifeNowMinute() {
   const now = new Date();
   return now.getHours() * 60 + now.getMinutes();
@@ -4022,6 +4045,15 @@ function scrollLifeToNow(smooth) {
 function refreshLifeNow() {
   if (state.tab !== 'life') return;
   const cache = state.lifeCache;
+  // 过零点：数据里的 date 还是昨天 → 静默重拉一次，绿高光与「此刻」才能跟到新的一天
+  if (cache && cache.enabled && cache.date && cache.date !== lifeTodayKey()) {
+    if (!state.lifeReloading) {
+      state.lifeReloading = true;
+      state.lifeDay = '';
+      loadLife().finally(() => { state.lifeReloading = false; });
+    }
+    return;
+  }
   if (!cache || cache.date !== state.lifeDay) return;   // 只在"今天"那页有意义
   const rows = $$('#lifeTimeline .life-row');
   if (!rows.length) return;
@@ -4068,9 +4100,13 @@ async function loadLife() {
 function renderLife(d) {
   const on = d && d.enabled;
   const plans = (d && d.plans) || [];
-  const todayDate = (d && d.date) || '';
+  // 「今天」按**真实日期**算，不用后端给的 date —— 否则过零点后高光还留在昨天
+  const todayDate = lifeTodayKey();
+  const dataDate = (d && d.date) || '';
   // 选中的那天：默认今天；跨天预览靠它切换。选中的日期消失了（重排后）就回落今天。
-  if (!state.lifeDay || !plans.some((p) => p.date === state.lifeDay)) state.lifeDay = todayDate;
+  if (!state.lifeDay || !plans.some((p) => p.date === state.lifeDay)) {
+    state.lifeDay = plans.some((p) => p.date === todayDate) ? todayDate : dataDate;
+  }
   const curDay = plans.find((p) => p.date === state.lifeDay) || null;
   const isToday = !!(curDay && curDay.date === todayDate);
   const segs = curDay ? (curDay.segments || []) : ((d && d.timeline) || []);
