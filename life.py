@@ -32,7 +32,7 @@ import random
 import re
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from nekro_agent.core.logger import get_sub_logger
@@ -82,7 +82,10 @@ def _squeeze(text: Any, cap: int = 100) -> str:
 
 
 def _hhmm(minute_of_day: int) -> str:
-    total = int(minute_of_day) % (24 * 60)
+    total = int(minute_of_day)
+    if total == 24 * 60:                 # 一天的收尾写成 24:00，不是 00:00
+        return "24:00"
+    total %= 24 * 60
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
@@ -91,6 +94,9 @@ def _minute(text: str) -> Optional[int]:
     if not m:
         return None
     hour, minute = int(m.group(1)), int(m.group(2))
+    # 24:00 是合法收尾（模型很爱这么写）；24:30 之类不认
+    if hour == 24 and minute == 0:
+        return 24 * 60
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         return None
     return hour * 60 + minute
@@ -619,6 +625,144 @@ URGENT_MARKERS = ("救命", "出事", "紧急", "医院", "受伤", "害怕", "�
 def is_urgent(text: str) -> bool:
     return any(m in str(text or "") for m in URGENT_MARKERS)
 
+
+
+# ---------------- 约定（B4）：她答应过 ta 的事 ----------------
+
+#: 认得出这是"一件答应了的事"
+PROMISE_MARKERS = ("答应", "约好", "说好", "约定", "别忘", "记得", "要还", "要带",
+                   "要交给", "见面", "回消息", "提醒")
+
+#: 相对日期词 → 偏移天数。**不写"下周""月底"这类模糊词**：
+#: 判不准就不提醒，宁可漏一次，也别天天在她耳边念同一件事。
+REL_DAY_WORDS = (("昨天", -1), ("昨日", -1), ("今天", 0), ("今晚", 0), ("今日", 0),
+                  ("明天", 1), ("明日", 1), ("后天", 2))
+
+#: 抽关键词时丢掉的虚词（只用于切词，别拿去过滤抓手）
+_TERM_STOP = set("你我他她它们的了吗呢吧啊呀哦嗯和跟与在是有要会把被给对就都也很还再又才")
+
+#: 抓手（笔记标题）只用轻过滤：标点与语气词。
+#: ⚠️ 这里不能复用 _TERM_STOP ——「还书」的「还」在虚词表里，
+#:    按虚词过滤会把抓手削成一个字，于是"换种说法"永远认不出来。
+_HANDLE_STOP = set("的了呢吧啊呀哦嗯，。！？、~～「」『』（）()【】 \t\n")
+
+
+@dataclass
+class Promise:
+    due: str                 # YYYY-MM-DD
+    text: str                # 原话（截断）
+    terms: List[str] = field(default_factory=list)   # 用来判"用户是不是在提这件事"
+    handle: str = ""         # 短抓手（笔记标题那种两三个字），换种说法也认得出
+
+
+def _shift_date(today: str, days: int) -> str:
+    try:
+        base = datetime.strptime(today, "%Y-%m-%d")
+    except Exception:  # noqa: BLE001
+        return today
+    return (base + timedelta(days=int(days))).strftime("%Y-%m-%d")
+
+
+def promise_terms(text: str, limit: int = 5) -> List[str]:
+    """抽出能代表这件事的关键词：引号里的原话优先，其次去虚词后的 2-4 字片段。"""
+    raw = str(text or "")
+    terms: List[str] = []
+    for quoted in re.findall(r"[「『\"]([^」』\"]{2,20})[」』\"]", raw):
+        terms.append(_squeeze(quoted, 20))
+    body = re.sub(r"[「『\"][^」』\"]*[」』\"]", " ", raw)
+    chunk = ""
+    for ch in body:
+        if ch in _TERM_STOP or not ch.strip():
+            if len(chunk) >= 2:
+                terms.append(chunk)
+            chunk = ""
+            continue
+        chunk += ch
+        if len(chunk) >= 4:
+            terms.append(chunk)
+            chunk = ""
+    if len(chunk) >= 2:
+        terms.append(chunk)
+    out: List[str] = []
+    for t in terms:
+        t = t.strip()
+        if len(t) >= 2 and t not in out:
+            out.append(t)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def extract_promises(items: List[Dict[str, Any]], today: str) -> List[Promise]:
+    """从「笔记 / 事件史」里挑出**带时间**的约定。没有时间的约定一律不收。
+
+    ``items`` 每项可为 ``{"title","content","expire_at"}``。
+    """
+    out: List[Promise] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        title = _squeeze(item.get("title"), 40)
+        content = _squeeze(item.get("content"), 160)
+        text = f"{title}：{content}" if title and content and title not in content else (content or title)
+        if not text or not any(m in text for m in PROMISE_MARKERS):
+            continue
+        # 到期日判定：**先看文本里的时间词**（昨天/今天/明天…），
+        # 再看笔记的 expire_at —— 而且只有它已经到期（≤ 今天）才算数。
+        # ⚠️ 不能把未来的 expire_at 当成到期日：那是"这条笔记什么时候过期"，
+        #    不是"她答应的事什么时候该做"。按前者判，一条挂 48 小时的笔记
+        #    会显示成"后天到期"，从此永远不进提醒。
+        due = ""
+        for word, offset in REL_DAY_WORDS:
+            if word in text:
+                due = _shift_date(today, offset)
+                break
+        if not due:
+            try:
+                expire_at = int(item.get("expire_at") or 0)
+            except (TypeError, ValueError):
+                expire_at = 0
+            if expire_at > 0:
+                stamp = datetime.fromtimestamp(expire_at).strftime("%Y-%m-%d")
+                if stamp <= today:
+                    due = stamp
+        if not due:
+            continue
+        out.append(Promise(due=due, text=_squeeze(text, 80), terms=promise_terms(text),
+                           handle=_squeeze(title, 12) or (promise_terms(text) or [""])[0]))
+    return out
+
+
+def due_promises(promises: List[Promise], today: str) -> List[Promise]:
+    """今天到期的（含已经过期的昨天/更早，逾期更要提）。"""
+    return [p for p in promises or [] if p.due and p.due <= today]
+
+
+def promise_line(promise: Promise) -> str:
+    return f"（你还记着：{_squeeze(promise.text, 60)}——该提就提，别提就算了）"
+
+
+def promise_hit(user_text: str, promise: Promise) -> bool:
+    """用户是不是在提这件事。
+
+    两档判据，宁可漏也别瞎认（认错了会莫名加分，比漏掉更糟）：
+    1. 直接命中某个关键词；
+    2. 换了一种说法 —— 抓手（笔记标题）里的字**大部分**都出现在对方话里。
+       实测对方很少原样重复「把书还给她」，多半说「要还的那本书」，
+       所以第二档是必需的，但门槛要高（至少 2 个字、且占比 ≥60%）。
+    """
+    text = str(user_text or "")
+    if not text or promise is None:
+        return False
+    for term in (promise.terms or []):
+        if len(term) >= 2 and term in text:
+            return True
+    handle = "".join(ch for ch in str(promise.handle or "") if ch.strip() and ch not in _HANDLE_STOP)
+    if len(handle) >= 2:
+        hits = sum(1 for ch in set(handle) if ch in text)
+        if hits >= 2 and hits >= int(0.6 * len(set(handle)) + 0.999):
+            return True
+    return False
 
 # ---------------- 引擎 ----------------
 

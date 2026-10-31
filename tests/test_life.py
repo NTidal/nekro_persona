@@ -97,6 +97,12 @@ class TestBasics(unittest.TestCase):
     def test_squeeze_makes_single_line(self):
         self.assertEqual(L._squeeze("  a\n b\tc  "), "a b c")
 
+    def test_midnight_end_is_valid(self):
+        """回归：24:00 曾被判为非法 → 模型写的最后一段被整段丢掉。"""
+        self.assertEqual(L._minute("24:00"), 24 * 60)
+        self.assertIsNone(L._minute("24:30"))
+        self.assertEqual(L._hhmm(24 * 60), "24:00")
+
     def test_minute_roundtrip(self):
         self.assertEqual(L._minute("09:05"), 545)
         self.assertEqual(L._hhmm(545), "09:05")
@@ -618,6 +624,89 @@ class TestTierVisibility(unittest.TestCase):
         L._BLOCK_CACHE.clear()
         fine = run(eng.block_for("ck1", score=60))
         self.assertNotEqual(coarse, fine)
+
+
+class TestPromises(unittest.TestCase):
+    """B4：约定识别。判不准就不提 —— 宁漏一次，也别天天念同一件事。"""
+
+    TODAY = "2026-06-15"
+
+    def test_terms_prefer_quoted_words(self):
+        terms = L.promise_terms("答应过要「把书还给她」，别忘")
+        self.assertIn("把书还给她", terms)
+
+    def test_terms_drop_filler(self):
+        terms = L.promise_terms("答应明天把照片发过去")
+        self.assertTrue(terms)
+        for t in terms:
+            self.assertFalse(any(ch in t for ch in "的了呢吧啊我你"))
+
+    def test_relative_day_makes_due_date(self):
+        items = [{"title": "还书", "content": "答应明天把书还给她", "expire_at": 0}]
+        got = L.extract_promises(items, self.TODAY)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].due, "2026-06-16")
+
+    def test_expire_at_counts_when_already_expired(self):
+        past = int(datetime(2026, 6, 10, 20, 0).timestamp())
+        items = [{"title": "回消息", "content": "约好回消息", "expire_at": past}]
+        got = L.extract_promises(items, self.TODAY)
+        self.assertEqual(got[0].due, "2026-06-10")
+
+    def test_future_expire_at_is_not_a_due_date(self):
+        """回归：expire_at 是"笔记什么时候过期"，不是"约定该做的时候"。
+        按它判会让一条挂 48 小时的笔记显示成后天到期，从此永不提醒。"""
+        future = int(datetime(2026, 7, 1, 20, 0).timestamp())
+        items = [{"title": "还书", "content": "答应把书还给她", "expire_at": future}]
+        self.assertEqual(L.extract_promises(items, self.TODAY), [])
+
+    def test_no_time_word_is_skipped(self):
+        items = [{"title": "还书", "content": "答应过把书还给她", "expire_at": 0}]
+        self.assertEqual(L.extract_promises(items, self.TODAY), [])
+
+    def test_vague_time_is_skipped(self):
+        items = [{"title": "见面", "content": "说好下周见面", "expire_at": 0}]
+        self.assertEqual(L.extract_promises(items, self.TODAY), [])
+
+    def test_non_promise_is_skipped(self):
+        items = [{"title": "天气", "content": "今天下雨了", "expire_at": 0}]
+        self.assertEqual(L.extract_promises(items, self.TODAY), [])
+
+    def test_due_includes_overdue(self):
+        past = int(datetime(2026, 6, 14, 20, 0).timestamp())
+        items = [
+            {"title": "a", "content": "答应把东西给她", "expire_at": past},
+            {"title": "b", "content": "答应明天把东西给她", "expire_at": 0},
+        ]
+        promises = L.extract_promises(items, self.TODAY)
+        due = L.due_promises(promises, self.TODAY)
+        self.assertEqual([p.text[:1] for p in due], ["a"])
+
+    def test_yesterday_counts_as_overdue(self):
+        items = [{"title": "还书", "content": "答应昨天把书还给她", "expire_at": 0}]
+        got = L.extract_promises(items, self.TODAY)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].due, "2026-06-14")
+
+    def test_line_is_soft(self):
+        p = L.Promise(due=self.TODAY, text="答应明天把书还给她", terms=["把书还给她"])
+        line = L.promise_line(p)
+        self.assertIn("你还记着", line)
+        self.assertIn("别提就算了", line, "提醒不能变成催办")
+
+    def test_hit_matches_terms(self):
+        p = L.Promise(due=self.TODAY, text="答应明天把书还给她", terms=["把书还给她"], handle="还书")
+        self.assertTrue(L.promise_hit("你不是说要把书还给她吗", p))
+        self.assertFalse(L.promise_hit("今天天气不错", p))
+
+    def test_hit_accepts_paraphrase(self):
+        """实测对方很少原样重复原话，多半说「要还的那本书」。"""
+        p = L.Promise(due=self.TODAY, text="答应昨天把那本借的书还给她", terms=["答应", "昨天"], handle="还书")
+        self.assertTrue(L.promise_hit("上次说要还的那本书，你还记着吗", p))
+
+    def test_hit_rejects_loose_overlap(self):
+        p = L.Promise(due=self.TODAY, text="答应把围巾还给她", terms=["围巾"], handle="围巾还她")
+        self.assertFalse(L.promise_hit("今天书店人好多", p))
 
 
 class TestAttach(unittest.TestCase):

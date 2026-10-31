@@ -840,6 +840,26 @@ class FavorabilityConfig(ConfigBase):
         "追加给生成器的风格约束，例如「不安排上班场景」。留空则不加。",
         en_title="Plan Style Hint", en_desc="Extra style constraint for plan generation",
     )
+    PROMISE_ENABLED: bool = _fav_field(
+        True, "启用「约定」跟进",
+        "在她答应过的事到期当天，往上下文里放一句提醒；对方主动提起这件事时记一点好感度。"
+        "只认带时间的约定（今天/今晚/明天/后天，或笔记上挂了到期时间），"
+        "「下周」「月底」这类模糊说法不提醒。",
+        en_title="Enable Promise Follow-up",
+        en_desc="Remind her of dated promises and reward when the user brings it up",
+    )
+    PROMISE_BONUS: int = _fav_field(
+        2, "对方主动提起约定时的加分",
+        "对方记得并主动提起她答应过的事 —— 记一点长期关系分。范围 0-5；0 = 只提醒不记分。",
+        en_title="Promise Bonus", en_desc="Favorability granted when the user raises a due promise",
+        ge=0, le=5,
+    )
+    PROMISE_MIN_SCORE: int = _fav_field(
+        20, "记约定分的最低关系分",
+        "还不熟的时候，对方提约定更像在催事，不算维护关系 —— 低于这个分数只提醒、不记分。",
+        en_title="Promise Min Score", en_desc="Only grant promise bonus above this score",
+        ge=0, le=100,
+    )
     LIFE_INJECT_ENABLED: bool = _fav_field(
         True, "把生活状态注入对话",
         "关闭后只生成不注入（数据仍可在 WebUI 查看）。仅在「启用生活时间轴」打开时有效。"
@@ -3958,6 +3978,75 @@ async def sync_user_profile(_ctx: schemas.AgentCtx, message: ChatMessage):
     return None
 
 
+async def _promise_note(_ctx: schemas.AgentCtx, state, profile, recent_text: str) -> str:
+    """「约定」跟进（B4）：到期提醒 + 对方主动提起时记一点分。
+
+    设计上刻意保守：
+    - 只认**带时间**的约定，判不准就不提（宁漏不扰）
+    - **失约不自动扣分** —— 那是关系事件，该由模型按当时的语境决定，
+      系统臆测"她今天忘了"只会制造莫名其妙的负分
+    - 加分只管「对方主动提起」这一种明确信号，且有最低关系分与每日一次的门槛
+    """
+    try:
+        if not bool(getattr(config, "PROMISE_ENABLED", True)):
+            return ""
+        chat_key = _ctx.chat_key
+        today = persona_life._today()
+        items: List[Dict[str, Any]] = []
+        try:
+            doc = await tier4.open_tier4()
+            for entry in doc.entries:
+                if entry.kind != tier4.NOTE_KIND or entry.scope != chat_key:
+                    continue
+                if entry.is_expired():
+                    continue
+                items.append({"title": entry.title, "content": entry.content,
+                              "expire_at": int(entry.expire_at or 0)})
+        except Exception as exc:  # noqa: BLE001
+            plugin.logger.debug(f"[persona] 读取笔记失败（约定跟进跳过其来源）: {exc}")
+        try:
+            for item in await persona_memlog.list_entries(chat_key):
+                items.append({"title": item.title, "content": item.content, "expire_at": 0})
+        except Exception as exc:  # noqa: BLE001
+            plugin.logger.debug(f"[persona] 读取关系记忆失败（约定跟进跳过其来源）: {exc}")
+        if not items:
+            return ""
+
+        due = persona_life.due_promises(
+            persona_life.extract_promises(items, today), today)
+        if not due:
+            return ""
+        promise = due[0]
+        plugin.logger.info(f"[persona] 约定提醒：{chat_key} 「{promise.text[:32]}」到期 {promise.due}")
+
+        bonus = int(getattr(config, "PROMISE_BONUS", 2) or 0)
+        min_score = int(getattr(config, "PROMISE_MIN_SCORE", 20) or 0)
+        if bonus > 0 and profile is not None and int(profile.score) >= min_score \
+                and persona_life.promise_hit(recent_text, promise):
+            # 今天已经记过约定分就不再记（一天最多一次，避免"提一次加一次"）
+            _already = any(
+                str(getattr(e, "kind", "")) == "promise"
+                and _day_start_ts(int(getattr(e, "timestamp", 0) or 0)) == _day_start_ts(_ts_now())
+                for e in (profile.recent_events or [])
+            )
+            if not _already:
+                now = _ts_now()
+                profile.decay_mood(now)
+                # nudge 自带事件流且支持 kind —— 直接标成 promise，
+                # 不要再手工 append 一条：同一笔分会变成 manual + promise 两条，日后对账对不上。
+                profile.nudge(bonus, f"对方主动提起约定「{promise.text[:40]}」",
+                              tags=["约定"], kind="promise")
+                profile.record_adjust(bonus, now)
+                state.last_active_user_id = profile.user_id
+                await _store_archive(chat_key, state)
+                plugin.logger.info(
+                    f"[persona] 约定加分：user={profile.user_id} +{bonus} → {int(profile.score)}")
+        return persona_life.promise_line(promise)
+    except Exception as exc:  # noqa: BLE001
+        plugin.logger.warning(f"[persona] 约定跟进失败（本轮跳过）: {exc}")
+        return ""
+
+
 @plugin.mount_prompt_inject_method("persona_prompt")
 async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
     """统一注入：关系卡 + 阶梯记忆（含好感度门控）+ 好感度增减参考。
@@ -4058,6 +4147,18 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
             )
     except Exception as e:  # noqa: BLE001
         plugin.logger.warning(f"[persona] tier4 块渲染失败，本轮跳过: {e}")
+
+    # ③b 约定跟进（她答应过 ta 的事）
+    # 与 ③ 分开的一小段：生活状态是背景，约定是「欠着的事」，不能混在一起说。
+    try:
+        _promise = await _promise_note(
+            _ctx, state, profile,
+            await persona_memory._recent_text(_ctx),
+        )
+        if _promise:
+            parts.append(_promise)
+    except Exception as e:  # noqa: BLE001
+        plugin.logger.warning(f"[persona] 约定跟进注入失败，本轮跳过: {e}")
 
     # ⑤ 关系记忆（memory_log · 系统自动沉淀的事件史）
     # 与 ③ 的 tier4 note 分工不同：note 是角色自己记的功能小抄（模型主动写），
