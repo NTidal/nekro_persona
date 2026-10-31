@@ -829,6 +829,13 @@ class FavorabilityConfig(ConfigBase):
         en_title="Max Plan Segments", en_desc="Upper bound of daily plan segments",
         ge=3, le=20,
     )
+    LIFE_PLAN_HORIZON: int = _fav_field(
+        1, "一次排几天日程",
+        "1 = 每天现排（默认）；3 = 一次排三天（省调用、日子更连贯，但第三天可能已和实际脱节）。"
+        "可填 1-7。改动后会在下一次跨天或补齐时生效。",
+        en_title="Plan Horizon (days)", en_desc="1 = daily, 3 = three days per generation (1-7)",
+        ge=1, le=7,
+    )
     LIFE_BLOCK_CAP: int = _fav_field(
         380, "注入块正文上限（字符）",
         "生活状态注入正文的硬上限，超出截断；尾注不计入。",
@@ -1352,7 +1359,8 @@ async def _life_write(key: str, value) -> None:
                                  value=json.dumps(value, ensure_ascii=False))
 
 
-async def _life_ask(prompt: str, *, system: str, task: str = "") -> str:
+async def _life_ask(prompt: str, *, system: str, task: str = "",
+                    max_tokens: Optional[int] = None) -> str:
     """日程 / 梦境的一次性模型调用：独立于对话回合，不经过 agent。"""
     from nekro_agent.core.config import config as _na_cfg
     from nekro_agent.services.agent.openai import gen_openai_chat_response
@@ -1368,7 +1376,7 @@ async def _life_ask(prompt: str, *, system: str, task: str = "") -> str:
         api_key=group.API_KEY,
         base_url=group.BASE_URL,
         temperature=0.85,
-        max_tokens=2600,
+        max_tokens=int(max_tokens or 2600),
         max_wait_time=120,
     )
     return resp.response_content or ""

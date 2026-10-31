@@ -36,6 +36,7 @@ class FakeConfig:
         self.LIFE_BLOCK_CAP = over.get("LIFE_BLOCK_CAP", 380)
         self.LIFE_PLAN_STYLE_HINT = over.get("LIFE_PLAN_STYLE_HINT", "")
         self.LIFE_INJECT_ENABLED = over.get("LIFE_INJECT_ENABLED", True)
+        self.LIFE_PLAN_HORIZON = over.get("LIFE_PLAN_HORIZON", 1)
 
 
 class FakeStore:
@@ -60,7 +61,7 @@ def make_engine(*, reply=None, cfg=None, store=None):
     store = store or FakeStore()
     calls = []
 
-    async def ask(prompt, *, system="", task=""):
+    async def ask(prompt, *, system="", task="", max_tokens=None):
         calls.append(task)
         return reply(prompt) if callable(reply) else reply
 
@@ -189,6 +190,22 @@ class TestCoverageMath(unittest.TestCase):
         """回归：gap == 0 的相邻段曾被一并合并，导致整份日程塌成一段。"""
         segs = [L.Segment(0, 480, "睡"), L.Segment(480, 900, "起来"), L.Segment(900, 1440, "待着")]
         self.assertEqual(len(L.repair_plan(segs)), 3)
+
+
+class TestRepairNightGap(unittest.TestCase):
+    """模型从早上开排（漏掉夜里）时，补一段睡觉，而不是把整份日程作废。"""
+
+    def test_leading_gap_is_filled_with_sleep(self):
+        segs = [L.Segment(8 * 60 + 10, 12 * 60, "起床做事", "平平的"),
+                L.Segment(12 * 60, 18 * 60, "继续", "松"),
+                L.Segment(18 * 60, 24 * 60, "收尾", "安宁")]
+        ok, why = L.validate_plan(segs)
+        self.assertFalse(ok, "原样应当不合格（开头缺 490 分钟）")
+        fixed = L.repair_plan(segs)
+        ok2, why2 = L.validate_plan(fixed)
+        self.assertTrue(ok2, why2)
+        self.assertEqual(fixed[0].start, 0, "第一段应当从 00:00 开始")
+        self.assertIn("睡", fixed[0].doing)
 
 
 class TestRepair(unittest.TestCase):
@@ -707,6 +724,140 @@ class TestPromises(unittest.TestCase):
     def test_hit_rejects_loose_overlap(self):
         p = L.Promise(due=self.TODAY, text="答应把围巾还给她", terms=["围巾"], handle="围巾还她")
         self.assertFalse(L.promise_hit("今天书店人好多", p))
+
+
+class TestHorizon(unittest.TestCase):
+    """多日日程：一次排 N 天，逐日校验，缺哪天补哪天。"""
+
+    def _multi_reply(self, dates, *, bad_day=None):
+        days = []
+        for day in dates:
+            segs = [{"window": "00:00-07:30", "doing": "睡着", "feel": "沉"},
+                    {"window": "07:30-12:00", "doing": "醒着做事", "feel": "平平的"},
+                    {"window": "12:00-18:00", "doing": "继续", "feel": "松"},
+                    {"window": "18:00-24:00", "doing": "收尾", "feel": "安宁"}]
+            if day == bad_day:
+                segs = segs[:1]          # 只有一段 → 必然不合格
+            days.append({"date": day, "summary": f"{day} 的一天", "segments": segs})
+        return json.dumps({"days": days}, ensure_ascii=False)
+
+    def test_horizon_three_fills_three_days(self):
+        today = L._today()
+        dates = [L._shift_date(today, i) for i in range(3)]
+        store = FakeStore()
+        engine, _, _ = make_engine(reply=self._multi_reply(dates),
+                                   cfg=FakeConfig(LIFE_PLAN_HORIZON=3), store=store)
+        state = run(engine.ensure_today())
+        self.assertEqual(sorted(state.plans), sorted(dates))
+        for day, plan in state.plans.items():
+            ok, why = L.validate_plan(plan.segments)
+            self.assertTrue(ok, f"{day}: {why}")
+            self.assertEqual(plan.source, "model")
+
+    def test_horizon_does_not_regenerate_same_day(self):
+        today = L._today()
+        dates = [L._shift_date(today, i) for i in range(3)]
+        store = FakeStore()
+        engine, _, calls = make_engine(reply=self._multi_reply(dates),
+                                       cfg=FakeConfig(LIFE_PLAN_HORIZON=3), store=store)
+        run(engine.ensure_today())
+        writes = store.writes
+        plan_calls = len([c for c in calls if c.startswith("life_plan")])
+        run(engine.ensure_today())
+        self.assertEqual(store.writes, writes, "同一天不该重复生成")
+        self.assertEqual(len([c for c in calls if c.startswith("life_plan")]), plan_calls)
+
+    def test_bad_day_falls_back_alone(self):
+        today = L._today()
+        dates = [L._shift_date(today, i) for i in range(3)]
+        engine, _, _ = make_engine(reply=self._multi_reply(dates, bad_day=dates[1]),
+                                   cfg=FakeConfig(LIFE_PLAN_HORIZON=3))
+        state = run(engine.ensure_today())
+        self.assertEqual(state.plans[dates[0]].source, "model")
+        self.assertEqual(state.plans[dates[1]].source, "template", "坏的那天单独兜底")
+        self.assertEqual(state.plans[dates[2]].source, "model")
+
+    def test_single_day_format_still_works_with_horizon_one(self):
+        engine, _, _ = make_engine(reply=good_plan_json(), cfg=FakeConfig(LIFE_PLAN_HORIZON=1))
+        state = run(engine.ensure_today())
+        self.assertEqual(list(state.plans), [L._today()])
+        self.assertEqual(state.plans[L._today()].source, "model")
+
+    def test_topup_only_generates_missing_day(self):
+        today = L._today()
+        tomorrow = L._shift_date(today, 1)
+        store = FakeStore()
+        engine, _, _ = make_engine(reply=self._multi_reply([tomorrow]),
+                                   cfg=FakeConfig(LIFE_PLAN_HORIZON=2), store=store)
+        seeded = L.DayState(date=today, plans={today: L.template_plan()},
+                            vitals=L.Vitals(60, "平静"))
+        store.data[L.STATE_KEY] = json.dumps(seeded.to_json(), ensure_ascii=False)
+        state = run(engine.ensure_today())
+        self.assertIn(today, state.plans)
+        self.assertIn(tomorrow, state.plans)
+        self.assertEqual(state.plans[tomorrow].source, "model")
+
+    def test_old_days_are_pruned(self):
+        today = L._today()
+        old = L._shift_date(today, -5)
+        store = FakeStore()
+        engine, _, _ = make_engine(reply=good_plan_json(), store=store)
+        seeded = L.DayState(date=today,
+                            plans={old: L.template_plan(), today: L.template_plan()},
+                            vitals=L.Vitals(60, "平静"))
+        store.data[L.STATE_KEY] = json.dumps(seeded.to_json(), ensure_ascii=False)
+        state = run(engine.ensure_today())
+        self.assertNotIn(old, state.plans, "更早的骨架应当被裁掉")
+
+    def test_legacy_single_plan_is_migrated(self):
+        today = L._today()
+        legacy = {"date": today, "plan": L.template_plan().to_json(), "recent": []}
+        state = L.DayState.from_json(legacy)
+        self.assertIn(today, state.plans)
+        self.assertEqual(state.plan.source, "template")
+
+    def test_token_budget_scales_with_days(self):
+        engine, _, _ = make_engine()
+        self.assertLess(engine._plan_tokens(1), engine._plan_tokens(3))
+        self.assertLessEqual(engine._plan_tokens(7), 4096)
+
+    def test_render_uses_today_not_last_day(self):
+        today = L._today()
+        dates = [L._shift_date(today, i) for i in range(3)]
+        engine, _, _ = make_engine(reply=self._multi_reply(dates),
+                                   cfg=FakeConfig(LIFE_PLAN_HORIZON=3))
+        state = run(engine.ensure_today())
+        state.plans[dates[0]].summary = "今天的底色"
+        text = engine.render(state, score=60)
+        self.assertIn("今天的底色", text)
+
+
+class TestSalvage(unittest.TestCase):
+    """被 max_tokens 截断时，完整的那几天必须还能用。"""
+
+    def test_extract_complete_days_only(self):
+        raw = ('{"days": [{"date": "2026-11-01", "summary": "a", "segments": [{"window": "00:00-24:00", '
+               '"doing": "x", "feel": "y"}]}, {"date": "2026-11-02", "summary": "b", "segments": [{"window": '
+               '"00:00-24:00", "doing": "x", "feel": "y"}]}, {"date": "2026-11-03", "summary": "c", "segr')
+        got = L.extract_day_objects(raw)
+        self.assertEqual([d["date"] for d in got], ["2026-11-01", "2026-11-02"])
+
+    def test_truncated_third_day_falls_back_alone(self):
+        today = L._today()
+        dates = [L._shift_date(today, i) for i in range(3)]
+        good = []
+        for day in dates[:2]:
+            good.append('{"date": "%s", "summary": "s", "segments": ['
+                        '{"window": "00:00-07:30", "doing": "睡着", "feel": "沉"},'
+                        '{"window": "07:30-12:00", "doing": "醒着", "feel": "平平的"},'
+                        '{"window": "12:00-18:00", "doing": "做事", "feel": "松"},'
+                        '{"window": "18:00-24:00", "doing": "收尾", "feel": "安宁"}]}' % day)
+        raw = '{"days": [' + ",".join(good) + ', {"date": "%s", "summary": "s", "segr' % dates[2]
+        engine, _, _ = make_engine(reply=raw, cfg=FakeConfig(LIFE_PLAN_HORIZON=3))
+        state = run(engine.ensure_today())
+        self.assertEqual(state.plans[dates[0]].source, "model")
+        self.assertEqual(state.plans[dates[1]].source, "model")
+        self.assertEqual(state.plans[dates[2]].source, "template")
 
 
 class TestAttach(unittest.TestCase):

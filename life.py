@@ -387,16 +387,51 @@ class Card:
 
 @dataclass
 class DayState:
-    date: str = ""
-    plan: Optional[DayPlan] = None
+    """一天以上的生活状态。
+
+    ``plans`` 以日期为键，可以同时存今天与后几天的骨架（``LIFE_PLAN_HORIZON``）。
+    ``plan`` 是「今天那份」的读写别名 —— 上层（渲染 / 当前时段 / 梦境）不必关心
+    一次排了几天，只关心今天。
+    """
+
+    date: str = ""                       # 今天（滚动指针）
+    plans: Dict[str, DayPlan] = field(default_factory=dict)
     vitals: Optional[Vitals] = None
     dream: Optional[Dream] = None
     card: Optional[Card] = None
     recent: List[Dict[str, Any]] = field(default_factory=list)   # 最近几天骨架，给"别重复"用
 
+    def __init__(self, date: str = "", plans: Optional[Dict[str, DayPlan]] = None,
+                 vitals: Optional[Vitals] = None, dream: Optional[Dream] = None,
+                 card: Optional[Card] = None, recent: Optional[List[Dict[str, Any]]] = None,
+                 plan: Optional[DayPlan] = None):
+        # 手写 __init__ 而不是让 dataclass 生成：老调用点（含测试）还在写 ``plan=``，
+        # 那是「今天这份」的简写，等价于 plans[date]=plan。
+        self.date = str(date or "")
+        self.plans = dict(plans or {})
+        self.vitals = vitals
+        self.dream = dream
+        self.card = card
+        self.recent = list(recent or [])
+        if plan is not None and self.date:
+            self.plans[self.date] = plan
+
+    @property
+    def plan(self) -> Optional[DayPlan]:
+        return self.plans.get(self.date)
+
+    @plan.setter
+    def plan(self, value: Optional[DayPlan]) -> None:
+        if value is None:
+            self.plans.pop(self.date, None)
+        else:
+            self.plans[self.date] = value
+
     def to_json(self) -> Dict[str, Any]:
         return {
             "date": self.date,
+            "plans": {d: p.to_json() for d, p in self.plans.items() if p is not None},
+            # 兼容：老版本只认 "plan"，写一份今天的进去，回退旧代码时也读得懂
             "plan": self.plan.to_json() if self.plan else None,
             "vitals": self.vitals.to_json() if self.vitals else None,
             "dream": self.dream.to_json() if self.dream else None,
@@ -408,15 +443,74 @@ class DayState:
     def from_json(raw: Any) -> "DayState":
         if not isinstance(raw, dict):
             return DayState()
+        date_key = str(raw.get("date") or "")
+        plans: Dict[str, DayPlan] = {}
+        for day, item in (raw.get("plans") or {}).items():
+            plan = DayPlan.from_json(item)
+            if plan is not None and str(day):
+                plans[str(day)] = plan
+        if not plans:
+            # 旧数据：只有单日 "plan"，归到 state.date 名下
+            legacy = DayPlan.from_json(raw.get("plan"))
+            if legacy is not None and date_key:
+                plans[date_key] = legacy
         return DayState(
-            date=str(raw.get("date") or ""),
-            plan=DayPlan.from_json(raw.get("plan")),
+            date=date_key,
+            plans=plans,
             vitals=Vitals.from_json(raw.get("vitals")),
             dream=Dream.from_json(raw.get("dream")),
             card=Card.from_json(raw.get("card")),
             recent=[r for r in (raw.get("recent") or []) if isinstance(r, dict)],
         )
 
+
+
+def extract_day_objects(raw: str) -> List[Dict[str, Any]]:
+    """从（可能被截断的）多日输出里，切出**每个完整的** day 对象。
+
+    为什么需要：三天一批的输出有 3-6k 字，模型撞上 max_tokens 会被拦腰截断。
+    没有这一步，一次截断就丢掉全部三天（都退兜底模板）；有了它，
+    完整的前两天照样能用，只有被截断的那天走兜底。
+    """
+    text = str(raw or "")
+    out: List[Dict[str, Any]] = []
+    i = 0
+    while True:
+        start = text.find('{"date"', i)
+        if start == -1:
+            start = text.find('{ "date"', i)
+        if start == -1:
+            break
+        depth, j, in_str, esc = 0, start, False, False
+        while j < len(text):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            j += 1
+        if depth != 0:
+            break                      # 这个对象没闭合 → 后面都不用看了
+        try:
+            item = json.loads(text[start:j + 1])
+        except Exception:              # noqa: BLE001
+            item = None
+        if isinstance(item, dict):
+            out.append(item)
+        i = j + 1
+    return out
 
 # ---------------- 校验与修补 ----------------
 
@@ -452,6 +546,14 @@ def repair_plan(segments: List[Segment]) -> List[Segment]:
     if len(usable) < 3:
         return []
     usable.sort(key=lambda s: s.start)
+    # 夜里那一段模型经常漏掉（它习惯从早上开排）。补上而不是整份作废：
+    # 「00:00-08:10 在睡」是事实，不是编造。
+    if usable and usable[0].start > 0:
+        head_end = usable[0].start
+        usable.insert(0, Segment(0, head_end, "睡着，夜里偶尔翻个身", "沉"))
+    if usable and usable[-1].end < 24 * 60:
+        usable.append(Segment(usable[-1].end, 24 * 60, "睡下了，等这一天过去", "安宁"))
+
     merged: List[Segment] = []
     for seg in usable:
         # 只接「真正的小缝」（0 < 空档 ≤ 15 分钟）。
@@ -890,10 +992,17 @@ class Engine:
         return None
 
     # ---- 模型调用 ----
-    async def _ask_model(self, prompt: str, *, system: str, task: str) -> Optional[str]:
+    async def _ask_model(self, prompt: str, *, system: str, task: str,
+                         max_tokens: Optional[int] = None) -> Optional[str]:
         if self._ask is None:
             return None
         try:
+            if max_tokens:
+                try:
+                    return await self._ask(prompt, system=system, task=task, max_tokens=max_tokens)
+                except TypeError:
+                    # 注入的 ask 实现不认识 max_tokens（测试替身/旧装配）→ 退回默认预算
+                    pass
             return await self._ask(prompt, system=system, task=task)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[life] 模型调用失败（{task}）: {exc!r}")
@@ -907,11 +1016,31 @@ class Engine:
         except Exception:  # noqa: BLE001
             return ""
 
-    # ---- 生成日程 ----
-    async def rebuild_plan(self, state: DayState, *, reason: str = "") -> DayState:
-        date_key = _today()
-        if not (state.card and state.card.date == date_key):
-            card, hist = self.roll_card(date_key, await self.load_history())
+    # ---- 生成日程（可一次排多天）----
+    def _horizon(self) -> int:
+        """一次排几天。1 = 逐日（默认）；3 = 三天一批。"""
+        try:
+            n = int(self._cfg("LIFE_PLAN_HORIZON", 1) or 1)
+        except (TypeError, ValueError):
+            n = 1
+        return max(1, min(7, n))
+
+    def _plan_tokens(self, days: int) -> int:
+        """按天数给输出预算。
+
+        一天 12-18 段大约 2.6k 输出 token；多天不是简单线性 —— 每天的段数会收敛
+        （见 ``_plan_prompt``），但摘要与 JSON 开销还在，所以按 1500/天 给余量。
+        """
+        # ⚠️ 上限压到 4096：实测把 max_tokens 抬到 6000 时供应商直接返回
+        #    "非流式响应内容为空"，比截断更糟（连抢救都没得救）。
+        return max(2000, min(4096, 1200 + 1100 * max(1, days)))
+
+    async def rebuild_plans(self, state: DayState, dates: List[str], *, reason: str = "") -> DayState:
+        if not dates:
+            return state
+        today = _today()
+        if not (state.card and state.card.date == today):
+            card, hist = self.roll_card(today, await self.load_history())
             await self.save_history(hist)
             state.card = card
 
@@ -919,37 +1048,64 @@ class Engine:
         hi = max(lo, min(PLAN_MAX_SEGMENTS, int(self._cfg("LIFE_PLAN_MAX_SEGMENTS", PLAN_MAX_SEGMENTS))))
         persona = await self._persona_text()
         system = (
-            "你在替一个角色安排今天。她的设定如下，日子要贴着这个设定过。\n"
+            "你在替一个角色安排日子。她的设定如下，日子要贴着这个设定过。\n"
             f"【角色】\n{persona or '（设定缺失，按作息规律、生活平淡的普通人来写）'}"
         )
-        raw = await self._ask_model(self._plan_prompt(state, lo, hi), system=system,
-                                    task=f"life_plan{':' + reason if reason else ''}")
-        plan = self._parse_plan(raw or "", hi)
-        if plan is not None:
-            ok, why = validate_plan(plan.segments)
-            if not ok:
-                logger.info(f"[life] 日程不合格（{why}），尝试修补")
-                fixed = repair_plan(plan.segments)
-                if fixed and validate_plan(fixed)[0]:
-                    plan = DayPlan(plan.summary, fixed, source="repaired")
-                else:
-                    plan = None
-        if plan is None:
-            logger.warning("[life] 今日日程走兜底模板（模型不可用或输出不可用）")
-            plan = template_plan()
+        if len(dates) > 1:
+            # 多日时每天段数收敛：3 天 × 18 段塞不进 4096 的输出预算，
+            # 被截断（甚至返回空）就全退兜底。6-10 段足够表达"此刻在做什么"。
+            lo = max(5, lo - 6)
+            hi = max(lo, min(10, hi - 8))
+        raw = await self._ask_model(
+            self._plan_prompt(state, lo, hi, dates), system=system,
+            task=f"life_plan{':' + reason if reason else ''}:{len(dates)}d",
+            max_tokens=self._plan_tokens(len(dates)),
+        )
+        parsed = self._parse_plans(raw or "", dates, hi)
 
-        state.plan = plan
-        state.date = date_key
-        state.recent = (state.recent + [{"date": date_key,
-                                         "doings": [s.doing for s in plan.segments]}])[-7:]
+        for day in dates:
+            plan = parsed.get(day)
+            if plan is not None:
+                ok, why = validate_plan(plan.segments)
+                if not ok:
+                    logger.info(f"[life] {day} 日程不合格（{why}），尝试修补")
+                    fixed = repair_plan(plan.segments)
+                    plan = DayPlan(plan.summary, fixed, source="repaired") \
+                        if fixed and validate_plan(fixed)[0] else None
+            if plan is None:
+                logger.warning(f"[life] {day} 日程走兜底模板（模型不可用或输出不可用）")
+                plan = template_plan()
+            state.plans[day] = plan
+            state.recent = (state.recent + [{"date": day,
+                                             "doings": [s.doing for s in plan.segments]}])[-7:]
+
+        state.date = today
         if state.vitals is None:
-            state.vitals = self.seed_vitals(state, date_key)
+            state.vitals = self.seed_vitals(state, today)
         await self.save(state)
         return state
 
-    def _plan_prompt(self, state: DayState, lo: int, hi: int) -> str:
+    async def rebuild_plan(self, state: DayState, *, reason: str = "") -> DayState:
+        """单日包装（保持旧调用点与测试不变）。"""
+        return await self.rebuild_plans(state, [_today()], reason=reason)
+
+    def _plan_prompt(self, state: DayState, lo: int, hi: int,
+                     dates: Optional[List[str]] = None) -> str:
+        dates = dates or [_today()]
         card = state.card
-        lines = ["把今天排出来。要求如下。", "", f"今天：{day_label()}"]
+        multi = len(dates) > 1
+        lines = [f"把接下来 {len(dates)} 天排出来。要求如下。" if multi else "把今天排出来。要求如下。", ""]
+        if multi:
+            lines.append("这几天是同一个人连续的日子，要像一条线：可以埋下铺垫"
+                         "（今天累了、明天缓过来），但**不要每天各写各的**。")
+            for day in dates:
+                try:
+                    short = day_label(datetime.strptime(day, "%Y-%m-%d")).rsplit(" ", 1)[0]
+                except Exception:  # noqa: BLE001
+                    short = day
+                lines.append(f"· {day}（{short}）")
+        else:
+            lines.append(f"今天：{day_label()}")
         if card is not None:
             lines.append(f"在哪过：{card.scene_name}。{card.constraint}")
             if card.interludes:
@@ -972,17 +1128,61 @@ class Engine:
             "整天里至少有两三段是松快的，不要全写成没力气、发闷。",
             "summary 用一句话说今天的底色，口语。",
             "",
-            '只回 JSON，不要解释：'
-            '{"summary": "...", "segments": [{"window": "HH:MM-HH:MM", "doing": "...", "feel": "..."}]}',
         ]
+        if multi:
+            lines += [
+                "",
+                f"每天都要排满一整天：**第一段必须从 00:00 开始，最后一段到 24:00 结束**"
+                f"（夜里那段也要写，别从早上开排）；各自独立但前后呼应；"
+                f"每天 {lo}-{hi} 段，段长不要平均分；doing 一句话说完，别铺陈。",
+                '只回 JSON，不要解释：{"days": [{"date": "YYYY-MM-DD", "summary": "...", '
+                '"segments": [{"window": "HH:MM-HH:MM", "doing": "...", "feel": "..."}]}]}',
+            ]
+        else:
+            lines.append('只回 JSON，不要解释：'
+                         '{"summary": "...", "segments": [{"window": "HH:MM-HH:MM", '
+                         '"doing": "...", "feel": "..."}]}')
         return "\n".join(lines)
 
-    def _parse_plan(self, raw: str, hi: int) -> Optional[DayPlan]:
+    def _parse_plans(self, raw: str, dates: List[str], hi: int) -> Dict[str, DayPlan]:
+        """把模型输出拆成 {date: DayPlan}。缺的日期不补 —— 由调用方兜底。"""
         payload = _loose_json(raw)
         if not isinstance(payload, dict):
-            # 留证据：短输出=模型没听话，长输出被 max_tokens 截断=参数不够。
-            # 没有这两行，日志里只剩一句"模型不可用"，排查等于瞎猜。
-            logger.warning(f"[life] 日程 JSON 不可用：原始 {len(raw)} 字，开头 {raw[:80]!r}，结尾 {raw[-60:]!r}")
+            # 整体 JSON 坏了（多半是被 max_tokens 截断）→ 抢救完整的那几天
+            salvaged = extract_day_objects(raw)
+            out: Dict[str, DayPlan] = {}
+            for item in salvaged:
+                day = _squeeze(item.get("date") or "", 10)
+                if day not in dates:
+                    continue
+                plan = self._parse_one(item, hi)
+                if plan is not None:
+                    out[day] = plan
+            logger.warning(
+                f"[life] 日程 JSON 不完整（原始 {len(raw)} 字，结尾 {raw[-40:]!r}）→ "
+                f"抢救出 {len(out)}/{len(dates)} 天：{', '.join(sorted(out)) or '无'}")
+            return out
+        items = payload.get("days")
+        out: Dict[str, DayPlan] = {}
+        if isinstance(items, list) and items:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                day = _squeeze(item.get("date") or "", 10)
+                if day not in dates:
+                    continue
+                plan = self._parse_one(item, hi)
+                if plan is not None:
+                    out[day] = plan
+            return out
+        # 单日格式（模型没按多日输出）：只认第一天的
+        single = self._parse_one(payload, hi)
+        if single is not None and dates:
+            out[dates[0]] = single
+        return out
+
+    def _parse_one(self, payload: Dict[str, Any], hi: int) -> Optional[DayPlan]:
+        if not isinstance(payload, dict):
             return None
         segments: List[Segment] = []
         for item in payload.get("segments") or payload.get("events") or []:
@@ -1002,11 +1202,18 @@ class Engine:
             segments.append(Segment(start, end if end > start else end + 24 * 60, doing,
                                     _squeeze(item.get("feel") or item.get("mood"), 24)))
         if len(segments) < 3:
-            logger.warning(f"[life] 日程段数不足（{len(segments)} 段），原始 {len(raw)} 字")
+            logger.warning(f"[life] 日程段数不足（{len(segments)} 段），单日 JSON {len(payload)} 键")
             return None
         segments.sort(key=lambda s: s.start)
         return DayPlan(_squeeze(payload.get("summary"), 80) or "普通的一天",
                        segments[:hi], source="model")
+
+    def _parse_plan(self, raw: str, hi: int) -> Optional[DayPlan]:
+        """单日包装（旧调用点与测试用）。"""
+        payload = _loose_json(raw)
+        if not isinstance(payload, dict):
+            return None
+        return self._parse_one(payload, hi)
 
     # ---- 生成梦境 ----
     async def rebuild_dream(self, state: DayState) -> DayState:
@@ -1038,23 +1245,49 @@ class Engine:
 
     # ---- 跨天滚动 ----
     async def ensure_today(self) -> DayState:
-        """保证状态是今天的：跨天时依次滚「梦 → 日程 → 手感」。永不抛异常。"""
-        date_key = _today()
+        """保证「今天」以及后几天（LIFE_PLAN_HORIZON）都有骨架。永不抛异常。
+
+        跨天时依次滚「梦 → 日程 → 手感」；同一天内只补缺失的日期（top-up），
+        不重排已有的那天 —— 否则每来一条消息都可能把今天重写一遍。
+        """
+        today = _today()
+        horizon = self._horizon()
+        need = [_shift_date(today, i) for i in range(horizon)]
+
+        keep_from = _shift_date(today, -1)
+
+        def _ready(st: DayState) -> bool:
+            # 除了「今天有骨架、未来几天齐了」，还要求没有过期的旧骨架 ——
+            # 否则快路径会一直命中，裁剪永远轮不到执行。
+            return (st.date == today and st.plan is not None
+                    and all(d in st.plans for d in need)
+                    and all(d >= keep_from for d in st.plans))
+
         state = await self.load()
-        if state.date == date_key and state.plan is not None:
+        if _ready(state):
             return state
         async with self._lock:
             state = await self.load()
-            if state.date == date_key and state.plan is not None:
+            if _ready(state):
                 return state
-            await self.rebuild_dream(state)      # 素材来自昨天的骨架，必须先于覆盖
-            state = await self.load()
-            state = await self.rebuild_plan(state, reason="daily")
+            day_changed = state.date != today
+            if day_changed:
+                await self.rebuild_dream(state)   # 素材来自昨天的骨架，必须先于覆盖
+                state = await self.load()
+            missing = [d for d in need if d not in state.plans]
+            if missing:
+                state = await self.rebuild_plans(state, missing,
+                                                 reason="daily" if day_changed else "topup")
+            # 只保留「昨天 + 今天 + 未来几天」：更早的骨架没有用处，还占注入预算
+            state.plans = {d: p for d, p in state.plans.items() if d >= keep_from}
             if state.vitals is None:
-                state.vitals = self.seed_vitals(state, date_key)
-            state.date = date_key
+                state.vitals = self.seed_vitals(state, today)
+            state.date = today
             await self.save(state)
-            logger.info(f"[life] 已滚动到 {date_key}（来源: {state.plan.source if state.plan else '无'}）")
+            logger.info(
+                f"[life] 已滚动到 {today}（排了 {len(state.plans)} 天: "
+                f"{', '.join(sorted(state.plans))}；今天来源 "
+                f"{state.plan.source if state.plan else '无'}）")
             return state
 
     # ---- 渲染 ----
@@ -1120,7 +1353,7 @@ class Engine:
         date_key = _today()
         # 缓存键要带上「说得多细」和「要不要收着」—— 同一频道不同用户档位不同，
         # 只按 chat_key 缓存会把 A 的细化版本发给还不熟的 B。
-        cache_key = (chat_key, date_key, int(score) >= 20, int(mood) <= -30)
+        cache_key = (chat_key, date_key, int(score) >= 20, int(mood) <= -30, self._horizon())
         cached = _BLOCK_CACHE.get(cache_key)
         if cached is not None and ts - cached[0] < BLOCK_CACHE_TTL:
             return cached[1]

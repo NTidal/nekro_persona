@@ -3504,6 +3504,13 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "source": (state.plan.source if state.plan else ""),
             "summary": (state.plan.summary if state.plan else ""),
             "segments": len(state.plan.segments) if state.plan else 0,
+            "horizon": int(getattr(_pcfg, "LIFE_PLAN_HORIZON", 1) or 1),
+            "days": [
+                {"date": d, "source": state.plans[d].source,
+                 "segments": len(state.plans[d].segments),
+                 "summary": state.plans[d].summary}
+                for d in sorted(state.plans)
+            ],
             "now": ({"window": seg.window, "doing": seg.doing, "feel": seg.feel} if seg else None),
             "vitals": ({"energy": state.vitals.energy, "mood": state.vitals.mood,
                         "aches": [a.get("label") for a in state.vitals.aches]} if state.vitals else None),
