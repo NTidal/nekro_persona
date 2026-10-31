@@ -511,6 +511,115 @@ def energy_target(hour: int) -> int:
     return int(_HOUR_ENERGY.get(int(hour) % 24, 60))
 
 
+
+# ---------------- 三向联动（B3）：状态 → 情绪 / 语气 ----------------
+
+#: 判「她这会儿腾不出手」的动词/状态词。宁可少判：误判会把正常对话压短。
+BUSY_MARKERS = ("赶", "一直在做", "忙", "路上", "排队", "睡着", "没空")
+
+#: 判「她这天本来就不顺」的体感词（只看当前段的 feel 与当天 summary）
+NEG_FEEL_MARKERS = ("烦", "沉", "闷", "累", "钝", "发空", "发酸", "发紧", "空", "疲", "晃")
+
+
+@dataclass
+class MoodBias:
+    """一次情绪波动的「当下权重」。只调幅度与耐久，不改符号。"""
+
+    factor: float = 1.0
+    half_life_mult: float = 1.0
+    notes: List[str] = field(default_factory=list)
+
+    def describe(self) -> str:
+        return "、".join(self.notes) if self.notes else "无调整"
+
+
+def mood_bias(state: DayState, *, score: int = 0, mood: int = 0,
+              now: Optional[datetime] = None) -> MoodBias:
+    """此刻该怎么读这句话。返回乘数与半衰期倍数（纯函数，便于单测）。
+
+    四条规则，各自只在"说得通"的时候生效：
+
+    ① **累了就钝**：深夜或能量见底 → 正负都收着（对负向 ×0.8、对正向 ×0.6）。
+       累的时候不容易炸，也没力气高兴 —— 比"越累越敏感"更接近真人。
+    ② **本来就不顺**：当前时段体感或当天底色偏负 → 负向 ×1.15（同一句话落在坏日子里更重）。
+    ③ **熟的人更耐读**：score≥60 → 负向 ×0.85 且衰减半衰期 ×1.5（信任是缓冲，气也散得慢）；
+       score<20 → 负向 ×1.15 且半衰期 ×0.8（还不熟，一句越界就够呛，但忘得也快）。
+    ④ 乘数钳在 [0.5, 1.35]：单次调整不该由这些旁路因素主导。
+    """
+    bias = MoodBias()
+    cur = now or datetime.now()
+    hour = cur.hour
+    energy = state.vitals.energy if state.vitals else 70
+
+    # ① 钝化
+    if hour >= 23 or hour < 6:
+        bias.factor *= 0.8 if mood <= 0 else 0.6
+        bias.notes.append("深夜")
+    elif energy < 25:
+        bias.factor *= 0.8 if mood <= 0 else 0.6
+        bias.notes.append(f"体力见底({energy})")
+
+    # ② 坏日子
+    glimpse = []
+    seg = None
+    if state.plan is not None:
+        for cand in state.plan.segments:
+            if cand.covers(cur.hour * 60 + cur.minute):
+                seg = cand
+                break
+        glimpse.append(state.plan.summary or "")
+    if seg is not None:
+        glimpse.append(seg.feel or "")
+        glimpse.append(seg.doing or "")
+    if any(m in " ".join(glimpse) for m in NEG_FEEL_MARKERS):
+        if mood <= 0:
+            bias.factor *= 1.15
+            bias.notes.append("今天本来就不顺")
+
+    # ③ 关系深浅
+    if score >= 60:
+        if mood <= 0:
+            bias.factor *= 0.85
+            bias.half_life_mult *= 1.5
+            bias.notes.append("关系深(缓冲)")
+    elif score < 20:
+        if mood <= 0:
+            bias.factor *= 1.15
+            bias.half_life_mult *= 0.8
+            bias.notes.append("还不熟")
+
+    bias.factor = max(0.5, min(1.35, bias.factor))
+    bias.half_life_mult = max(0.5, min(2.0, bias.half_life_mult))
+    return bias
+
+
+def hold_hint(state: DayState, *, mood: int = 0) -> str:
+    """此刻要不要把话收着说。返回一句约束（空串=不用）。
+
+    只在**三条同时成立才不打扰**：她腾不出手 / 体力见底 / 情绪明显不好。
+    这是语气约束，不是拒答 —— 对方真有事（见 URGENT）时照常回应。
+    """
+    if state.plan is not None:
+        for seg in state.plan.segments:
+            if seg.covers(datetime.now().hour * 60 + datetime.now().minute):
+                if any(m in f"{seg.doing} {seg.feel}" for m in BUSY_MARKERS):
+                    return "（你这会儿正忙着手上的事，回得短一点，别展开）"
+                break
+    if state.vitals is not None and state.vitals.energy < 20:
+        return "（你这会儿很累，话少一点，别硬撑）"
+    if mood <= -30:
+        return "（你心里还堵着，语气淡一点，别刻意热络）"
+    return ""
+
+
+#: 对方真有事时不收着 —— 语气约束不能压过求救信号
+URGENT_MARKERS = ("救命", "出事", "紧急", "医院", "受伤", "害怕", "崩溃", "想不开")
+
+
+def is_urgent(text: str) -> bool:
+    return any(m in str(text or "") for m in URGENT_MARKERS)
+
+
 # ---------------- 引擎 ----------------
 
 class Engine:
@@ -805,8 +914,14 @@ class Engine:
             return state
 
     # ---- 渲染 ----
-    def render(self, state: DayState, *, chat_key: str = "", cap: Optional[int] = None) -> str:
-        """生活状态注入块。信息不全就少说几句，绝不编。"""
+    def render(self, state: DayState, *, chat_key: str = "", cap: Optional[int] = None,
+               score: int = 0, mood: int = 0) -> str:
+        """生活状态注入块。信息不全就少说几句，绝不编。
+
+        ``score`` 决定**能知道多细**：还不熟（<20）只给"自己的事，不方便细说"，
+        够熟才说具体在做什么 —— 关系变近的回报之一是"知道她更多日常细节"。
+        ``mood`` 用来判要不要收着说话（见 ``hold_hint``）。
+        """
         if state.plan is None:
             return ""
         lines = ["【你今天的生活】", f"现在：{day_label()}"]
@@ -822,9 +937,11 @@ class Engine:
             if state.plan.summary:
                 lines.append(f"今天：{_squeeze(state.plan.summary, BLOCK_LINE_CAP)}")
             seg = self.segment_at(state)
-            if seg is not None:
+            if seg is not None and int(score) >= 20:
                 feel = f"（{_squeeze(seg.feel, 16)}）" if seg.feel else ""
                 lines.append(f"此刻（{seg.window}）：{_squeeze(seg.doing, BLOCK_LINE_CAP)}{feel}")
+            elif seg is not None:
+                lines.append(f"此刻（{seg.window}）：自己的事，不太方便细说")
 
         if state.vitals is not None:
             lines.append(f"状态：能量 {max(0, min(100, state.vitals.energy))}/100，"
@@ -834,6 +951,9 @@ class Engine:
                 lines.append(f"身上：{aches}")
         if state.dream and state.dream.text and state.dream.afterglow:
             lines.append(f"昨夜那点余韵：{_squeeze(state.dream.afterglow, 50)}")
+        hint = hold_hint(state, mood=mood)
+        if hint:
+            lines.append(hint)
 
         body = "\n".join(lines)[: int(cap or self._cfg("LIFE_BLOCK_CAP", BLOCK_BODY_CAP))]
         tail = ("（这些只是你此刻的底子，不用主动交代；"
@@ -841,7 +961,8 @@ class Engine:
         return body + "\n" + tail
 
     # ---- 注入入口（B2：接进 persona_prompt） ----
-    async def block_for(self, chat_key: str, *, now: Optional[float] = None) -> str:
+    async def block_for(self, chat_key: str, *, now: Optional[float] = None,
+                        score: int = 0, mood: int = 0) -> str:
         """给 prompt 用的生活块。**永不抛异常、永不阻塞回复**。
 
         两个设计约束：
@@ -853,7 +974,9 @@ class Engine:
             return ""
         ts = _now() if now is None else float(now)
         date_key = _today()
-        cache_key = (chat_key, date_key)
+        # 缓存键要带上「说得多细」和「要不要收着」—— 同一频道不同用户档位不同，
+        # 只按 chat_key 缓存会把 A 的细化版本发给还不熟的 B。
+        cache_key = (chat_key, date_key, int(score) >= 20, int(mood) <= -30)
         cached = _BLOCK_CACHE.get(cache_key)
         if cached is not None and ts - cached[0] < BLOCK_CACHE_TTL:
             return cached[1]
@@ -887,7 +1010,7 @@ class Engine:
             if self.tick(state, now=ts):
                 await self.save(state)
 
-        text = self.render(state, chat_key=chat_key)
+        text = self.render(state, chat_key=chat_key, score=score, mood=mood)
         _BLOCK_CACHE[cache_key] = (ts, text)
         return text
 

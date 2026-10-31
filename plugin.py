@@ -2257,6 +2257,9 @@ class UserArchive:
     # 2.6.0：情绪日额度（与好感度的 day_key/day_net 分开记，互不干扰）
     mood_day_key: int = 0
     mood_day_net: int = 0
+    # 2.6.0 之后：「这一次情绪」的半衰期（分钟）。0 = 用配置默认。
+    # 关系越深，同一句冒犯的气散得越慢（信任是缓冲，不是免疫力）。
+    mood_half_life: int = 0
     mood_events: List["ArchiveEvent"] = field(default_factory=list)
 
     # ---------- 构造 ----------
@@ -2299,6 +2302,7 @@ class UserArchive:
             mood_at=_int_or(data.get("mood_at"), 0),
             mood_day_key=_int_or(data.get("mood_day_key"), 0),
             mood_day_net=_int_or(data.get("mood_day_net"), 0),
+            mood_half_life=_int_or(data.get("mood_half_life"), 0),
         )
         item.recent_events = [
             ArchiveEvent.from_raw(x) for x in (data.get("recent_events") or [])
@@ -2336,6 +2340,7 @@ class UserArchive:
             "mood_at": self.mood_at,
             "mood_day_key": self.mood_day_key,
             "mood_day_net": self.mood_day_net,
+            "mood_half_life": self.mood_half_life,
             "mood_events": [e.to_raw() for e in self.mood_events],
         }
 
@@ -2376,7 +2381,8 @@ class UserArchive:
         if not int(self.mood):
             return 0
         now = _ts_now() if now is None else int(now)
-        return _decay_mood_value(int(self.mood), int(self.mood_at or 0), now)
+        return _decay_mood_value(int(self.mood), int(self.mood_at or 0), now,
+                                 int(self.mood_half_life or 0))
 
     def decay_mood(self, now: int | None = None) -> int:
         """把情绪按经过时间衰减并写回；返回**衰减前**的值（供沉淀判定）。"""
@@ -2386,7 +2392,8 @@ class UserArchive:
             if not int(self.mood_at or 0):
                 self.mood_at = now
             return 0
-        after = _decay_mood_value(before, int(self.mood_at or 0), now)
+        after = _decay_mood_value(before, int(self.mood_at or 0), now,
+                                  int(self.mood_half_life or 0))
         if after != before:
             self.mood = after
             self.mood_at = now
@@ -2930,7 +2937,7 @@ def _mood_band(mood: int) -> tuple[str, str]:
     return "", ""
 
 
-def _decay_mood_value(mood: int, at: int, now: int) -> int:
+def _decay_mood_value(mood: int, at: int, now: int, half_life_min: int = 0) -> int:
     """按半衰期把情绪衰减到整数（向 0 收敛）。纯函数、不碰状态。"""
     value = int(mood)
     if not value:
@@ -2940,7 +2947,9 @@ def _decay_mood_value(mood: int, at: int, now: int) -> int:
     if start <= 0 or now <= start:
         return value
     try:
-        half = max(3, int(getattr(config, "MOOD_HALF_LIFE_MIN", 60) or 60)) * 60
+        # 档案上存了「这一次」的半衰期就优先用它（B3：越熟越难忘，气也散得慢）
+        _override = int(half_life_min or 0)
+        half = max(3, _override if _override else int(getattr(config, "MOOD_HALF_LIFE_MIN", 60) or 60)) * 60
     except Exception:  # noqa: BLE001
         half = 3600
     factor = 0.5 ** ((now - start) / float(half))
@@ -4008,7 +4017,11 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
     try:
         _life_engine = persona_life.engine()
         if _life_engine is not None and _life_engine.on:
-            life_block = await _life_engine.block_for(_ctx.chat_key)
+            life_block = await _life_engine.block_for(
+                _ctx.chat_key,
+                score=int(profile.score) if profile is not None else 0,
+                mood=int(profile.mood) if profile is not None else 0,
+            )
             if life_block:
                 parts.append(life_block)
                 plugin.logger.info(f"[persona] 生活块注入：{len(life_block)} 字")
@@ -4178,6 +4191,30 @@ async def adjust_mood(
             plugin.logger.info(
                 f"[persona] 情绪收敛：{_requested:+} → {delta:+}（当前 {before:+}）user={resolved_user_id}",
             )
+
+        # 当下状态加权（B3）：同一句话落在什么样的日子里，读出来的分量不一样。
+        # 只调幅度与耐久，不改符号；乘数钳在 [0.5, 1.35]，主导权仍在收敛与日额度。
+        try:
+            _life_eng = persona_life.engine()
+            _bias = None
+            if _life_eng is not None and _life_eng.on:
+                _life_state = await _life_eng.load()
+                if _life_state.plan is not None and _life_state.date == persona_life._today():
+                    _bias = persona_life.mood_bias(
+                        _life_state, score=int(profile.score), mood=delta)
+            if _bias is not None and (_bias.factor != 1.0 or _bias.half_life_mult != 1.0):
+                _pre = delta
+                delta = int(round(delta * _bias.factor))
+                delta = delta or (1 if _pre > 0 else -1)
+                if delta < 0:
+                    _base_half = max(3, int(getattr(config, "MOOD_HALF_LIFE_MIN", 60) or 60))
+                    profile.mood_half_life = int(round(_base_half * _bias.half_life_mult))
+                plugin.logger.info(
+                    f"[persona] 情绪加权：{_pre:+} → {delta:+}"
+                    f"（{_bias.describe()}；半衰期 ×{_bias.half_life_mult:g}）user={resolved_user_id}",
+                )
+        except Exception as _bias_exc:  # noqa: BLE001
+            plugin.logger.warning(f"[persona] 情绪加权跳过（不影响本次记录）: {_bias_exc}")
 
         # 最小间隔（2.6.0）：冷却期内重复调用不拒绝，但再打一次折
         try:

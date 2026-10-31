@@ -503,6 +503,123 @@ class TestBlockFor(unittest.TestCase):
         self.assertEqual(run(engine.block_for("onebot_v11-group_1")), "")
 
 
+class TestMoodBias(unittest.TestCase):
+    """B3：当下状态怎么读这句话。只调幅度与耐久，不改符号。"""
+
+    def _state(self, *, energy=70, summary="", feel="", doing="", now_seg=True):
+        segs = [L.Segment(0, 24 * 60, doing or "待着", feel)]
+        state = L.DayState(date=L._today(), plan=L.DayPlan(summary or "平常的一天", segs),
+                           vitals=L.Vitals(energy, "平静"))
+        return state
+
+    def test_neutral_day_keeps_factor(self):
+        bias = L.mood_bias(self._state(), score=40, mood=-20, now=datetime(2026, 6, 15, 15, 0))
+        self.assertEqual(bias.factor, 1.0)
+        self.assertEqual(bias.half_life_mult, 1.0)
+
+    def test_late_night_softens_both_directions(self):
+        neg = L.mood_bias(self._state(), score=40, mood=-20, now=datetime(2026, 6, 15, 2, 0))
+        pos = L.mood_bias(self._state(), score=40, mood=20, now=datetime(2026, 6, 15, 2, 0))
+        self.assertAlmostEqual(neg.factor, 0.8)
+        self.assertAlmostEqual(pos.factor, 0.6)
+        self.assertIn("深夜", neg.notes)
+
+    def test_low_energy_softens(self):
+        bias = L.mood_bias(self._state(energy=12), score=40, mood=-20,
+                           now=datetime(2026, 6, 15, 15, 0))
+        self.assertAlmostEqual(bias.factor, 0.8)
+        self.assertTrue(any("体力" in n for n in bias.notes))
+
+    def test_bad_day_amplifies_negative(self):
+        bias = L.mood_bias(self._state(feel="发闷、有点烦"), score=40, mood=-20,
+                           now=datetime(2026, 6, 15, 15, 0))
+        self.assertAlmostEqual(bias.factor, 1.15)
+        self.assertTrue(any("不顺" in n for n in bias.notes))
+
+    def test_bad_day_does_not_amplify_positive(self):
+        bias = L.mood_bias(self._state(feel="发闷、有点烦"), score=40, mood=20,
+                           now=datetime(2026, 6, 15, 15, 0))
+        self.assertAlmostEqual(bias.factor, 1.0)
+
+    def test_close_relation_cushions_and_lingers(self):
+        bias = L.mood_bias(self._state(), score=80, mood=-20, now=datetime(2026, 6, 15, 15, 0))
+        self.assertAlmostEqual(bias.factor, 0.85)
+        self.assertAlmostEqual(bias.half_life_mult, 1.5)
+
+    def test_stranger_reads_harder_and_forgets_faster(self):
+        bias = L.mood_bias(self._state(), score=5, mood=-20, now=datetime(2026, 6, 15, 15, 0))
+        self.assertAlmostEqual(bias.factor, 1.15)
+        self.assertAlmostEqual(bias.half_life_mult, 0.8)
+
+    def test_factor_is_clamped(self):
+        extreme = L.mood_bias(self._state(energy=5, feel="发闷"), score=5, mood=-60,
+                              now=datetime(2026, 6, 15, 2, 0))
+        self.assertLessEqual(extreme.factor, 1.35)
+        self.assertGreaterEqual(extreme.factor, 0.5)
+
+    def test_positive_mood_never_gets_amplified_by_tier(self):
+        close = L.mood_bias(self._state(), score=80, mood=20, now=datetime(2026, 6, 15, 15, 0))
+        self.assertEqual(close.factor, 1.0)
+        self.assertEqual(close.half_life_mult, 1.0)
+
+
+class TestHoldHint(unittest.TestCase):
+    """B3：什么时候该收着说话。"""
+
+    def _state(self, doing="待着", energy=70):
+        return L.DayState(date=L._today(),
+                          plan=L.DayPlan("平常", [L.Segment(0, 24 * 60, doing, "平静")]),
+                          vitals=L.Vitals(energy, "平静"))
+
+    def test_nothing_when_idle(self):
+        self.assertEqual(L.hold_hint(self._state(), mood=0), "")
+
+    def test_busy_activity_expects_short_reply(self):
+        hint = L.hold_hint(self._state(doing="一直在做手上的事，忙得没抬头"), mood=0)
+        self.assertIn("短一点", hint)
+
+    def test_low_energy_expects_short_reply(self):
+        self.assertIn("累", L.hold_hint(self._state(energy=10), mood=0))
+
+    def test_bad_mood_expects_distance(self):
+        self.assertIn("淡一点", L.hold_hint(self._state(), mood=-40))
+
+    def test_urgent_words_are_recognised(self):
+        self.assertTrue(L.is_urgent("救命，我出事了"))
+        self.assertFalse(L.is_urgent("今天有点累"))
+
+
+class TestTierVisibility(unittest.TestCase):
+    """B3：关系不够深时只给模糊说法，够深才说具体在做什么。"""
+
+    def _state(self):
+        return L.DayState(date=L._today(),
+                          plan=L.DayPlan("平常的一天",
+                                         [L.Segment(0, 24 * 60, "在擦窗台，手有点凉", "平平的")]),
+                          vitals=L.Vitals(70, "平静"))
+
+    def test_stranger_gets_coarse_view(self):
+        eng, _, _ = make_engine()
+        text = eng.render(self._state(), score=5)
+        self.assertIn("不太方便细说", text)
+        self.assertNotIn("擦窗台", text)
+
+    def test_friend_gets_details(self):
+        eng, _, _ = make_engine()
+        text = eng.render(self._state(), score=45)
+        self.assertIn("擦窗台", text)
+
+    def test_block_for_passes_score_through(self):
+        store = FakeStore()
+        eng, _, _ = make_engine(reply=good_plan_json(), store=store)
+        run(eng.ensure_today())
+        L._BLOCK_CACHE.clear()
+        coarse = run(eng.block_for("ck1", score=5))
+        L._BLOCK_CACHE.clear()
+        fine = run(eng.block_for("ck1", score=60))
+        self.assertNotEqual(coarse, fine)
+
+
 class TestAttach(unittest.TestCase):
     def test_attach_and_is_on(self):
         engine, _, _ = make_engine(cfg=FakeConfig(LIFE_ENABLED=True))

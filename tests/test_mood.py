@@ -24,6 +24,36 @@ HALF = 3600          # 默认半衰期 60 分钟
 NO_DIGIT = re.compile(r"\d")
 
 
+class TestMoodHalfLifeOverride(unittest.TestCase):
+    """B3：档案上存的半衰期优先于配置默认（越熟的气散得越慢）。"""
+
+    def test_override_extends_decay_time(self):
+        now = 1_700_000_000
+        base = P._decay_mood_value(-40, now - 3600, now)
+        linger = P._decay_mood_value(-40, now - 3600, now, 90)
+        self.assertGreater(abs(linger), abs(base), "半衰期 90 分钟时一小时后的余额应更多")
+
+    def test_override_shortens_decay_time(self):
+        now = 1_700_000_000
+        base = P._decay_mood_value(-40, now - 3600, now)
+        quick = P._decay_mood_value(-40, now - 3600, now, 30)
+        self.assertLess(abs(quick), abs(base))
+
+    def test_zero_override_falls_back_to_config(self):
+        now = 1_700_000_000
+        self.assertEqual(P._decay_mood_value(-40, now - 1800, now, 0),
+                         P._decay_mood_value(-40, now - 1800, now))
+
+    def test_archive_roundtrip_keeps_half_life(self):
+        a = P.UserArchive(user_id="u1", score=80, mood=-30, mood_at=1_700_000_000, mood_half_life=90)
+        back = P.UserArchive.from_raw("u1", a.to_raw())
+        self.assertEqual(back.mood_half_life, 90)
+
+    def test_old_data_defaults_to_zero(self):
+        back = P.UserArchive.from_raw("u1", {"user_id": "u1", "mood": -10})
+        self.assertEqual(back.mood_half_life, 0)
+
+
 class TestMoodBand(unittest.TestCase):
     """情绪值 → 定性档位。分界点必须精确，否则语气会错档。"""
 
