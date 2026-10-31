@@ -3511,6 +3511,16 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                  "summary": state.plans[d].summary}
                 for d in sorted(state.plans)
             ],
+            # 跨天预览要每天的分段；只给 days 的摘要就换不了天看
+            "plans": [
+                {"date": d,
+                 "source": state.plans[d].source,
+                 "summary": state.plans[d].summary,
+                 "segments": [{"window": s.window, "start": s.start, "end": s.end,
+                               "doing": s.doing, "feel": s.feel}
+                              for s in state.plans[d].segments]}
+                for d in sorted(state.plans)
+            ],
             "now": ({"window": seg.window, "doing": seg.doing, "feel": seg.feel} if seg else None),
             # 前端时间轴要画完整分段：只给 now 的话，页面上就只剩"此刻"一行
             "timeline": ([{"window": s.window, "start": s.start, "end": s.end,
@@ -3528,6 +3538,132 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 " ".join([state.plan.summary] + [f"{s.doing} {s.feel}" for s in state.plan.segments])
                 if state.plan else ""),
             "block": eng.render(state),
+        }
+
+    @router.get("/api/life_pack", summary="生活词元包：抽词配置与禁词（可编辑）")
+    async def api_life_pack(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        from . import life as _life
+
+        pack = _life.load_world_pack()
+        path = None
+        try:
+            from . import memory as _mem
+
+            path = str(_mem._bg_dir() / "life.json")
+        except Exception:  # noqa: BLE001
+            path = None
+        return {
+            "setting": pack.setting,
+            "places": list(pack.places),
+            "props": list(pack.props),
+            "verbs": list(pack.verbs),
+            "feels": list(pack.feels),
+            "events": list(pack.events),
+            # 禁词分两份：内置那份不可删（改了等于放行通用现代词），自定义那份可编
+            "forbidden": list(pack.forbidden),
+            "builtin_forbidden": list(_life.BUILTIN_WORLD.forbidden),
+            "path": path,
+        }
+
+    @router.post("/api/life_pack", summary="保存词元包（写 backgrounds/life.json，自动备份）")
+    async def api_life_pack_save(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        body = await _json_body(request)
+        from . import life as _life
+        from . import memory as _mem
+
+        def _words(key: str) -> list:
+            raw = body.get(key)
+            if raw is None:
+                return []
+            if isinstance(raw, str):
+                raw = raw.replace("、", "\n").replace(",", "\n").split("\n")
+            out: list = []
+            for item in raw or []:
+                text = str(item or "").strip()
+                if text and text not in out:
+                    out.append(text[:24])
+            return out[:60]
+
+        path = _mem._bg_dir() / "life.json"
+        old: Dict[str, Any] = {}
+        try:
+            if path.exists():
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    old = loaded
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"现有 life.json 解析失败，先修它: {exc}") from exc
+
+        world = dict(old.get("world") or {})
+        for key in ("places", "props", "verbs", "feels", "events", "forbidden"):
+            if key in body:
+                world[key] = _words(key)
+        if "setting" in body:
+            world["setting"] = str(body.get("setting") or "").strip()[:200]
+        old["world"] = world
+
+        try:
+            if path.exists():
+                backup = path.with_suffix(".json.bak_before_ui")
+                backup.write_bytes(path.read_bytes())
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(old, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"写入失败: {exc}") from exc
+
+        pack = _life.load_world_pack()
+        return {
+            "ok": True,
+            "persisted": True,
+            "path": str(path),
+            "pack": {
+                "setting": pack.setting,
+                "places": list(pack.places),
+                "props": list(pack.props),
+                "verbs": list(pack.verbs),
+                "feels": list(pack.feels),
+                "events": list(pack.events),
+                "forbidden": list(pack.forbidden),
+                "builtin_forbidden": list(_life.BUILTIN_WORLD.forbidden),
+            },
+        }
+
+    @router.post("/api/life_rebuild", summary="重新生成日程（强制重抽词元 + 重排 N 天）")
+    async def api_life_rebuild(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        body = await _json_body(request)
+        from . import life as _life
+
+        eng = _life.engine()
+        if eng is None or not eng.on:
+            raise HTTPException(status_code=400, detail="生活时间轴未启用（LIFE_ENABLED）")
+        try:
+            days = int(body.get("days") or eng._horizon())
+        except (TypeError, ValueError):
+            days = eng._horizon()
+        days = max(1, min(7, days))
+
+        today = _life._today()
+        dates = [_life._shift_date(today, i) for i in range(days)]
+        try:
+            # 与跨天滚动同一把锁：否则用户点重排的同时来一条消息，两边同时写 state
+            async with eng._lock:
+                state = await eng.load()
+                state.seed = None          # 强制重抽：否则同一天会复用旧词元
+                state = await eng.rebuild_plans(state, dates, reason="manual")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"生成失败: {exc}") from exc
+
+        return {
+            "ok": True,
+            "days": [{"date": d, "source": state.plans[d].source,
+                      "segments": len(state.plans[d].segments),
+                      "summary": state.plans[d].summary}
+                     for d in dates if d in state.plans],
+            "seed": (state.seed.to_json() if state.seed else None),
         }
 
     @router.get("/api/mood_bands", summary="情绪档位表：当前生效的定性描述与来源")
