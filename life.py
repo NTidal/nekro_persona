@@ -160,7 +160,83 @@ def day_label(now: Optional[datetime] = None) -> str:
     return f"{cur.strftime('%Y-%m-%d')} 周{_WEEKDAY[cur.weekday()]} {kind} {cur.strftime('%H:%M')}"
 
 
-# ---------------- 内容包（数据驱动，内置只作兜底） ----------------
+# ---------------- 词元包（种子式内容：抽词，不抽整句） ----------------
+#
+# 为什么不做"整句池"：整句池里每一句都是作者的世界观，抽到即定型；
+# 而词元池只提供**在世界观之内**的名词与动作，句子交给模型按当天语境去串 ——
+# 既能每天不重样（组合数上万），又天然不会冒出"上班打卡"这类不存在的场景。
+
+@dataclass(frozen=True)
+class WorldPack:
+    """一个角色的生活词元。字段全可空，空则回落内置通用包。"""
+
+    setting: str = ""                       # 一句世界设定（写进提示词）
+    places: Tuple[str, ...] = ()            # 在哪：星炬学院、食堂、绿洲边…
+    props: Tuple[str, ...] = ()             # 手里有什么：终端、数据坞、旧磁带…
+    verbs: Tuple[str, ...] = ()             # 会做的事：听课、做同步率练习、修终端…
+    feels: Tuple[str, ...] = ()             # 体感词：沉、钝、松快、心里发空…
+    events: Tuple[str, ...] = ()            # 可能发生的小事：终端收到旧消息…
+    forbidden: Tuple[str, ...] = ()         # 这个世界里不存在的东西（上班/打卡/通勤…）
+
+    def usable(self) -> bool:
+        return bool(self.places and self.verbs)
+
+
+BUILTIN_WORLD = WorldPack(
+    setting="普通人的日常：待在屋里、出门办点事、吃饭、发呆。",
+    places=("屋子里", "窗边", "楼下", "街角", "常去的店", "半路的站台"),
+    props=("杯子", "书", "手机", "钥匙", "袋子", "外套"),
+    verbs=("待着", "整理东西", "出门一趟", "煮点吃的", "发呆", "翻旧东西", "走了一段路"),
+    feels=("沉", "钝", "松快", "发闷", "暖", "心里发空", "有点烦", "安宁"),
+    events=("碰到一件小事打断了安排", "翻出很久没碰的东西", "外面天气变了",
+            "听到别人聊起一件事", "临时改了主意", "多花了不少时间"),
+    forbidden=("上班", "下班", "打卡", "通勤", "开会", "同事", "领导", "工位",
+               "加班", "公司", "办公室", "地铁", "公交", "外卖", "便利店", "工资", "房贷"),
+)
+
+
+def load_world_pack() -> WorldPack:
+    """读 ``backgrounds/life.json`` 的 ``world`` 段；缺什么就用内置包补什么。"""
+    path = None
+    try:
+        from . import memory as _mem
+
+        getter = getattr(_mem, "_bg_dir", None)
+        path = getter() / "life.json" if callable(getter) else None
+    except Exception:  # noqa: BLE001
+        path = None
+    payload: Dict[str, Any] = {}
+    if path is not None:
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded.get("world") if isinstance(loaded.get("world"), dict) else {}
+        except Exception:  # noqa: BLE001
+            payload = {}
+
+    def words(key: str, fallback: Tuple[str, ...], cap: int = 40) -> Tuple[str, ...]:
+        rows = []
+        for item in (payload.get(key) or []):
+            text = _squeeze(item, 24)
+            if text and text not in rows:
+                rows.append(text)
+            if len(rows) >= cap:
+                break
+        return tuple(rows) or fallback
+
+    return WorldPack(
+        setting=_squeeze(payload.get("setting"), 200) or BUILTIN_WORLD.setting,
+        places=words("places", BUILTIN_WORLD.places),
+        props=words("props", BUILTIN_WORLD.props),
+        verbs=words("verbs", BUILTIN_WORLD.verbs),
+        feels=words("feels", BUILTIN_WORLD.feels),
+        events=words("events", BUILTIN_WORLD.events),
+        # 禁词表**永远并上内置那份**：作者只补自己世界的，通用现代词不用重复写
+        forbidden=tuple(dict.fromkeys(words("forbidden", ()) + BUILTIN_WORLD.forbidden)),
+    )
+
+
+# ---------------- 旧整句池（保留兼容：没有 world 段的旧 life.json 仍能用） ----------------
 
 @dataclass(frozen=True)
 class Scene:
@@ -363,6 +439,64 @@ class Dream:
 
 
 @dataclass
+class DaySeed:
+    """今天抽到的词元组合。这是「素材」，不是成品句子。"""
+
+    date: str = ""
+    place: str = ""
+    prop: str = ""
+    verbs: List[str] = field(default_factory=list)
+    events: List[str] = field(default_factory=list)
+    feels: List[str] = field(default_factory=list)
+
+    def to_json(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def from_json(raw: Any) -> Optional["DaySeed"]:
+        if not isinstance(raw, dict):
+            return None
+        return DaySeed(
+            date=str(raw.get("date") or ""),
+            place=_squeeze(raw.get("place"), 24),
+            prop=_squeeze(raw.get("prop"), 24),
+            verbs=[_squeeze(x, 24) for x in (raw.get("verbs") or []) if _squeeze(x, 24)],
+            events=[_squeeze(x, 40) for x in (raw.get("events") or []) if _squeeze(x, 40)],
+            feels=[_squeeze(x, 16) for x in (raw.get("feels") or []) if _squeeze(x, 16)],
+        )
+
+
+def seed_block(seed: Optional[DaySeed], pack: Optional[WorldPack] = None) -> str:
+    """把抽到的词元写成「今日素材」块，交给模型去串成具体的生活。"""
+    if seed is None:
+        return ""
+    pack = pack or load_world_pack()
+    lines = ["【今日素材（必须用上，不要换成别的场景）】"]
+    if pack.setting:
+        lines.append(f"世界设定：{pack.setting}")
+    if seed.place:
+        lines.append(f"在哪：{seed.place}")
+    if seed.prop:
+        lines.append(f"手边：{seed.prop}")
+    if seed.verbs:
+        lines.append("会做：" + "、".join(seed.verbs))
+    if seed.events:
+        lines.append("会发生：" + " / ".join(seed.events))
+    if seed.feels:
+        lines.append("体感词（挑着用，别全塞进去）：" + "、".join(seed.feels))
+    lines.append("要求：把上面的词串成具体的动作与场景，可以加细节，"
+                 "但**不要引入这个世界没有的东西**（她不存在于现代职场/校园之外的地方）。")
+    return "\n".join(lines)
+
+
+def world_hits(text: str, pack: Optional[WorldPack] = None) -> List[str]:
+    """文本里命中了哪些「这个世界不存在」的词。"""
+    pack = pack or load_world_pack()
+    body = str(text or "")
+    return [w for w in pack.forbidden if w and w in body]
+
+
+@dataclass
 class Card:
     date: str
     scene_id: str
@@ -398,12 +532,12 @@ class DayState:
     plans: Dict[str, DayPlan] = field(default_factory=dict)
     vitals: Optional[Vitals] = None
     dream: Optional[Dream] = None
-    card: Optional[Card] = None
+    seed: Optional[DaySeed] = None
     recent: List[Dict[str, Any]] = field(default_factory=list)   # 最近几天骨架，给"别重复"用
 
     def __init__(self, date: str = "", plans: Optional[Dict[str, DayPlan]] = None,
                  vitals: Optional[Vitals] = None, dream: Optional[Dream] = None,
-                 card: Optional[Card] = None, recent: Optional[List[Dict[str, Any]]] = None,
+                 seed: Optional[DaySeed] = None, recent: Optional[List[Dict[str, Any]]] = None,
                  plan: Optional[DayPlan] = None):
         # 手写 __init__ 而不是让 dataclass 生成：老调用点（含测试）还在写 ``plan=``，
         # 那是「今天这份」的简写，等价于 plans[date]=plan。
@@ -411,7 +545,7 @@ class DayState:
         self.plans = dict(plans or {})
         self.vitals = vitals
         self.dream = dream
-        self.card = card
+        self.seed = seed
         self.recent = list(recent or [])
         if plan is not None and self.date:
             self.plans[self.date] = plan
@@ -435,7 +569,7 @@ class DayState:
             "plan": self.plan.to_json() if self.plan else None,
             "vitals": self.vitals.to_json() if self.vitals else None,
             "dream": self.dream.to_json() if self.dream else None,
-            "card": self.card.to_json() if self.card else None,
+            "seed": self.seed.to_json() if self.seed else None,
             "recent": self.recent[-7:],
         }
 
@@ -459,7 +593,7 @@ class DayState:
             plans=plans,
             vitals=Vitals.from_json(raw.get("vitals")),
             dream=Dream.from_json(raw.get("dream")),
-            card=Card.from_json(raw.get("card")),
+            seed=DaySeed.from_json(raw.get("seed")) or DaySeed.from_json(raw.get("card")),
             recent=[r for r in (raw.get("recent") or []) if isinstance(r, dict)],
         )
 
@@ -567,6 +701,28 @@ def repair_plan(segments: List[Segment]) -> List[Segment]:
         else:
             merged.append(seg)
     return merged
+
+
+def scrub_plan(plan: DayPlan, pack: Optional[WorldPack] = None) -> DayPlan:
+    """把命中越界词的段落改写成世界观内的中性说法（只动命中的段）。
+
+    不整天作废的理由：一份 10 段的日程里可能只有 1 段写了"下班路上"，
+    其余 9 段都是好的 —— 整天丢掉反而是更大的信息损失。
+    """
+    pack = pack or load_world_pack()
+    place = (pack.places[0] if pack.places else "自己的地方")
+    verb = (pack.verbs[0] if pack.verbs else "待着")
+    feel = (pack.feels[0] if pack.feels else "平静")
+    segments: List[Segment] = []
+    for seg in plan.segments:
+        if world_hits(f"{seg.doing} {seg.feel}", pack):
+            segments.append(Segment(seg.start, seg.end, f"在{place}{verb}", feel))
+        else:
+            segments.append(seg)
+    summary = plan.summary
+    if world_hits(summary, pack):
+        summary = "普通的一天"
+    return DayPlan(summary, segments, source="repaired", built_at=plan.built_at)
 
 
 def template_plan(summary: str = "没什么安排的一天") -> DayPlan:
@@ -919,25 +1075,34 @@ class Engine:
             logger.warning(f"[life] 写抽签历史失败: {exc!r}")
 
     # ---- 抽签 ----
-    def roll_card(self, date_key: str, hist: Dict[str, List[str]]) -> Tuple[Card, Dict[str, List[str]]]:
-        scenes, interludes, _ = load_content_pack()
-        rng = _rng("card", date_key)
+    def roll_card(self, date_key: str, hist: Dict[str, List[str]]) -> Tuple[DaySeed, Dict[str, List[str]]]:
+        """抽今天的词元（保留旧名字，避免上层大改）。
 
-        cooled_scenes = set((hist.get("scenes") or [])[-SCENE_COOLDOWN:])
-        scene_pool = [s for s in scenes if s.id not in cooled_scenes] or list(scenes)
-        scene = rng.choice(scene_pool)
+        抽的是**词**不是句子：地点/手边物/会做的事/会发生的事/体感词，
+        组合交给模型。冷却只压"地点"和"事件"，动作词允许重复（人本来就重复做同样的事）。
+        """
+        pack = load_world_pack()
+        rng = _rng("seed", date_key)
 
-        cooled_interludes = set((hist.get("interludes") or [])[-INTERLUDE_COOLDOWN:])
-        interlude_pool = [i for i in interludes if i.id not in cooled_interludes] or list(interludes)
-        rng.shuffle(interlude_pool)
-        picked = interlude_pool[:INTERLUDE_PER_DAY]
+        cooled_places = set((hist.get("places") or [])[-SCENE_COOLDOWN:])
+        place_pool = [p for p in pack.places if p not in cooled_places] or list(pack.places)
+        place = rng.choice(place_pool) if place_pool else ""
 
-        card = Card(date_key, scene.id, scene.name, scene.constraint, picked)
+        cooled_events = set((hist.get("events") or [])[-INTERLUDE_COOLDOWN:])
+        event_pool = [e for e in pack.events if e not in cooled_events] or list(pack.events)
+        rng.shuffle(event_pool)
+        events = event_pool[:INTERLUDE_PER_DAY]
+
+        verbs = rng.sample(list(pack.verbs), k=min(2, len(pack.verbs))) if pack.verbs else []
+        feels = rng.sample(list(pack.feels), k=min(2, len(pack.feels))) if pack.feels else []
+        prop = rng.choice(list(pack.props)) if pack.props else ""
+
+        seed = DaySeed(date_key, place, prop, verbs, events, feels)
         new_hist = {
-            "scenes": (list(hist.get("scenes") or []) + [scene.id])[-SCENE_COOLDOWN * 2:],
-            "interludes": (list(hist.get("interludes") or []) + [i.id for i in picked])[-INTERLUDE_COOLDOWN * 3:],
+            "places": (list(hist.get("places") or []) + [place])[-SCENE_COOLDOWN * 2:],
+            "events": (list(hist.get("events") or []) + events)[-INTERLUDE_COOLDOWN * 3:],
         }
-        return card, new_hist
+        return seed, new_hist
 
     # ---- 初始手感 ----
     def seed_vitals(self, state: DayState, date_key: str, hour: Optional[int] = None) -> Vitals:
@@ -1039,10 +1204,10 @@ class Engine:
         if not dates:
             return state
         today = _today()
-        if not (state.card and state.card.date == today):
-            card, hist = self.roll_card(today, await self.load_history())
+        if not (state.seed and state.seed.date == today):
+            seed, hist = self.roll_card(today, await self.load_history())
             await self.save_history(hist)
-            state.card = card
+            state.seed = seed
 
         lo = max(3, min(16, int(self._cfg("LIFE_PLAN_MIN_SEGMENTS", PLAN_MIN_SEGMENTS))))
         hi = max(lo, min(PLAN_MAX_SEGMENTS, int(self._cfg("LIFE_PLAN_MAX_SEGMENTS", PLAN_MAX_SEGMENTS))))
@@ -1063,6 +1228,24 @@ class Engine:
         )
         parsed = self._parse_plans(raw or "", dates, hi)
 
+        # 世界观校验：命中了"这个世界不存在"的词 → 点名重抽一次
+        pack = load_world_pack()
+        bad = {d: world_hits(self._plan_text(p), pack) for d, p in parsed.items()}
+        bad = {d: w for d, w in bad.items() if w}
+        if bad:
+            names = "、".join(sorted({w for ws in bad.values() for w in ws}))
+            logger.warning(f"[life] 日程越界（{names}），点名重抽一次：{', '.join(sorted(bad))}")
+            retry = await self._ask_model(
+                self._plan_prompt(state, lo, hi, dates)
+                + f"\n\n上一次你写了「{names}」——这些东西在她的世界里不存在，重写，别再用。",
+                system=system, task=f"life_plan:retry:{len(dates)}d",
+                max_tokens=self._plan_tokens(len(dates)),
+            )
+            retried = self._parse_plans(retry or "", dates, hi)
+            for day, plan in retried.items():
+                if not world_hits(self._plan_text(plan), pack):
+                    parsed[day] = plan
+
         for day in dates:
             plan = parsed.get(day)
             if plan is not None:
@@ -1075,6 +1258,11 @@ class Engine:
             if plan is None:
                 logger.warning(f"[life] {day} 日程走兜底模板（模型不可用或输出不可用）")
                 plan = template_plan()
+            else:
+                hits = world_hits(self._plan_text(plan), pack)
+                if hits:
+                    logger.warning(f"[life] {day} 仍有越界词（{'、'.join(hits)}），改写命中段")
+                    plan = scrub_plan(plan, pack)
             state.plans[day] = plan
             state.recent = (state.recent + [{"date": day,
                                              "doings": [s.doing for s in plan.segments]}])[-7:]
@@ -1089,10 +1277,16 @@ class Engine:
         """单日包装（保持旧调用点与测试不变）。"""
         return await self.rebuild_plans(state, [_today()], reason=reason)
 
+    @staticmethod
+    def _plan_text(plan: Optional[DayPlan]) -> str:
+        if plan is None:
+            return ""
+        body = [plan.summary] + [f"{s.doing} {s.feel}" for s in plan.segments]
+        return " ".join(body)
+
     def _plan_prompt(self, state: DayState, lo: int, hi: int,
                      dates: Optional[List[str]] = None) -> str:
         dates = dates or [_today()]
-        card = state.card
         multi = len(dates) > 1
         lines = [f"把接下来 {len(dates)} 天排出来。要求如下。" if multi else "把今天排出来。要求如下。", ""]
         if multi:
@@ -1106,11 +1300,9 @@ class Engine:
                 lines.append(f"· {day}（{short}）")
         else:
             lines.append(f"今天：{day_label()}")
-        if card is not None:
-            lines.append(f"在哪过：{card.scene_name}。{card.constraint}")
-            if card.interludes:
-                lines.append("今天会发生两件小事（嵌进不同时段，不用写成大事）："
-                             + "；".join(i.text for i in card.interludes))
+        material = seed_block(state.seed)
+        if material:
+            lines.append(material)
         avoid = avoid_hint(recent_doings(state.recent))
         if avoid:
             lines.append(avoid)
@@ -1125,6 +1317,8 @@ class Engine:
             "一段是一小段连续的生活，不是一个瞬间，也不是任务名。",
             "feel 用 1-3 个短词写当时的感受或身体状态，别每段都同一个词。",
             "允许有一天什么也没发生，那种日子反而可信。",
+            "**只在「今日素材」给出的世界与词元范围内写**；不要出现这个世界没有的地点、"
+            "身份与作息（她不打卡、不通勤、没有同事和工位）。",
             "整天里至少有两三段是松快的，不要全写成没力气、发闷。",
             "summary 用一句话说今天的底色，口语。",
             "",

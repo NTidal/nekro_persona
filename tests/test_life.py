@@ -229,34 +229,43 @@ class TestRepair(unittest.TestCase):
 
 
 class TestCard(unittest.TestCase):
+    """抽词：同一天抽到同一组词，地点/事件有冷却，组合数足够大。"""
+
+    EMPTY = {"places": [], "events": []}
+
     def test_deterministic_for_same_date(self):
         a, _ = L.Engine(store_read=FakeStore().read, store_write=FakeStore().write,
-                        config=FakeConfig()).roll_card("2026-06-15", {"scenes": [], "interludes": []})
+                        config=FakeConfig()).roll_card("2026-06-15", dict(self.EMPTY))
         b, _ = L.Engine(store_read=FakeStore().read, store_write=FakeStore().write,
-                        config=FakeConfig()).roll_card("2026-06-15", {"scenes": [], "interludes": []})
-        self.assertEqual(a.scene_id, b.scene_id)
-        self.assertEqual([i.id for i in a.interludes], [i.id for i in b.interludes])
+                        config=FakeConfig()).roll_card("2026-06-15", dict(self.EMPTY))
+        self.assertEqual(a.place, b.place)
+        self.assertEqual(a.verbs, b.verbs)
+        self.assertEqual(a.events, b.events)
 
-    def test_interludes_are_two(self):
-        card, _ = L.Engine(store_read=FakeStore().read, store_write=FakeStore().write,
-                           config=FakeConfig()).roll_card("2026-06-15", {"scenes": [], "interludes": []})
-        self.assertEqual(len(card.interludes), L.INTERLUDE_PER_DAY)
+    def test_seed_has_all_facets(self):
+        seed, _ = L.Engine(store_read=FakeStore().read, store_write=FakeStore().write,
+                           config=FakeConfig()).roll_card("2026-06-15", dict(self.EMPTY))
+        self.assertTrue(seed.place)
+        self.assertTrue(seed.prop)
+        self.assertEqual(len(seed.verbs), 2)
+        self.assertEqual(len(seed.events), L.INTERLUDE_PER_DAY)
+        self.assertEqual(len(seed.feels), 2)
 
-    def test_scene_cooldown_respected(self):
+    def test_place_cooldown_respected(self):
         engine, _, _ = make_engine()
-        hist = {"scenes": [], "interludes": []}
+        hist = dict(self.EMPTY)
         seen = []
         for day in range(1, L.SCENE_COOLDOWN + 1):
-            card, hist = engine.roll_card(f"2026-06-{day:02d}", hist)
-            seen.append(card.scene_id)
-        self.assertEqual(len(set(seen)), len(seen), "冷却期内不该重复抽到同一个场景")
+            seed, hist = engine.roll_card(f"2026-06-{day:02d}", hist)
+            seen.append(seed.place)
+        self.assertEqual(len(set(seen)), len(seen), "冷却期内不该重复抽到同一个地点")
 
     def test_history_is_capped(self):
         engine, _, _ = make_engine()
-        hist = {"scenes": [], "interludes": []}
+        hist = dict(self.EMPTY)
         for day in range(1, 21):
             _, hist = engine.roll_card(f"2026-06-{day:02d}", hist)
-        self.assertLessEqual(len(hist["scenes"]), L.SCENE_COOLDOWN * 2)
+        self.assertLessEqual(len(hist["places"]), L.SCENE_COOLDOWN * 2)
 
 
 class TestDoings(unittest.TestCase):
@@ -285,14 +294,14 @@ class TestSerialization(unittest.TestCase):
     def test_day_state_roundtrip(self):
         state = L.DayState(date="2026-06-15", plan=L.template_plan(), vitals=L.Vitals(66, "发闷"),
                            dream=L.Dream("梦见走不完的楼梯", "恍惚", "醒来有点晕", "2026-06-15"),
-                           card=L.Card("2026-06-15", "quiet_room", "安静的屋子", "待着", []),
+                           seed=L.DaySeed("2026-06-15", "安静的屋子", "书", ["待着"], ["翻出旧东西"], ["松快"]),
                            recent=[{"date": "2026-06-15", "doings": ["a"]}])
         back = L.DayState.from_json(state.to_json())
         self.assertEqual(back.date, state.date)
         self.assertEqual(back.plan.source, "template")
         self.assertEqual(back.vitals.energy, 66)
         self.assertEqual(back.dream.mood, "恍惚")
-        self.assertEqual(back.card.scene_id, "quiet_room")
+        self.assertEqual(back.seed.place, "安静的屋子")
         self.assertEqual(len(back.recent), 1)
 
     def test_bad_json_degrades(self):
@@ -365,7 +374,7 @@ class TestPlanGeneration(unittest.TestCase):
         engine, _, _ = make_engine(reply=None)
         state = run(engine.rebuild_plan(L.DayState()))
         self.assertEqual(state.plan.source, "template")
-        self.assertTrue(state.card is not None)
+        self.assertTrue(state.seed is not None)
 
     def test_recent_keeps_at_most_seven(self):
         engine, _, _ = make_engine(reply=good_plan_json())
@@ -858,6 +867,52 @@ class TestSalvage(unittest.TestCase):
         self.assertEqual(state.plans[dates[0]].source, "model")
         self.assertEqual(state.plans[dates[1]].source, "model")
         self.assertEqual(state.plans[dates[2]].source, "template")
+
+
+class TestWorldFit(unittest.TestCase):
+    """种子式内容：抽词要抽在世界观内，生成后还要过一遍禁词校验。"""
+
+    def test_seed_block_lists_every_drawn_word(self):
+        seed = L.DaySeed("2026-06-15", "星炬学院的教室", "终端", ["听课", "抄录数据"],
+                         ["终端收到一条旧消息"], ["松快"])
+        block = L.seed_block(seed, L.BUILTIN_WORLD)
+        for token in ("星炬学院的教室", "终端", "听课", "抄录数据", "终端收到一条旧消息"):
+            self.assertIn(token, block)
+        self.assertIn("不要引入这个世界没有的东西", block)
+
+    def test_world_hits_finds_forbidden_words(self):
+        hits = L.world_hits("下班路上顺便买了外卖", L.BUILTIN_WORLD)
+        self.assertIn("下班", hits)
+        self.assertIn("外卖", hits)
+        self.assertEqual(L.world_hits("在学院抄录数据", L.BUILTIN_WORLD), [])
+
+    def test_scrub_plan_rewrites_only_offending_segment(self):
+        plan = L.DayPlan("下班回家的一天", [
+            L.Segment(0, 480, "睡着", "沉"),
+            L.Segment(480, 900, "下班路上顺路买了外卖", "累"),
+            L.Segment(900, 1440, "在学院抄录数据", "松快"),
+        ])
+        fixed = L.scrub_plan(plan, L.BUILTIN_WORLD)
+        self.assertEqual(fixed.source, "repaired")
+        self.assertEqual(len(fixed.segments), 3, "不能整天作废")
+        self.assertFalse(L.world_hits(fixed.summary, L.BUILTIN_WORLD))
+        self.assertFalse(L.world_hits(
+            " ".join(f"{s.doing} {s.feel}" for s in fixed.segments), L.BUILTIN_WORLD))
+        self.assertEqual(fixed.segments[2].doing, "在学院抄录数据", "没问题的段不该被动")
+
+    def test_offending_generation_triggers_retry_then_scrub(self):
+        today = L._today()
+        bad = json.dumps({"summary": "下班回家", "segments": [
+            {"window": "00:00-07:30", "doing": "睡着", "feel": "沉"},
+            {"window": "07:30-12:00", "doing": "下班路上买外卖", "feel": "累"},
+            {"window": "12:00-18:00", "doing": "在学院听课", "feel": "平平的"},
+            {"window": "18:00-24:00", "doing": "翻旧磁带", "feel": "安宁"}]}, ensure_ascii=False)
+        engine, _, calls = make_engine(reply=bad)
+        state = run(engine.ensure_today())
+        plan = state.plans[today]
+        self.assertFalse(L.world_hits(engine._plan_text(plan), L.BUILTIN_WORLD),
+                         "落库前必须已经没有越界词")
+        self.assertTrue(any("retry" in c for c in calls), "应当点名重抽过一次")
 
 
 class TestAttach(unittest.TestCase):

@@ -3516,7 +3516,13 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                         "aches": [a.get("label") for a in state.vitals.aches]} if state.vitals else None),
             "dream": ({"mood": state.dream.mood, "len": len(state.dream.text),
                        "afterglow": state.dream.afterglow} if state.dream else None),
-            "card": ({"scene": state.card.scene_name} if state.card else None),
+            "seed": ({"place": state.seed.place, "prop": state.seed.prop,
+                      "verbs": state.seed.verbs, "events": state.seed.events,
+                      "feels": state.seed.feels}
+                     if state.seed else None),
+            "world_hits": _life.world_hits(
+                " ".join([state.plan.summary] + [f"{s.doing} {s.feel}" for s in state.plan.segments])
+                if state.plan else ""),
             "block": eng.render(state),
         }
 
