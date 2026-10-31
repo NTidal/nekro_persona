@@ -1359,6 +1359,11 @@ async def _life_write(key: str, value) -> None:
                                  value=json.dumps(value, ensure_ascii=False))
 
 
+# 关思考：persona 里所有「一次性」LLM 调用都必须带（实测见 consolidator.DISABLE_THINKING）。
+# 单一来源放这里，避免第三处再漏 —— 之前 life 生成就是漏了它，8 连跑里 7 次退兜底。
+LLM_NO_THINKING = dict(persona_consolidator.DISABLE_THINKING)
+
+
 async def _life_ask(prompt: str, *, system: str, task: str = "",
                     max_tokens: Optional[int] = None) -> str:
     """日程 / 梦境的一次性模型调用：独立于对话回合，不经过 agent。"""
@@ -1379,7 +1384,7 @@ async def _life_ask(prompt: str, *, system: str, task: str = "",
         max_tokens=int(max_tokens or 2600),
         # ⚠️ 必须关思考：思考 token 会挤占 max_tokens，症状是**正文为空**
         #    或正文被截断（实测 8 连跑里 7 次退兜底）。consolidator 早就踩过同一个坑。
-        extra_body=dict(persona_consolidator.DISABLE_THINKING),
+        extra_body=dict(LLM_NO_THINKING),
         max_wait_time=120,
     )
     return resp.response_content or ""
