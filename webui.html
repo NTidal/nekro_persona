@@ -747,7 +747,11 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 .life-kv { display: grid; gap: 8px; }
 .life-kv-row { display: flex; align-items: baseline; gap: 10px; font-size: 12px; }
 .life-kv-key { flex: 0 0 62px; color: var(--text-mute); font-size: 11px; }
-.life-kv-val { color: var(--text-soft); line-height: 1.6; }
+.life-kv-val { color: var(--text-soft); line-height: 1.6; flex: 1 1 auto; min-width: 0; }
+/* 能量：条在数值左边，条吃掉剩余宽度 */
+.life-energy { display: flex; align-items: center; gap: 10px; }
+.life-energy .meter { flex: 1 1 auto; margin-top: 0; min-width: 48px; }
+.life-energy-num { font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 12px; }
 .life-days { display: grid; gap: 8px; }
 .life-day {
   display: grid;
@@ -4171,7 +4175,7 @@ function renderLife(d) {
     const e = Math.max(0, Math.min(100, Number(vit.energy) || 0));
     const cls = e < 25 ? 'danger' : (e < 50 ? 'warning' : '');
     rows.push(`<div class="life-kv-row"><div class="life-kv-key">能量</div>
-      <div class="life-kv-val">${e}/100<div class="meter ${cls}"><i style="width:${e}%"></i></div></div></div>`);
+      <div class="life-kv-val life-energy"><div class="meter ${cls}"><i style="width:${e}%"></i></div><span class="life-energy-num">${e}/100</span></div></div>`);
     if (vit.mood) rows.push(`<div class="life-kv-row"><div class="life-kv-key">心情</div><div class="life-kv-val">${esc(vit.mood)}</div></div>`);
     const aches = (vit.aches || []).filter(Boolean);
     if (aches.length) rows.push(`<div class="life-kv-row"><div class="life-kv-key">身上</div><div class="life-kv-val">${esc(aches.join('、'))}</div></div>`);
