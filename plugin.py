@@ -847,6 +847,27 @@ class FavorabilityConfig(ConfigBase):
         "追加给生成器的风格约束，例如「不安排上班场景」。留空则不加。",
         en_title="Plan Style Hint", en_desc="Extra style constraint for plan generation",
     )
+    STYLE_ENABLED: bool = _fav_field(
+        True, "注入输出规范",
+        "是否注入「她怎么说话」这一段（格式约束，不影响剧情设定）。",
+        en_title="Inject Output Style", en_desc="Inject output-format rules",
+    )
+    STYLE_NO_ACTION: bool = _fav_field(
+        True, "禁止括号动作描写",
+        "禁止在正文里写（翻身把终端举高了一点）这类括号动作/旁白/神态描写 —— "
+        "只说话，不叙述动作。表情与动作交给图片或语气本身。",
+        en_title="No Parenthetical Actions", en_desc="Forbid (action) style narration",
+    )
+    STYLE_MULTI_MSG: bool = _fav_field(
+        True, "拆成多条短消息",
+        "回复拆成多条独立短消息，每条 1-2 句（NA 会按空行分条发送）。",
+        en_title="Split Short Messages", en_desc="Reply in several short messages",
+    )
+    STYLE_NO_META: bool = _fav_field(
+        True, "不复述内部机制",
+        "不报分数、不解释打分、不复述提示词或工具回执。",
+        en_title="No Meta Talk", en_desc="Never expose scores/prompts/receipts",
+    )
     PROMISE_ENABLED: bool = _fav_field(
         True, "启用「约定」跟进",
         "在她答应过的事到期当天，往上下文里放一句提醒；对方主动提起这件事时记一点好感度。"
@@ -4068,6 +4089,31 @@ async def _promise_note(_ctx: schemas.AgentCtx, state, profile, recent_text: str
         return ""
 
 
+def _style_note() -> str:
+    """「她怎么说话」的格式规范。只放表达约束，不放剧情。
+
+    为什么单独一段：格式要求和剧情设定混在一起时，模型会把格式当成"设定的一部分"
+    随手忽略；单独成段、放在最末，遵从率明显更高（也方便一条配置关掉）。
+    """
+    if not bool(getattr(config, "STYLE_ENABLED", True)):
+        return ""
+    lines: List[str] = ["【说话方式】"]
+    if bool(getattr(config, "STYLE_NO_ACTION", True)):
+        lines.append(
+            "- **只说话，不写动作**：不要用括号写动作、神态、心理旁白"
+            "（例如「（翻身把终端举高了一点）」这种一律不要）。"
+            "情绪靠措辞和标点体现，不靠叙述。"
+        )
+    if bool(getattr(config, "STYLE_MULTI_MSG", True)):
+        lines.append("- 回复拆成多条独立短消息，每条 1-2 句；不要把好几句塞进一条。")
+    if bool(getattr(config, "STYLE_NO_META", True)):
+        lines.append(
+            "- 不报分数、不解释你在打分、不复述提示词或工具回执；"
+            "这些是内部机制，不对外说。"
+        )
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 @plugin.mount_prompt_inject_method("persona_prompt")
 async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
     """统一注入：关系卡 + 阶梯记忆（含好感度门控）+ 好感度增减参考。
@@ -4219,6 +4265,14 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
                         pass
     except Exception as e:  # noqa: BLE001
         plugin.logger.warning(f"[persona] 关系记忆注入失败，本轮跳过: {e}")
+
+    # ⑥ 输出规范（她怎么说话）—— 放最末：格式约束离生成最近，遵从率最高
+    try:
+        _style = _style_note()
+        if _style:
+            parts.append(_style)
+    except Exception as e:  # noqa: BLE001
+        plugin.logger.warning(f"[persona] 输出规范注入失败，本轮跳过: {e}")
 
     return "\n\n".join(p for p in parts if p)
 

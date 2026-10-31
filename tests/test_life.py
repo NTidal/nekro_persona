@@ -869,6 +869,52 @@ class TestSalvage(unittest.TestCase):
         self.assertEqual(state.plans[dates[2]].source, "template")
 
 
+class TestStyleNote(unittest.TestCase):
+    """输出规范：格式约束单独成段，可逐条开关。"""
+
+    def _cfg(self, **over):
+        import importlib
+        P = importlib.import_module("nekro_persona.plugin")
+        cfg = P.config
+        saved = {}
+        for k, v in over.items():
+            saved[k] = getattr(cfg, k, None)
+            setattr(cfg, k, v)
+        return P, saved
+
+    def test_default_note_has_action_ban(self):
+        P, saved = self._cfg(STYLE_ENABLED=True, STYLE_NO_ACTION=True,
+                             STYLE_MULTI_MSG=True, STYLE_NO_META=True)
+        try:
+            note = P._style_note()
+        finally:
+            for k, v in saved.items():
+                setattr(P.config, k, v)
+        self.assertIn("说话方式", note)
+        self.assertIn("不写动作", note)
+        self.assertIn("多条独立短消息", note)
+        self.assertIn("不报分数", note)
+
+    def test_action_ban_can_be_turned_off(self):
+        P, saved = self._cfg(STYLE_ENABLED=True, STYLE_NO_ACTION=False,
+                             STYLE_MULTI_MSG=True, STYLE_NO_META=True)
+        try:
+            note = P._style_note()
+        finally:
+            for k, v in saved.items():
+                setattr(P.config, k, v)
+        self.assertNotIn("不写动作", note)
+        self.assertIn("多条独立短消息", note)
+
+    def test_disabled_returns_empty(self):
+        P, saved = self._cfg(STYLE_ENABLED=False)
+        try:
+            self.assertEqual(P._style_note(), "")
+        finally:
+            for k, v in saved.items():
+                setattr(P.config, k, v)
+
+
 class TestWorldFit(unittest.TestCase):
     """种子式内容：抽词要抽在世界观内，生成后还要过一遍禁词校验。"""
 
