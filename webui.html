@@ -64,6 +64,7 @@
   --bg-tint-1: rgba(47, 111, 94, 0.07);
   --bg-tint-2: rgba(180, 69, 58, 0.045);
   --surface: #fffdf7;
+  --surface-solid: #fffdf7;   /* 弹窗/抽屉用：不跟玻璃层一起变透明 */
   --surface-2: #faf7ef;
   --surface-3: #efe9dc;
   --surface-hover: #ece5d5;
@@ -104,6 +105,7 @@
   --bg-tint-1: rgba(99, 183, 164, 0.08);
   --bg-tint-2: rgba(224, 138, 125, 0.05);
   --surface: #1c1e23;
+  --surface-solid: #181b20;
   --surface-2: #22252c;
   --surface-3: #2a2e37;
   --surface-hover: #32363f;
@@ -652,6 +654,15 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 .badge.danger { color: var(--vermilion); border-color: var(--vermilion-border); background: var(--vermilion-soft); }
 .badge.info { color: var(--indigo); border-color: var(--indigo-border); background: var(--indigo-soft); }
 .badge-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+/* 长 chat_key（搜索态徽章）：单行截断，别把整行撑开 */
+.badge.trunc {
+  display: inline-block;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
 .chip {
   display: inline-flex;
   align-items: center;
@@ -1908,7 +1919,9 @@ dialog::backdrop { animation: fadeIn 0.35s ease; }
 
 /* ---------- 弹窗：浓磨砂卡片 ---------- */
 .dialog {
-  background-color: color-mix(in srgb, var(--surface) 74%, transparent);
+  /* ⚠️ 不能用 --surface：玻璃层把它调成 0.44 透明，再乘百分比就更透
+     （74% × 0.44 ≈ 33%，实测 0.41）。弹窗要压住背后内容，改用实色表面。 */
+  background-color: color-mix(in srgb, var(--surface-solid) 97%, transparent);
   border: 1px solid var(--glass-sheen);
 }
 dialog::backdrop { backdrop-filter: blur(12px) saturate(1.25); }
@@ -3337,7 +3350,11 @@ function openDialog({ title, subtitle = '', body = '', foot = '' }) {
   $('#dialogFoot').hidden = !foot;
   if (!dlg.open) dlg.showModal();
 }
-function closeDialog() { if (dlg.open) dlg.close(); }
+function closeDialog() {
+  if (dlg.open) dlg.close();
+  // 导入确认框关掉（取消 / 完成 / 出错）就别再攥着上一个 File 引用不放
+  if (state._pendingImport) state._pendingImport = null;
+}
 
 /* 统一的破坏性操作确认框：返回 Promise<boolean>。
    ⚠️ 之前全站只有「删背景记忆条目」有确认，而它恰好是唯一进回收站、可恢复的那种；
@@ -4572,7 +4589,9 @@ function renderOverviewRuntime(data) {
 async function renderOverviewMood() {
   const box = $('#overviewMood');
   if (!box) return;
+  const seq = (state.moodSeq = (state.moodSeq || 0) + 1);
   const d = await load('mood_stats?days=7');
+  if (seq !== state.moodSeq) return;                 // 已被更新的请求取代
   if (!d) { box.innerHTML = '<div class="empty-inline">统计暂不可用</div>'; return; }
   const days = d.days || 7;
   const bars = (d.by_day || []).map((x) => {
@@ -5923,7 +5942,14 @@ $('#cardStylePreview').addEventListener('click', () => runCardPreview());
 
 /* ---- 背景 ---- */
 let _bgTimer = 0;
+let _bgLast = { key: '', ts: 0 };
 async function saveBg(patch, rerender) {
+  // 拖动时 input 走 350ms 防抖、松手 change 又立刻存一次 —— 同一份 patch 会连发两遍。
+  // 600ms 内同值直接跳过（真的改了值 key 会变，不会误吞）。
+  const _key = JSON.stringify(patch || {});
+  const _now = Date.now();
+  if (_key === _bgLast.key && _now - _bgLast.ts < 600) return true;
+  _bgLast = { key: _key, ts: _now };
   let d = null;
   try {
     d = await postAction('card_bg', patch);
@@ -6239,7 +6265,7 @@ function renderMemo(data) {
         <strong>${esc(n.title || '未命名')}${n.expired ? ' <span class="badge warning">已过期</span>' : ''}</strong>
         <p>${esc(n.content || '')}</p>
         <div class="list-meta">
-          ${searching ? `<span class="badge info">${esc(n.chat_key || '')}</span>` : ''}
+          ${searching ? `<span class="badge info trunc" title="${esc(n.chat_key || '')}">${esc(n.chat_key || '')}</span>` : ''}
           ${n.min_favor ? `<span class="badge accent">门槛 ${n.min_favor}</span>` : '<span class="badge">公开</span>'}
           ${n.source_user_id ? `<span class="badge">${esc(n.source_user_id)}</span>` : ''}
           ${(n.tags || []).map((t) => `<span class="chip">${esc(t)}</span>`).join('')}
@@ -6367,7 +6393,8 @@ function renderAnchor(data) {
   $('#anchorMeta').innerHTML = `共 ${m.total != null ? m.total : data.items.length} 条 · 今日新增 ${m.day_count || 0} · 权重上限 ${m.salience_max || 5}`;
   const list = $('#anchorList');
   if (!data.items.length) { list.innerHTML = '<div class="empty-inline">还没有锚点——锚点由模型在对话中自行沉淀</div>'; return; }
-  const max = m.salience_max || 5;
+  // 上限跟后端走（salience_max），缺省才用 5；别再写死
+  const max = Math.max(1, Math.min(9, Number(m.salience_max) || 5));
   list.innerHTML = data.items.map((a) => `
     <div class="list-item">
       <div class="list-copy">
@@ -6796,6 +6823,14 @@ async function downloadFile(path, fallbackName) {
   const headers = {};
   if (state.key) headers['X-WebUI-Key'] = state.key;
   const res = await fetch('./api/' + path, { headers });
+  if (res.status === 401) {
+    // 走与 api() 一致的引导：弹密钥框并登记重放（否则用户只看到"HTTP 401"）
+    if (!_authReplaying) {
+      _setAuthPending(() => downloadFile(path, fallbackName), path, true);
+      openKeyDialog('需要访问密钥：本次下载没有执行');
+    }
+    throw new Error('需要访问密钥');
+  }
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
     try {
@@ -6823,6 +6858,13 @@ async function uploadZip(path, file) {
   const headers = { 'Content-Type': 'application/zip' };
   if (state.key) headers['X-WebUI-Key'] = state.key;
   const res = await fetch('./api/' + path, { method: 'POST', headers, body: file });
+  if (res.status === 401) {
+    if (!_authReplaying) {
+      _setAuthPending(() => uploadZip(path, file), path, true);
+      openKeyDialog('需要访问密钥：本次导入没有执行');
+    }
+    throw new Error('需要访问密钥');
+  }
   let data = null;
   try { data = await res.json(); } catch (e) { /* 非 JSON */ }
   if (!res.ok || !data || data.ok !== true) {
