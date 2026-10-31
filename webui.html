@@ -3971,6 +3971,74 @@ async function rebuildLife() {
 }
 
 /* ---------------- 日程（生活时间轴） ---------------- */
+/* ---------------- 日程：此刻由真实时间算 ---------------- */
+function lifeNowMinute() {
+  const now = new Date();
+  return now.getHours() * 60 + now.getMinutes();
+}
+
+function lifeSegmentIndex(segs, minute) {
+  for (let i = 0; i < segs.length; i += 1) {
+    const s = Number(segs[i].start) || 0;
+    const e = Number(segs[i].end) || 0;
+    if (minute >= s && minute < e) return i;
+  }
+  return -1;
+}
+
+// 把时间轴滚到「此刻」那段：只有真的换了段才滚，避免每分钟把页面拽走
+function scrollLifeToNow(smooth) {
+  const row = document.querySelector('#lifeTimeline .life-row.now');
+  if (!row) return;
+  const wrap = row.closest('.card-body') || row.parentElement;
+  const box = row.getBoundingClientRect();
+  const view = wrap.getBoundingClientRect();
+  const outside = box.top < view.top || box.bottom > view.bottom;
+  if (!outside) return;
+  row.scrollIntoView({ block: 'center', behavior: smooth ? 'smooth' : 'auto' });
+}
+
+// 每分钟重算一次高亮（不重新渲染整页，避免打断阅读与滚动位置）
+function refreshLifeNow() {
+  if (state.tab !== 'life') return;
+  const cache = state.lifeCache;
+  if (!cache || cache.date !== state.lifeDay) return;   // 只在"今天"那页有意义
+  const rows = $$('#lifeTimeline .life-row');
+  if (!rows.length) return;
+  const minute = lifeNowMinute();
+  let idx = -1;
+  rows.forEach((row, i) => {
+    const s = Number(row.dataset.start) || 0;
+    const e = Number(row.dataset.end) || 0;
+    if (minute >= s && minute < e) idx = i;
+  });
+  rows.forEach((row, i) => {
+    const on = i === idx;
+    row.classList.toggle('now', on);
+    const badge = row.querySelector('.life-doing .badge');
+    if (on && !badge) {
+      const doing = row.querySelector('.life-doing');
+      if (doing) doing.insertAdjacentHTML('beforeend', ' <span class="badge accent">此刻</span>');
+    } else if (!on && badge) {
+      badge.remove();
+    }
+  });
+  const hit = rows[idx];
+  if (!hit) return;
+  const key = `${hit.dataset.start}-${hit.dataset.end}`;
+  if (key !== state.lifeNowKey) {          // 换段了才滚
+    state.lifeNowKey = key;
+    scrollLifeToNow(true);
+    const doing = (hit.querySelector('.life-doing') || {}).textContent || '';
+    $('#lifeTimelineHint').textContent = `此刻 ${(hit.querySelector('.life-time') || {}).textContent || ''} · ${doing.replace(' 此刻', '').trim()}`;
+  }
+}
+
+setInterval(refreshLifeNow, 60000);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refreshLifeNow();   // 切回标签页立刻对齐
+});
+
 async function loadLife() {
   let data;
   try {
@@ -4029,19 +4097,25 @@ function renderLife(d) {
   }
 
   // ② 时间轴（跨天预览的切换器是下面「这几天」的每一行）
-  $('#lifeTimelineHint').textContent = isToday && now
-    ? `此刻 ${now.window} · ${now.doing}`
-    : (curDay ? `${curDay.date} · ${curDay.source === 'model' ? '模型生成' : curDay.source === 'repaired' ? '修补后' : '兜底模板'}` : '按段看在做什么');
+  // 「此刻」由真实时间算：拿分钟数比对每段 start/end，不依赖后端那份 now
+  const nowMin = lifeNowMinute();
+  const hitIdx = isToday ? lifeSegmentIndex(segs, nowMin) : -1;
+  const hit = hitIdx >= 0 ? segs[hitIdx] : null;
+  $('#lifeTimelineHint').textContent = hit
+    ? `此刻 ${hit.window} · ${hit.doing}`
+    : (curDay ? curDay.date : '按段看在做什么');
   if (!segs.length) {
     $('#lifeTimeline').innerHTML = '<div class="empty-inline">这一天还没有日程</div>';
   } else {
-    const nowWin = isToday && now ? now.window : '';
-    $('#lifeTimeline').innerHTML = '<div class="life-rows">' + segs.map((s) => `
-      <div class="life-row${s.window === nowWin ? ' now' : ''}">
+    $('#lifeTimeline').innerHTML = '<div class="life-rows">' + segs.map((s, i) => `
+      <div class="life-row${i === hitIdx ? ' now' : ''}" data-start="${Number(s.start) || 0}" data-end="${Number(s.end) || 0}">
         <div class="life-time">${esc(s.window || '')}</div>
-        <div class="life-doing">${esc(s.doing || '')}${s.window === nowWin ? ' <span class="badge accent">此刻</span>' : ''}</div>
+        <div class="life-doing">${esc(s.doing || '')}${i === hitIdx ? ' <span class="badge accent">此刻</span>' : ''}</div>
         <div class="life-feel">${esc(s.feel || '')}</div>
       </div>`).join('') + '</div>';
+    // 打开页面就滚到此刻那一段（否则长日程要手动找）
+    state.lifeNowKey = hit ? hit.window : '';
+    scrollLifeToNow(false);
   }
 
   // ③ 状态与素材
@@ -4075,13 +4149,12 @@ function renderLife(d) {
     : '点一行看那天的时间轴';
   $('#lifeDays').innerHTML = days.length
     ? '<div class="life-days">' + days.map((r) => {
-      const badge = r.source === 'model' ? 'success' : (r.source === 'repaired' ? 'warning' : 'danger');
-      const label = { model: '模型', repaired: '修补', template: '兜底' }[r.source] || r.source;
+      // 只留日期 / 段数 / 摘要：「今天」「模型」这类标签删掉（信息在指标卡里已经有了）
       const on = r.date === state.lifeDay;
       const isToday = r.date === todayDate;
       return `<div class="life-day${isToday ? ' today' : ''}${on ? ' on' : ''}" data-life-day="${esc(r.date)}" role="button" tabindex="0">
-        <div class="life-day-date">${esc(r.date)}${isToday ? ' <span class="badge accent">今天</span>' : ''}</div>
-        <div><span class="badge ${badge}">${esc(label)}</span> <span class="life-feel">${r.segments} 段</span></div>
+        <div class="life-day-date">${esc(r.date)}</div>
+        <div><span class="life-feel">${r.segments} 段</span></div>
         <div class="life-day-sum">${esc(r.summary || '')}</div>
       </div>`;
     }).join('') + '</div>'
@@ -4180,6 +4253,7 @@ $('#lifeRefreshBtn').addEventListener('click', async () => {
 function pickLifeDay(date) {
   if (!date) return;
   state.lifeDay = date;
+  state.lifeNowKey = '';
   renderLife(state.lifeCache || {});
   // 切完把时间轴滚进视野：点的是下面那行，看的是上面那块
   const card = $('#lifeTimeline');
