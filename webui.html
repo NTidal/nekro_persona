@@ -652,9 +652,11 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 .life-row {
   display: grid;
   grid-template-columns: 96px 1fr auto;
-  align-items: baseline;
+  align-items: center;
   gap: 10px;
-  padding: 7px 10px;
+  /* 行高固定：doing 长短不一时（尤其跨天切换）不会把整块顶来顶去 */
+  height: 48px;
+  padding: 0 10px;
   border-radius: 8px;
   border-left: 2px solid transparent;
   transition: background 0.14s ease, border-color 0.14s ease;
@@ -665,9 +667,26 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
   border-left-color: var(--accent);
 }
 .life-time { font-variant-numeric: tabular-nums; font-size: 11px; color: var(--text-mute); letter-spacing: 0.02em; }
-.life-doing { font-size: 12.5px; color: var(--text-soft); line-height: 1.55; }
+.life-doing {
+  font-size: 12.5px;
+  color: var(--text-soft);
+  line-height: 1.45;
+  display: -webkit-box;          /* 两行封顶 + 省略号：固定行高下才排得齐 */
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .life-row.now .life-doing { color: var(--text); }
 .life-feel { font-size: 11px; color: var(--text-mute); white-space: nowrap; }
+.life-split { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); gap: 22px; }
+.life-split-title {
+  font-size: 11px;
+  color: var(--text-mute);
+  letter-spacing: 0.04em;
+  padding-bottom: 8px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
 .life-day { cursor: pointer; transition: background 0.14s ease, border-color 0.14s ease; }
 .life-day:hover { background: var(--surface-2); }
 .life-day.on {
@@ -738,9 +757,10 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 .life-day-sum { font-size: 12px; color: var(--text-mute); line-height: 1.55; }
 .life-day.today .life-day-sum { color: var(--text-soft); }
 @media (max-width: 720px) {
-  .life-row { grid-template-columns: 78px 1fr; }
+  .life-row { grid-template-columns: 78px 1fr; height: 46px; }
   .life-feel { display: none; }
   .life-day { grid-template-columns: 84px 1fr; }
+  .life-split { grid-template-columns: 1fr; gap: 18px; }
 }
 
 .data-table { width: 100%; border-collapse: collapse; }
@@ -2398,34 +2418,34 @@ body.is-scrolling .dialog-foot {
         </div>
       </div>
       <div class="metric-grid" id="lifeMetrics"></div>
-      <div class="two-col">
-        <div class="card">
-          <div class="card-head">
-            <div>
-              <h2 class="card-title">时间轴</h2>
-              <div class="card-subtitle" id="lifeTimelineHint">按段看在做什么</div>
-            </div>
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">时间轴</h2>
+            <div class="card-subtitle" id="lifeTimelineHint">按段看在做什么</div>
           </div>
-          <div class="card-body" id="lifeTimeline"><div class="empty-inline">加载中…</div></div>
         </div>
-        <div class="card">
-          <div class="card-head">
-            <div>
-              <h2 class="card-title">状态与素材</h2>
-              <div class="card-subtitle">能量 / 心情 / 今天抽到的词元</div>
-            </div>
-          </div>
-          <div class="card-body" id="lifeSide"><div class="empty-inline">加载中…</div></div>
-        </div>
+        <div class="card-body" id="lifeTimeline"><div class="empty-inline">加载中…</div></div>
       </div>
       <div class="card">
         <div class="card-head">
           <div>
-            <h2 class="card-title">这几天</h2>
+            <h2 class="card-title">状态与这几天</h2>
             <div class="card-subtitle" id="lifeDaysHint">点一行看那天的时间轴</div>
           </div>
         </div>
-        <div class="card-body" id="lifeDays"><div class="empty-inline">加载中…</div></div>
+        <div class="card-body">
+          <div class="life-split">
+            <div class="life-split-col">
+              <div class="life-split-title">状态与素材</div>
+              <div id="lifeSide"><div class="empty-inline">加载中…</div></div>
+            </div>
+            <div class="life-split-col">
+              <div class="life-split-title">这几天</div>
+              <div id="lifeDays"><div class="empty-inline">加载中…</div></div>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="card">
         <div class="card-head">
@@ -4012,17 +4032,8 @@ function refreshLifeNow() {
     const e = Number(row.dataset.end) || 0;
     if (minute >= s && minute < e) idx = i;
   });
-  rows.forEach((row, i) => {
-    const on = i === idx;
-    row.classList.toggle('now', on);
-    const badge = row.querySelector('.life-doing .badge');
-    if (on && !badge) {
-      const doing = row.querySelector('.life-doing');
-      if (doing) doing.insertAdjacentHTML('beforeend', ' <span class="badge accent">此刻</span>');
-    } else if (!on && badge) {
-      badge.remove();
-    }
-  });
+  // 只保留高亮，不再插「此刻」角标（角标会把固定行高撑开一点，切换时看得出抖）
+  rows.forEach((row, i) => row.classList.toggle('now', i === idx));
   const hit = rows[idx];
   if (!hit) return;
   const key = `${hit.dataset.start}-${hit.dataset.end}`;
@@ -4110,7 +4121,7 @@ function renderLife(d) {
     $('#lifeTimeline').innerHTML = '<div class="life-rows">' + segs.map((s, i) => `
       <div class="life-row${i === hitIdx ? ' now' : ''}" data-start="${Number(s.start) || 0}" data-end="${Number(s.end) || 0}">
         <div class="life-time">${esc(s.window || '')}</div>
-        <div class="life-doing">${esc(s.doing || '')}${i === hitIdx ? ' <span class="badge accent">此刻</span>' : ''}</div>
+        <div class="life-doing">${esc(s.doing || '')}</div>
         <div class="life-feel">${esc(s.feel || '')}</div>
       </div>`).join('') + '</div>';
     // 打开页面就滚到此刻那一段（否则长日程要手动找）
