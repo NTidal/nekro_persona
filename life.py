@@ -1064,9 +1064,13 @@ class Engine:
         except Exception:  # noqa: BLE001
             raw = None
         if not isinstance(raw, dict):
-            return {"scenes": [], "interludes": []}
-        return {"scenes": [str(x) for x in (raw.get("scenes") or [])],
-                "interludes": [str(x) for x in (raw.get("interludes") or [])]}
+            return {"places": [], "events": [], "props": []}
+        # ⚠️ 键名必须与 roll_card 写的一致（places/events）。
+        #    曾经这里还留着旧的 scenes/interludes：读回来的永远是空表，
+        #    冷却形同虚设 —— 实测连续 8 天抽到同一个地点。
+        return {"places": [str(x) for x in (raw.get("places") or raw.get("scenes") or [])],
+                "events": [str(x) for x in (raw.get("events") or raw.get("interludes") or [])],
+                "props": [str(x) for x in (raw.get("props") or [])]}
 
     async def save_history(self, hist: Dict[str, List[str]]) -> None:
         try:
@@ -1084,23 +1088,35 @@ class Engine:
         pack = load_world_pack()
         rng = _rng("seed", date_key)
 
-        cooled_places = set((hist.get("places") or [])[-SCENE_COOLDOWN:])
+        def _cool(window: int, size: int) -> int:
+            """冷却窗口按池子大小自适应。
+
+            池子只有 8 条却硬冷却 10 次，会一路「全在冷却」→ 退回全池 → 天天抽到同一条。
+            实测就是这样把事件词抽成了 4/16 种。
+            """
+            return max(0, min(window, size - 2))
+
+        cooled_places = set((hist.get("places") or [])[-_cool(SCENE_COOLDOWN, len(pack.places)):])
         place_pool = [p for p in pack.places if p not in cooled_places] or list(pack.places)
         place = rng.choice(place_pool) if place_pool else ""
 
-        cooled_events = set((hist.get("events") or [])[-INTERLUDE_COOLDOWN:])
+        cooled_events = set((hist.get("events") or [])[-_cool(INTERLUDE_COOLDOWN, len(pack.events)):])
         event_pool = [e for e in pack.events if e not in cooled_events] or list(pack.events)
         rng.shuffle(event_pool)
         events = event_pool[:INTERLUDE_PER_DAY]
 
+        cooled_props = set((hist.get("props") or [])[-_cool(4, len(pack.props)):])
+        prop_pool = [p for p in pack.props if p not in cooled_props] or list(pack.props)
+        prop = rng.choice(prop_pool) if prop_pool else ""
+
         verbs = rng.sample(list(pack.verbs), k=min(2, len(pack.verbs))) if pack.verbs else []
         feels = rng.sample(list(pack.feels), k=min(2, len(pack.feels))) if pack.feels else []
-        prop = rng.choice(list(pack.props)) if pack.props else ""
 
         seed = DaySeed(date_key, place, prop, verbs, events, feels)
         new_hist = {
             "places": (list(hist.get("places") or []) + [place])[-SCENE_COOLDOWN * 2:],
             "events": (list(hist.get("events") or []) + events)[-INTERLUDE_COOLDOWN * 3:],
+            "props": (list(hist.get("props") or []) + [prop])[-8:],
         }
         return seed, new_hist
 
@@ -1204,8 +1220,10 @@ class Engine:
         if not dates:
             return state
         today = _today()
-        if not (state.seed and state.seed.date == today):
-            seed, hist = self.roll_card(today, await self.load_history())
+        # 抽签锚在**这批的第一天**：补将来日期时用那天的种子，而不是永远用今天的。
+        anchor = dates[0]
+        if not (state.seed and state.seed.date == anchor):
+            seed, hist = self.roll_card(anchor, await self.load_history())
             await self.save_history(hist)
             state.seed = seed
 
@@ -1299,7 +1317,13 @@ class Engine:
                     short = day
                 lines.append(f"· {day}（{short}）")
         else:
-            lines.append(f"今天：{day_label()}")
+            # ⚠️ 必须用**目标日期**的标签，不能用 now()：
+            #    补将来日期时会写出"今天是周日 假日"，模型于是把工作日当假日过。
+            try:
+                target = datetime.strptime(dates[0], "%Y-%m-%d")
+            except Exception:  # noqa: BLE001
+                target = None
+            lines.append(f"今天：{day_label(target)}" if target else f"今天：{day_label()}")
         material = seed_block(state.seed)
         if material:
             lines.append(material)

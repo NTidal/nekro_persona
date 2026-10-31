@@ -1377,6 +1377,9 @@ async def _life_ask(prompt: str, *, system: str, task: str = "",
         base_url=group.BASE_URL,
         temperature=0.85,
         max_tokens=int(max_tokens or 2600),
+        # ⚠️ 必须关思考：思考 token 会挤占 max_tokens，症状是**正文为空**
+        #    或正文被截断（实测 8 连跑里 7 次退兜底）。consolidator 早就踩过同一个坑。
+        extra_body=dict(persona_consolidator.DISABLE_THINKING),
         max_wait_time=120,
     )
     return resp.response_content or ""
