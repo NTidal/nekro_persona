@@ -1408,6 +1408,11 @@ async def _life_persona_text() -> str:
 
 
 try:
+    # 记忆归纳也要守同一套世界观：把 life.json 的禁词表接过去。
+    # memory_log 里一旦出现「下班/组长/通勤」，它会被第 ⑤ 段每轮注入，
+    # 日程和情绪都会跟着漂 —— 那是比日程本身更难发现的上游污染。
+    persona_consolidator.configure_forbidden(
+        lambda: persona_life.load_world_pack().forbidden)
     persona_life.attach(persona_life.Engine(
         store_read=_life_read,
         store_write=_life_write,
@@ -6247,6 +6252,8 @@ async def _memlog_loop() -> None:
                     memories = await persona_consolidator.consolidate_with_llm(
                         batch, model_group_name=model_group,
                     )
+                    # 归纳结果过一道世界观过滤：宁可少记一条，也不让"下班/组长"进事件史
+                    memories = persona_consolidator.filter_memories(memories)
                 except Exception as exc:  # noqa: BLE001
                     plugin.logger.warning(
                         f"[memory_log] 归纳异常，素材回填: {chat_key}: {exc}")

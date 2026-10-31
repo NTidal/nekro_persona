@@ -352,10 +352,60 @@ def clear_buckets() -> None:
 
 # ==================== Prompt ====================
 
+# 世界观禁词（由 plugin.py 注入提供者；空 = 不过滤）
+_FORBIDDEN_PROVIDER = None
+
+
+def configure_forbidden(provider) -> None:
+    """注入「这个世界里不存在的词」的提供者（返回可迭代的字符串）。
+
+    做成 provider 而不是一次性列表：`life.json` 随时可能被改，取的时候才解析。
+    """
+    global _FORBIDDEN_PROVIDER
+    _FORBIDDEN_PROVIDER = provider
+
+
+def _forbidden_words() -> List[str]:
+    if _FORBIDDEN_PROVIDER is None:
+        return []
+    try:
+        return [str(w) for w in (_FORBIDDEN_PROVIDER() or []) if str(w).strip()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def scrub_memory(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """命中世界观禁词的记忆条目：返回 None 表示该丢，否则返回改写后的条目。
+
+    为什么丢而不是改写：一条"下班前被组长批评"的记忆里，**整件事都是编的**
+    （她没有上班这回事），改写只会造出另一件假事。
+    """
+    words = _forbidden_words()
+    if not words:
+        return item
+    body = " ".join([
+        str(item.get("title") or ""),
+        str(item.get("content") or ""),
+        " ".join(str(t) for t in (item.get("tags") or [])),
+    ])
+    hits = [w for w in words if w in body]
+    if not hits:
+        return item
+    logger.info(f"[memory_log] 丢弃越界记忆（{'、'.join(hits[:3])}）：{str(item.get('title'))[:16]}")
+    return None
+
+
 SYSTEM_PROMPT = (
     "你是记忆整理助手。给你一段角色与用户的互动记录（每条是一次关系的"
     "「变化依据」或角色说过的语音内容），请把**真正发生过的事件**归纳成"
     "若干条可长期留存的记忆。"
+)
+
+#: 禁词提示（运行时拼进去，避免把具体世界观写死在模板里）
+FORBIDDEN_HINT = (
+    "\n6. **不要引入这个世界不存在的场景与身份**：不要写上班/下班/打卡/通勤/开会/同事/"
+    "领导/工位/加班/公司/办公室/地铁/公交/外卖/便利店/工资/房贷这类词，"
+    "也不要把对方的事写成角色的日常"
 )
 
 USER_PROMPT_TEMPLATE = """以下是最近一段互动的要点记录（{n} 条）：
@@ -384,7 +434,13 @@ def build_prompt(items: List[Dict[str, Any]]) -> str:
             ts = time.strftime("%m-%d %H:%M", time.localtime(int(it["at"])))
         kind = "语音" if it.get("kind") == "voice" else "互动"
         lines.append(f"{i}. [{ts}][{kind}] {it.get('text', '')}")
-    return USER_PROMPT_TEMPLATE.format(n=len(items), materials="\n".join(lines))
+    prompt = USER_PROMPT_TEMPLATE.format(n=len(items), materials="\n".join(lines))
+    if _forbidden_words():
+        prompt = prompt.replace(
+            "\n5. 如果没有值得记的事，返回空数组",
+            "\n5. 如果没有值得记的事，返回空数组" + FORBIDDEN_HINT,
+        )
+    return prompt
 
 
 # ==================== LLM 调用 ====================
@@ -448,6 +504,22 @@ def parse_response(raw: str, *, strict: bool = False) -> List[Dict[str, Any]]:
             "event_at": ev,
         })
     return out
+
+
+def filter_memories(memories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把越界记忆过滤掉（保持顺序）。"""
+    kept: List[Dict[str, Any]] = []
+    dropped = 0
+    for item in memories or []:
+        if not isinstance(item, dict):
+            continue
+        if scrub_memory(item) is None:
+            dropped += 1
+            continue
+        kept.append(item)
+    if dropped:
+        logger.info(f"[memory_log] 本轮过滤掉 {dropped} 条越界记忆")
+    return kept
 
 
 async def consolidate_with_llm(items: List[Dict[str, Any]],

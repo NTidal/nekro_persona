@@ -24,6 +24,37 @@ HALF = 3600          # 默认半衰期 60 分钟
 NO_DIGIT = re.compile(r"\d")
 
 
+class TestMemoryLogWorldFilter(unittest.TestCase):
+    """memory_log 的世界观过滤：越界记忆宁可丢掉，也不让它进第 ⑤ 段注入。"""
+
+    def setUp(self):
+        from nekro_persona import consolidator as C
+        self.C = C
+        C.configure_forbidden(lambda: ["上班", "下班", "通勤", "组长"])
+        self.addCleanup(C.configure_forbidden, None)
+
+    def test_drops_offending_memory(self):
+        kept = self.C.filter_memories([
+            {"title": "下班被批评", "content": "下班前组长当众批评了对方", "tags": ["下班"]},
+            {"title": "冰原散步", "content": "傍晚沿着冰原走了一段", "tags": ["冰原"]},
+        ])
+        self.assertEqual([m["title"] for m in kept], ["冰原散步"])
+
+    def test_keeps_everything_when_no_words(self):
+        self.C.configure_forbidden(lambda: [])
+        rows = [{"title": "下班被批评", "content": "下班", "tags": []}]
+        self.assertEqual(len(self.C.filter_memories(rows)), 1)
+
+    def test_prompt_carries_forbidden_hint(self):
+        prompt = self.C.build_prompt([{"text": "某人说了句话", "at": 0}])
+        self.assertIn("不要引入这个世界不存在的场景与身份", prompt)
+
+    def test_prompt_without_words_has_no_hint(self):
+        self.C.configure_forbidden(lambda: [])
+        prompt = self.C.build_prompt([{"text": "某人说了句话", "at": 0}])
+        self.assertNotIn("不要引入这个世界不存在的场景与身份", prompt)
+
+
 class TestMoodHalfLifeOverride(unittest.TestCase):
     """B3：档案上存的半衰期优先于配置默认（越熟的气散得越慢）。"""
 
