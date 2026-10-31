@@ -3512,6 +3512,10 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 for d in sorted(state.plans)
             ],
             "now": ({"window": seg.window, "doing": seg.doing, "feel": seg.feel} if seg else None),
+            # 前端时间轴要画完整分段：只给 now 的话，页面上就只剩"此刻"一行
+            "timeline": ([{"window": s.window, "start": s.start, "end": s.end,
+                           "doing": s.doing, "feel": s.feel}
+                          for s in state.plan.segments] if state.plan else []),
             "vitals": ({"energy": state.vitals.energy, "mood": state.vitals.mood,
                         "aches": [a.get("label") for a in state.vitals.aches]} if state.vitals else None),
             "dream": ({"mood": state.dream.mood, "len": len(state.dream.text),

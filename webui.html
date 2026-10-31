@@ -647,6 +647,61 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 
 /* ---------- 表格 ---------- */
 .table-wrap { width: 100%; overflow: auto; }
+/* ── 日程时间轴 ── */
+.life-rows { display: grid; gap: 2px; }
+.life-row {
+  display: grid;
+  grid-template-columns: 96px 1fr auto;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border-left: 2px solid transparent;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+.life-row:hover { background: var(--surface-2); }
+.life-row.now {
+  background: var(--accent-soft);
+  border-left-color: var(--accent);
+}
+.life-time { font-variant-numeric: tabular-nums; font-size: 11px; color: var(--text-mute); letter-spacing: 0.02em; }
+.life-doing { font-size: 12.5px; color: var(--text-soft); line-height: 1.55; }
+.life-row.now .life-doing { color: var(--text); }
+.life-feel { font-size: 11px; color: var(--text-mute); white-space: nowrap; }
+.life-block {
+  margin: 0;
+  padding: 0;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.life-kv { display: grid; gap: 8px; }
+.life-kv-row { display: flex; align-items: baseline; gap: 10px; font-size: 12px; }
+.life-kv-key { flex: 0 0 62px; color: var(--text-mute); font-size: 11px; }
+.life-kv-val { color: var(--text-soft); line-height: 1.6; }
+.life-days { display: grid; gap: 8px; }
+.life-day {
+  display: grid;
+  grid-template-columns: 92px 74px 1fr;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border-left: 2px solid transparent;
+}
+.life-day.today { background: var(--accent-soft); border-left-color: var(--accent); }
+.life-day-date { font-variant-numeric: tabular-nums; font-size: 11.5px; color: var(--text-soft); }
+.life-day-sum { font-size: 12px; color: var(--text-mute); line-height: 1.55; }
+.life-day.today .life-day-sum { color: var(--text-soft); }
+@media (max-width: 720px) {
+  .life-row { grid-template-columns: 78px 1fr; }
+  .life-feel { display: none; }
+  .life-day { grid-template-columns: 84px 1fr; }
+}
+
 .data-table { width: 100%; border-collapse: collapse; }
 .data-table th {
   padding: 10px 14px;
@@ -2175,6 +2230,10 @@ body.is-scrolling .dialog-foot {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg>
         <span>概览</span>
       </button>
+      <button class="nav-item" type="button" data-tab="life">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/></svg>
+        <span>日程</span>
+      </button>
       <button class="nav-item" type="button" data-tab="memory">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11v17H6.5A2.5 2.5 0 0 0 4 22.5v-17Z"/><path d="M20 5.5A2.5 2.5 0 0 0 17.5 3H13v17h4.5a2.5 2.5 0 0 1 2.5 2.5v-17Z"/></svg>
         <span>背景记忆</span>
@@ -2277,6 +2336,58 @@ body.is-scrolling .dialog-foot {
           <div class="card-body" id="overviewDir"></div>
         </div>
         <div class="card"></div>
+      </div>
+    </section>
+
+    <!-- 日程（生活时间轴） -->
+    <section class="page" id="page-life" data-page="life">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">日程</h1>
+          <p class="page-desc">她今天在过什么日子：一整天的时间轴、此刻的状态、抽到的素材与昨夜余韵。</p>
+        </div>
+        <div class="head-actions">
+          <button class="btn sm" type="button" id="lifeRefreshBtn">刷新</button>
+        </div>
+      </div>
+      <div class="metric-grid" id="lifeMetrics"></div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">今天的时间轴</h2>
+              <div class="card-subtitle" id="lifeTimelineHint">按段看她在做什么</div>
+            </div>
+          </div>
+          <div class="card-body" id="lifeTimeline"><div class="empty-inline">加载中…</div></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">状态与素材</h2>
+              <div class="card-subtitle">能量 / 心情 / 今天抽到的词元</div>
+            </div>
+          </div>
+          <div class="card-body" id="lifeSide"><div class="empty-inline">加载中…</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">这几天</h2>
+            <div class="card-subtitle" id="lifeDaysHint">已排好的日子（含未来）</div>
+          </div>
+        </div>
+        <div class="card-body" id="lifeDays"><div class="empty-inline">加载中…</div></div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">注入块</h2>
+            <div class="card-subtitle">她每轮实际拿到的那一段（原样）</div>
+          </div>
+        </div>
+        <div class="card-body"><pre class="life-block" id="lifeBlock"></pre></div>
       </div>
     </section>
 
@@ -3701,10 +3812,120 @@ const MOCK = (() => {
   };
 })();
 
+/* ---------------- 日程（生活时间轴） ---------------- */
+async function loadLife() {
+  let data;
+  try {
+    data = await api('life_state');
+  } catch (e) {
+    $('#lifeMetrics').innerHTML = '';
+    $('#lifeTimeline').innerHTML = `<div class="empty-inline">读取失败：${esc(e.message || '未知错误')}</div>`;
+    return;
+  }
+  renderLife(data);
+}
+
+function renderLife(d) {
+  const on = d && d.enabled;
+  const segs = (d && d.timeline) || [];
+  const now = (d && d.now) || null;
+  const days = (d && d.days) || [];
+  const vit = (d && d.vitals) || null;
+  const seed = (d && d.seed) || null;
+  const hits = (d && d.world_hits) || [];
+
+  // ① 指标
+  const sourceKind = (d && d.source) === 'model' ? 'success'
+    : (d && d.source) === 'repaired' ? 'warning'
+      : (d && d.source) ? 'danger' : 'info';
+  const sourceText = { model: '模型生成', repaired: '修补后', template: '兜底模板' }[(d && d.source) || ''] || '未生成';
+  const cards = [
+    ['日期', on ? (d.date || '—') : '—', on ? '' : '未开启'],
+    ['来源', sourceText, ''],
+    ['段数', String((d && d.segments) || 0), `一次排 ${(d && d.horizon) || 1} 天`],
+    ['越界词', hits.length ? hits.join('、') : '无', hits.length ? '世界观校验未通过' : ''],
+  ];
+  $('#lifeMetrics').innerHTML = cards.map(([k, v, sub]) => `
+    <div class="metric">
+      <div class="metric-label">${esc(k)}</div>
+      <div class="metric-value">${esc(String(v))}</div>
+      ${sub ? `<div class="metric-sub">${esc(sub)}</div>` : ''}
+    </div>`).join('');
+
+  if (!on) {
+    const why = esc((d && d.reason) || 'LIFE_ENABLED 未开启');
+    $('#lifeTimeline').innerHTML = `<div class="empty-inline">生活时间轴未启用：${why}</div>`;
+    $('#lifeSide').innerHTML = '';
+    $('#lifeDays').innerHTML = '';
+    $('#lifeBlock').textContent = '';
+    return;
+  }
+
+  // ② 时间轴
+  $('#lifeTimelineHint').textContent = now
+    ? `此刻 ${now.window} · ${now.doing}`
+    : '按段看她在做什么';
+  if (!segs.length) {
+    $('#lifeTimeline').innerHTML = '<div class="empty-inline">今天还没有日程</div>';
+  } else {
+    const nowWin = now ? now.window : '';
+    $('#lifeTimeline').innerHTML = '<div class="life-rows">' + segs.map((s) => `
+      <div class="life-row${s.window === nowWin ? ' now' : ''}">
+        <div class="life-time">${esc(s.window || '')}</div>
+        <div class="life-doing">${esc(s.doing || '')}${s.window === nowWin ? ' <span class="badge accent">此刻</span>' : ''}</div>
+        <div class="life-feel">${esc(s.feel || '')}</div>
+      </div>`).join('') + '</div>';
+  }
+
+  // ③ 状态与素材
+  const rows = [];
+  if (vit) {
+    const e = Math.max(0, Math.min(100, Number(vit.energy) || 0));
+    const cls = e < 25 ? 'danger' : (e < 50 ? 'warning' : '');
+    rows.push(`<div class="life-kv-row"><div class="life-kv-key">能量</div>
+      <div class="life-kv-val">${e}/100<div class="meter ${cls}"><i style="width:${e}%"></i></div></div></div>`);
+    if (vit.mood) rows.push(`<div class="life-kv-row"><div class="life-kv-key">心情</div><div class="life-kv-val">${esc(vit.mood)}</div></div>`);
+    const aches = (vit.aches || []).filter(Boolean);
+    if (aches.length) rows.push(`<div class="life-kv-row"><div class="life-kv-key">身上</div><div class="life-kv-val">${esc(aches.join('、'))}</div></div>`);
+  }
+  if (seed) {
+    if (seed.place) rows.push(`<div class="life-kv-row"><div class="life-kv-key">在哪</div><div class="life-kv-val">${esc(seed.place)}</div></div>`);
+    if (seed.prop) rows.push(`<div class="life-kv-row"><div class="life-kv-key">手边</div><div class="life-kv-val">${esc(seed.prop)}</div></div>`);
+    if ((seed.verbs || []).length) rows.push(`<div class="life-kv-row"><div class="life-kv-key">会做</div><div class="life-kv-val">${esc(seed.verbs.join('、'))}</div></div>`);
+    if ((seed.events || []).length) rows.push(`<div class="life-kv-row"><div class="life-kv-key">会发生</div><div class="life-kv-val">${esc(seed.events.join(' / '))}</div></div>`);
+  }
+  if (d.dream && d.dream.afterglow) {
+    rows.push(`<div class="life-kv-row"><div class="life-kv-key">昨夜</div><div class="life-kv-val">${esc(d.dream.afterglow)}</div></div>`);
+  }
+  if (hits.length) {
+    rows.push(`<div class="life-kv-row"><div class="life-kv-key">越界</div><div class="life-kv-val">${esc(hits.join('、'))}（世界观校验命中，已在生成侧处理）</div></div>`);
+  }
+  $('#lifeSide').innerHTML = rows.length ? `<div class="life-kv">${rows.join('')}</div>` : '<div class="empty-inline">暂无状态</div>';
+
+  // ④ 这几天
+  $('#lifeDaysHint').textContent = days.length
+    ? `共 ${days.length} 天（含未来，一次排 ${d.horizon || 1} 天）`
+    : '已排好的日子（含未来）';
+  $('#lifeDays').innerHTML = days.length
+    ? '<div class="life-days">' + days.map((r) => {
+      const badge = r.source === 'model' ? 'success' : (r.source === 'repaired' ? 'warning' : 'danger');
+      const label = { model: '模型', repaired: '修补', template: '兜底' }[r.source] || r.source;
+      return `<div class="life-day${r.date === d.date ? ' today' : ''}">
+        <div class="life-day-date">${esc(r.date)}</div>
+        <div><span class="badge ${badge}">${esc(label)}</span> <span class="life-feel">${r.segments} 段</span></div>
+        <div class="life-day-sum">${esc(r.summary || '')}</div>
+      </div>`;
+    }).join('') + '</div>'
+    : '<div class="empty-inline">还没有排好的日子</div>';
+
+  // ⑤ 注入块
+  $('#lifeBlock').textContent = d.block || '（本轮没有注入块）';
+}
+
 /* ---------------- 导航 ---------------- */
-const PAGES = ['overview', 'memory', 'favor', 'rules', 'preview', 'cards', 'memo', 'anchor', 'memlog', 'trash', 'transfer', 'settings'];
+const PAGES = ['overview', 'life', 'memory', 'favor', 'rules', 'preview', 'cards', 'memo', 'anchor', 'memlog', 'trash', 'transfer', 'settings'];
 const LOADERS = {
-  overview: loadOverview, memory: loadMemory, favor: loadFavor, rules: loadRules,
+  overview: loadOverview, life: loadLife, memory: loadMemory, favor: loadFavor, rules: loadRules,
   preview: loadPreview, cards: loadCards, memo: loadMemo, anchor: loadAnchor, memlog: loadMemlog,
   trash: loadTrash, transfer: loadTransfer, settings: loadSettings,
 };
@@ -3782,6 +4003,12 @@ document.addEventListener('click', (e) => {
   const g = e.target.closest('[data-goto]');
   if (g) goto(g.dataset.goto);
 });
+$('#lifeRefreshBtn').addEventListener('click', async () => {
+  if (state.tab !== 'life') return;
+  toast('正在刷新日程…', 'info', 1200);
+  await loadLife();
+});
+
 $('#refreshBtn').addEventListener('click', async () => {
   // 走 goto 而不是直接调 loader：goto 包装里有转场和数字滚动（FX.replay）。
   // 直接调 loader 会让概览指标停在全 0（见 renderOverviewMetrics 里的注释）。
