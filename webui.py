@@ -3517,14 +3517,14 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                  "source": state.plans[d].source,
                  "summary": state.plans[d].summary,
                  "segments": [{"window": s.window, "start": s.start, "end": s.end,
-                               "doing": s.doing, "feel": s.feel}
+                               "doing": s.doing, "feel": s.feel, "mood": s.mood}
                               for s in state.plans[d].segments]}
                 for d in sorted(state.plans)
             ],
             "now": ({"window": seg.window, "doing": seg.doing, "feel": seg.feel} if seg else None),
             # 前端时间轴要画完整分段：只给 now 的话，页面上就只剩"此刻"一行
             "timeline": ([{"window": s.window, "start": s.start, "end": s.end,
-                           "doing": s.doing, "feel": s.feel}
+                           "doing": s.doing, "feel": s.feel, "mood": s.mood}
                           for s in state.plan.segments] if state.plan else []),
             "vitals": ({"energy": state.vitals.energy, "mood": state.vitals.mood,
                         "aches": [a.get("label") for a in state.vitals.aches]} if state.vitals else None),
@@ -3560,9 +3560,8 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "verbs": list(pack.verbs),
             "feels": list(pack.feels),
             "events": list(pack.events),
-            # 禁词整份可编辑（演城市上班族时要能整体换掉）；默认值只作「填入默认」用
+            # 禁词整份可编辑（演城市上班族时要能整体换掉）；页面不提供默认组填入
             "forbidden": list(pack.forbidden),
-            "default_forbidden": list(_life.DEFAULT_FORBIDDEN),
             "path": path,
         }
 
@@ -3627,7 +3626,6 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "feels": list(pack.feels),
                 "events": list(pack.events),
                 "forbidden": list(pack.forbidden),
-                "default_forbidden": list(_life.DEFAULT_FORBIDDEN),
             },
         }
 

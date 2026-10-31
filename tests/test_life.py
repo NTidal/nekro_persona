@@ -869,6 +869,66 @@ class TestSalvage(unittest.TestCase):
         self.assertEqual(state.plans[dates[2]].source, "template")
 
 
+class TestSegmentMood(unittest.TestCase):
+    """段级初始 mood：生成时就给，夹在 ±15，存得住、读得回、能用上。"""
+
+    def test_clip_bounds(self):
+        self.assertEqual(L._clip_seg_mood(0), 0)
+        self.assertEqual(L._clip_seg_mood(-40), -L.MOOD_SEG_CAP)
+        self.assertEqual(L._clip_seg_mood(99), L.MOOD_SEG_CAP)
+        self.assertEqual(L._clip_seg_mood("12"), 12)
+        self.assertEqual(L._clip_seg_mood("-7.6"), -8)
+        self.assertEqual(L._clip_seg_mood(None), 0)
+        self.assertEqual(L._clip_seg_mood("闷"), 0)
+
+    def test_roundtrip_keeps_mood(self):
+        plan = L.DayPlan("s", [L.Segment(0, 480, "睡着", "沉", -6),
+                               L.Segment(480, 900, "听课", "松快", 4)])
+        back = L.DayPlan.from_json(plan.to_json())
+        self.assertEqual([s.mood for s in back.segments], [-6, 4])
+
+    def test_parse_reads_numeric_mood_and_keeps_feel_text(self):
+        engine, _, _ = make_engine(reply=json.dumps({"summary": "s", "segments": [
+            {"window": "00:00-07:30", "doing": "睡着", "feel": "沉", "mood": -8},
+            {"window": "07:30-12:00", "doing": "听课", "feel": "平平的", "mood": 3},
+            {"window": "12:00-24:00", "doing": "做事", "feel": "松", "mood": 20},
+        ]}, ensure_ascii=False))
+        plan = engine._parse_plan(engine and '{"summary":"s","segments":[]}', 18)
+        payload = {"summary": "s", "segments": [
+            {"window": "00:00-07:30", "doing": "睡着", "feel": "沉", "mood": -8},
+            {"window": "07:30-12:00", "doing": "听课", "feel": "平平的", "mood": 3},
+            {"window": "12:00-24:00", "doing": "做事", "feel": "松", "mood": 20},
+        ]}
+        parsed = engine._parse_one(payload, 18)
+        self.assertEqual([s.mood for s in parsed.segments], [-8, 3, L.MOOD_SEG_CAP])
+        self.assertEqual(parsed.segments[0].feel, "沉", "feel 不该被数值 mood 覆盖")
+
+    def test_feel_array_is_flattened(self):
+        self.assertEqual(L._flatten_text(["松", "困"]), "松、困")
+        self.assertEqual(L._flatten_text("['松', '困']"), "松、困")
+        self.assertEqual(L._flatten_text("松快"), "松快")
+        self.assertEqual(L._flatten_text(None), "")
+
+    def test_template_has_neutral_mood(self):
+        self.assertTrue(all(s.mood == 0 for s in L.template_plan().segments))
+
+    def test_seed_mood_reads_current_segment(self):
+        plan = L.DayPlan("s", [L.Segment(0, 480, "睡着", "沉", -5),
+                               L.Segment(480, 1440, "做事", "松", 7)])
+        state = L.DayState(date=L._today(), plans={L._today(): plan})
+        self.assertEqual(L.seed_mood(state, datetime(2026, 6, 15, 3, 0)), -5)
+        self.assertEqual(L.seed_mood(state, datetime(2026, 6, 15, 10, 0)), 7)
+        self.assertEqual(L.seed_mood(L.DayState(), datetime(2026, 6, 15, 10, 0)), 0)
+
+    def test_mood_bias_uses_segment_mood(self):
+        plan = L.DayPlan("今天本来就不顺", [L.Segment(0, 1440, "发呆", "发闷", -12)])
+        state = L.DayState(date=L._today(), plans={L._today(): plan},
+                           vitals=L.Vitals(70, "闷"))
+        out = L.mood_bias(state, score=40, mood=-20, now=datetime(2026, 6, 15, 14, 0))
+        self.assertIn("此刻底色-12", out.notes)
+        self.assertTrue(out.factor > 1.0)
+
+
 class TestStyleNote(unittest.TestCase):
     """输出规范：格式约束单独成段，可逐条开关。"""
 

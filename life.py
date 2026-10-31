@@ -76,9 +76,35 @@ def _today(now: Optional[datetime] = None) -> str:
     return (now or datetime.now()).strftime("%Y-%m-%d")
 
 
+def _clip_seg_mood(raw: Any) -> int:
+    """把模型给的段级 mood 夹到 ±MOOD_SEG_CAP。非数字一律 0（不猜）。"""
+    try:
+        value = int(round(float(raw)))
+    except (TypeError, ValueError):
+        return 0
+    return max(-MOOD_SEG_CAP, min(MOOD_SEG_CAP, value))
+
+
 def _squeeze(text: Any, cap: int = 100) -> str:
     """压成单行 —— 注入块里出现换行会把条目结构撕开。"""
     return " ".join(str(text or "").split())[:cap]
+
+
+def _flatten_text(raw: Any, cap: int = 24) -> str:
+    """把"可能不是字符串"的字段压成一句话。
+
+    实测模型有时把 feel 写成数组 ``["松", "困"]`` —— 直接 str() 会得到
+    ``['松', '困']`` 这种东西出现在页面上，所以这里单独归一化。
+    """
+    if isinstance(raw, (list, tuple)):
+        parts = [_squeeze(x, 12) for x in raw]
+        return "、".join(p for p in parts if p)[:cap]
+    text = _squeeze(raw, cap)
+    if text.startswith("[") and text.endswith("]") and ("'" in text or '"' in text):
+        inner = text[1:-1]
+        parts = [_squeeze(x.strip().strip("'\""), 12) for x in inner.split(",")]
+        text = "、".join(p for p in parts if p)[:cap]
+    return text
 
 
 def _hhmm(minute_of_day: int) -> str:
@@ -298,6 +324,10 @@ BUILTIN_ACHES: Tuple[Dict[str, Any], ...] = (
     {"label": "整个人轻飘飘的", "hours": (2, 4)},
 )
 
+#: 每段「初始 mood」的幅度上限。这是当天底子的一个偏移量（±），
+#: 不放太大：它只是"这一段大概什么心情"，不该盖过实际互动带来的变化。
+MOOD_SEG_CAP = 15
+
 MOOD_WORDS_HIGH = ("轻快", "有点期待", "平静", "松松散散", "心情不错")
 MOOD_WORDS_LOW = ("有点蔫", "提不起劲", "发闷", "平平的", "懒得动")
 
@@ -365,6 +395,7 @@ class Segment:
     end: int                   # 可 > 1440（跨天）
     doing: str
     feel: str = ""
+    mood: int = 0              # 这一段的初始心情底子（±MOOD_SEG_CAP），生成时给
 
     @property
     def window(self) -> str:
@@ -387,7 +418,8 @@ class DayPlan:
             "summary": self.summary,
             "source": self.source,
             "built_at": self.built_at,
-            "segments": [{"start": s.start, "end": s.end, "doing": s.doing, "feel": s.feel}
+            "segments": [{"start": s.start, "end": s.end, "doing": s.doing,
+                          "feel": s.feel, "mood": s.mood}
                          for s in self.segments],
         }
 
@@ -401,7 +433,8 @@ class DayPlan:
                 return None
             try:
                 segments.append(Segment(int(item["start"]), int(item["end"]),
-                                        _squeeze(item.get("doing"), 120), _squeeze(item.get("feel"), 24)))
+                                        _squeeze(item.get("doing"), 120), _flatten_text(item.get("feel"), 24),
+                                        _clip_seg_mood(item.get("mood"))))
             except Exception:  # noqa: BLE001
                 return None
         if not segments:
@@ -864,9 +897,34 @@ def mood_bias(state: DayState, *, score: int = 0, mood: int = 0,
             bias.half_life_mult *= 0.8
             bias.notes.append("还不熟")
 
+    # ⑤ 此刻的底色：这一段生成时就带了初始 mood。同向放大一点、背向收一点 ——
+    #    幅度刻意小（±5%），只是"今天本来是什么调子"，不该压过真实互动。
+    if seg is not None and seg.mood:
+        if mood and mood * seg.mood > 0:
+            bias.factor *= 1.05
+        elif mood:
+            bias.factor *= 0.95
+        if abs(seg.mood) >= 8:
+            bias.notes.append(f"此刻底色{seg.mood:+d}")
+
     bias.factor = max(0.5, min(1.35, bias.factor))
     bias.half_life_mult = max(0.5, min(2.0, bias.half_life_mult))
     return bias
+
+
+def seed_mood(state: DayState, now: Optional[datetime] = None) -> int:
+    """此刻时段的初始 mood（生成日程时由模型给出）。
+
+    给上层"打底"用：没有日程、或那一段没给值就是 0（= 中性，不偏）。
+    """
+    if state.plan is None:
+        return 0
+    cur = now or datetime.now()
+    minute = cur.hour * 60 + cur.minute
+    for seg in state.plan.segments:
+        if seg.covers(minute):
+            return int(seg.mood)
+    return 0
 
 
 def hold_hint(state: DayState, *, mood: int = 0) -> str:
@@ -1365,13 +1423,17 @@ class Engine:
                 f"每天都要排满一整天：**第一段必须从 00:00 开始，最后一段到 24:00 结束**"
                 f"（夜里那段也要写，别从早上开排）；各自独立但前后呼应；"
                 f"每天 {lo}-{hi} 段，段长不要平均分；doing 一句话说完，别铺陈。",
+                '每段再给一个 mood（整数 -15~15）：这一段的**初始心情底子**，'
+                '负=闷/烦/沉，正=轻快/有精神，0=平。',
                 '只回 JSON，不要解释：{"days": [{"date": "YYYY-MM-DD", "summary": "...", '
-                '"segments": [{"window": "HH:MM-HH:MM", "doing": "...", "feel": "..."}]}]}',
+                '"segments": [{"window": "HH:MM-HH:MM", "doing": "...", "feel": "...", "mood": 0}]}]}',
             ]
         else:
+            lines.append('每段再给一个 mood（整数 -15~15）：这一段的**初始心情底子**，'
+                         '负=闷/烦/沉，正=轻快/有精神，0=平。别每段都一样，也别整段都极值。')
             lines.append('只回 JSON，不要解释：'
                          '{"summary": "...", "segments": [{"window": "HH:MM-HH:MM", '
-                         '"doing": "...", "feel": "..."}]}')
+                         '"doing": "...", "feel": "...", "mood": 0}]}')
         return "\n".join(lines)
 
     def _parse_plans(self, raw: str, dates: List[str], hi: int) -> Dict[str, DayPlan]:
@@ -1429,8 +1491,11 @@ class Engine:
             doing = _squeeze(item.get("doing") or item.get("activity"), 120)
             if start is None or end is None or not doing:
                 continue
+            # ⚠️ feel 与 mood 是两个字段：以前这里把 mood 当 feel 的兜底取，
+            #    一旦模型给出数值 mood，feel 就会被写成 "-8" 这种鬼东西。
             segments.append(Segment(start, end if end > start else end + 24 * 60, doing,
-                                    _squeeze(item.get("feel") or item.get("mood"), 24)))
+                                    _flatten_text(item.get("feel") or item.get("feels"), 24),
+                                    _clip_seg_mood(item.get("mood"))))
         if len(segments) < 3:
             logger.warning(f"[life] 日程段数不足（{len(segments)} 段），单日 JSON {len(payload)} 键")
             return None

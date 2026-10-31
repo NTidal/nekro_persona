@@ -678,6 +678,12 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 }
 .life-row.now .life-doing { color: var(--text); }
 .life-feel { font-size: 11px; color: var(--text-mute); white-space: nowrap; }
+.life-seg-mood {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-mute);
+  opacity: 0.75;
+  margin-left: 4px;
+}
 .life-split { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); gap: 22px; }
 .life-split-title {
   font-size: 11px;
@@ -3935,7 +3941,6 @@ async function loadLifePack() {
 
 function renderLifePack(pack) {
   state.lifePack = pack;
-  const defaults = pack.default_forbidden || [];
   const fields = LIFE_PACK_FIELDS.map(([key, label, hint]) => `
     <label class="life-field">
       <span class="life-field-label"><b>${esc(label)}</b>${esc(hint)}</span>
@@ -3951,7 +3956,6 @@ function renderLifePack(pack) {
       <div class="life-field full">
         <span class="life-field-label">
           <b>禁词</b>一旦出现，生成侧会重抽/改写（一行一个；演城市上班族就把这份整体换掉）
-          <button class="mini-btn" type="button" id="lifePackDefaults">填入默认 ${defaults.length} 条</button>
         </span>
         <textarea data-life-field="forbidden" spellcheck="false">${esc((pack.forbidden || []).join('\n'))}</textarea>
       </div>
@@ -4121,13 +4125,8 @@ function renderLife(d) {
   const hits = (d && d.world_hits) || [];
 
   // ① 指标
-  const sourceKind = (d && d.source) === 'model' ? 'success'
-    : (d && d.source) === 'repaired' ? 'warning'
-      : (d && d.source) ? 'danger' : 'info';
-  const sourceText = { model: '模型生成', repaired: '修补后', template: '兜底模板' }[(d && d.source) || ''] || '未生成';
   const cards = [
     ['日期', on ? (d.date || '—') : '—', on ? '' : '未开启'],
-    ['来源', sourceText, ''],
     ['段数', String((d && d.segments) || 0), `一次排 ${(d && d.horizon) || 1} 天`],
     ['越界词', hits.length ? hits.join('、') : '无', hits.length ? '世界观校验未通过' : ''],
   ];
@@ -4162,7 +4161,7 @@ function renderLife(d) {
       <div class="life-row${i === hitIdx ? ' now' : ''}" data-start="${Number(s.start) || 0}" data-end="${Number(s.end) || 0}">
         <div class="life-time">${esc(s.window || '')}</div>
         <div class="life-doing">${esc(s.doing || '')}</div>
-        <div class="life-feel">${esc(s.feel || '')}</div>
+        <div class="life-feel">${esc(s.feel || '')}${Number(s.mood) ? ` <span class="life-seg-mood">${Number(s.mood) > 0 ? '+' : ''}${Number(s.mood)}</span>` : ''}</div>
       </div>`).join('') + '</div>';
     // 打开页面就滚到此刻那一段（否则长日程要手动找）
     state.lifeNowKey = hit ? hit.window : '';
@@ -4326,14 +4325,6 @@ $('#lifePackSave').addEventListener('click', saveLifePack);
 $('#lifePackReload').addEventListener('click', async () => {
   toast('已从 life.json 重载', 'info', 1600);
   await loadLifePack();
-});
-$('#lifePack').addEventListener('click', (e) => {
-  if (!e.target.closest('#lifePackDefaults')) return;
-  const box = document.querySelector('#lifePack [data-life-field="forbidden"]');
-  if (!box) return;
-  const defaults = (state.lifePack && state.lifePack.default_forbidden) || [];
-  box.value = defaults.join('\n');
-  toast(`已填入默认禁词 ${defaults.length} 条，记得点保存`, 'info', 2400);
 });
 
 $('#refreshBtn').addEventListener('click', async () => {
