@@ -800,6 +800,47 @@ class FavorabilityConfig(ConfigBase):
                 "A backup is always written before any deletion.",
     )
 
+    # ==================== 生活时间轴（她自己今天在过什么日子）====================
+    # 与 score/mood 的分工：score 与 mood 记「她怎么看这个人」，生活时间轴记
+    # 「她自己今天在过什么日子」。后者是**全局一份**（跨频道共享），只当语气与状态的底子，
+    # 不进任何人的关系档案 —— 否则会出现"她同时在不同人面前过不同日子"。
+    LIFE_ENABLED: bool = _fav_field(
+        False, "启用生活时间轴",
+        "开启后每天给她排一份日程（在哪里过、此刻在做什么、能量与身上那点小状况），"
+        "并作为语气底子注入对话。关闭时完全不生成、不注入、不写任何数据。",
+        en_title="Enable Life Timeline",
+        en_desc="Daily life timeline used as tonal context; off means no generation / injection / storage",
+    )
+    LIFE_MODEL_GROUP: str = _fav_field(
+        "", "生成日程用的模型组",
+        "留空则用 USE_MODEL_GROUP。每天只生成一次（跨天惰性触发），建议用便宜的对话模型。",
+        en_title="Life Model Group",
+        en_desc="Model group for plan/dream generation; empty means USE_MODEL_GROUP",
+    )
+    LIFE_PLAN_MIN_SEGMENTS: int = _fav_field(
+        12, "日程最少段数",
+        "一天排几段的下限。太少显得日程很粗，太多模型容易编。",
+        en_title="Min Plan Segments", en_desc="Lower bound of daily plan segments",
+        ge=3, le=16,
+    )
+    LIFE_PLAN_MAX_SEGMENTS: int = _fav_field(
+        18, "日程最多段数",
+        "上限。段长不必等长——睡眠通常是一整块，刚醒和睡前各可以有一小段。",
+        en_title="Max Plan Segments", en_desc="Upper bound of daily plan segments",
+        ge=3, le=20,
+    )
+    LIFE_BLOCK_CAP: int = _fav_field(
+        380, "注入块正文上限（字符）",
+        "生活状态注入正文的硬上限，超出截断；尾注不计入。",
+        en_title="Inject Body Cap", en_desc="Hard cap for injected life block body",
+        ge=120, le=1200,
+    )
+    LIFE_PLAN_STYLE_HINT: str = _fav_field(
+        "", "日程风格提示（可空）",
+        "追加给生成器的风格约束，例如「不安排上班场景」。留空则不加。",
+        en_title="Plan Style Hint", en_desc="Extra style constraint for plan generation",
+    )
+
 
 # 模块级单例：配置实例与插件存储句柄
 config = plugin.get_config(FavorabilityConfig)
@@ -1251,6 +1292,7 @@ from . import memory as persona_memory  # noqa: E402  # 阶梯记忆与好感度
 from . import tier4  # noqa: E402  # tier4 生长层（身份锚点，阶段 A）
 from . import consolidator as persona_consolidator  # noqa: E402  # 关系记忆归纳
 from . import memory_log as persona_memlog  # noqa: E402  # 关系记忆存储
+from . import life as persona_life  # noqa: E402  # 生活时间轴（日程/手感/梦）
 
 # 背景记忆数据目录：**按访问解析**（多账号隔离）。
 # ⚠️ 绝不能在这里写下 `plugin.get_plugin_data_dir() / "backgrounds"` 的求值结果：
@@ -1262,6 +1304,84 @@ persona_memory.configure_bg_dir_provider(lambda: plugin.get_plugin_data_dir() / 
 tier4.configure_bg_dir_provider(lambda: plugin.get_plugin_data_dir() / "backgrounds")
 # 关系记忆与生长层同目录（memory_log.json 落到同一 backgrounds/）
 persona_memlog.configure_bg_dir_provider(lambda: plugin.get_plugin_data_dir() / "backgrounds")
+
+# ── 生活时间轴（life.py）：只做装配，真正开不开由 LIFE_ENABLED 决定（默认关）──
+# 作用域：global —— 一份人生跨所有频道；多账号分支下走账号作用域 store，
+# 免得 A 账号的人生状态被 B 账号读到。
+
+
+async def _life_read(key: str):
+    raw = await _store_for_write().get(chat_key=persona_life.GLOBAL_CHAT_KEY, store_key=key)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _life_write(key: str, value) -> None:
+    await _store_for_write().set(chat_key=persona_life.GLOBAL_CHAT_KEY, store_key=key,
+                                 value=json.dumps(value, ensure_ascii=False))
+
+
+async def _life_ask(prompt: str, *, system: str, task: str = "") -> str:
+    """日程 / 梦境的一次性模型调用：独立于对话回合，不经过 agent。"""
+    from nekro_agent.core.config import config as _na_cfg
+    from nekro_agent.services.agent.openai import gen_openai_chat_response
+
+    name = str(getattr(config, "LIFE_MODEL_GROUP", "") or "").strip() or _na_cfg.USE_MODEL_GROUP
+    group = _na_cfg.get_model_group_info(name)
+    resp = await gen_openai_chat_response(
+        model=group.CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        api_key=group.API_KEY,
+        base_url=group.BASE_URL,
+        temperature=0.85,
+        max_tokens=1800,
+        max_wait_time=90,
+    )
+    return resp.response_content or ""
+
+
+async def _life_persona_text() -> str:
+    """给生成器看的「她是谁」：抽 1 档身份记忆的正文句子压成一段（不注入任何东西）。"""
+    try:
+        tier1_dir = persona_memory._tier1_dir()
+    except Exception:  # noqa: BLE001
+        return ""
+    chunks: list = []
+    try:
+        for path in sorted(tier1_dir.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            for entry in (data.get("entries") or []) if isinstance(data, dict) else []:
+                if not isinstance(entry, dict):
+                    continue
+                text = " ".join(str(entry.get(k) or "") for k in ("title", "content"))
+                text = " ".join(text.split())
+                if text:
+                    chunks.append(text)
+    except Exception:  # noqa: BLE001
+        return ""
+    return "；".join(chunks)[:1200]
+
+
+try:
+    persona_life.attach(persona_life.Engine(
+        store_read=_life_read,
+        store_write=_life_write,
+        config=config,
+        ask_model=_life_ask,
+        persona_text=_life_persona_text,
+    ))
+except Exception as _life_exc:  # noqa: BLE001
+    plugin.logger.warning(f"[persona] 生活时间轴装配失败（功能不可用，其余不受影响）: {_life_exc}")
 # v2.0.2：目录状态缓存改为**有界 LRU**（每个账号目录约 20MB 常驻向量，旧实现只增不减）。
 # 这里只做一次初始化：取环境变量 NEKRO_PERSONA_STATE_MAX_DIRS，没有就用 memory.py 的
 # 默认值（8）。**刻意不新增插件配置项**——那会让 NA 在加载时回写 config.yaml，
