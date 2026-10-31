@@ -3480,6 +3480,39 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=f"统计失败: {exc}") from exc
 
+    @router.get("/api/life_state", summary="生活时间轴：今天的日程 / 当前时段 / 手感（只读）")
+    async def api_life_state(request: Request) -> Dict[str, Any]:
+        """看「她现在在过什么日子」。开关关掉时返回 enabled=false，不生成任何东西。"""
+        _check_key(request)
+        from . import life as _life
+        from .plugin import config as _pcfg
+
+        eng = _life.engine()
+        if eng is None:
+            return {"enabled": False, "reason": "未装配"}
+        if not eng.on:
+            return {"enabled": False, "reason": "LIFE_ENABLED 未开启"}
+        try:
+            state = await eng.load()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"读取失败: {exc}") from exc
+        seg = eng.segment_at(state) if state.plan else None
+        return {
+            "enabled": True,
+            "inject": bool(getattr(_pcfg, "LIFE_INJECT_ENABLED", True)),
+            "date": state.date,
+            "source": (state.plan.source if state.plan else ""),
+            "summary": (state.plan.summary if state.plan else ""),
+            "segments": len(state.plan.segments) if state.plan else 0,
+            "now": ({"window": seg.window, "doing": seg.doing, "feel": seg.feel} if seg else None),
+            "vitals": ({"energy": state.vitals.energy, "mood": state.vitals.mood,
+                        "aches": [a.get("label") for a in state.vitals.aches]} if state.vitals else None),
+            "dream": ({"mood": state.dream.mood, "len": len(state.dream.text),
+                       "afterglow": state.dream.afterglow} if state.dream else None),
+            "card": ({"scene": state.card.scene_name} if state.card else None),
+            "block": eng.render(state),
+        }
+
     @router.get("/api/mood_bands", summary="情绪档位表：当前生效的定性描述与来源")
     async def api_mood_bands(request: Request) -> Dict[str, Any]:
         _check_key(request)

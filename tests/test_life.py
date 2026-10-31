@@ -35,6 +35,7 @@ class FakeConfig:
         self.LIFE_PLAN_MAX_SEGMENTS = over.get("LIFE_PLAN_MAX_SEGMENTS", 18)
         self.LIFE_BLOCK_CAP = over.get("LIFE_BLOCK_CAP", 380)
         self.LIFE_PLAN_STYLE_HINT = over.get("LIFE_PLAN_STYLE_HINT", "")
+        self.LIFE_INJECT_ENABLED = over.get("LIFE_INJECT_ENABLED", True)
 
 
 class FakeStore:
@@ -43,8 +44,10 @@ class FakeStore:
     def __init__(self):
         self.data = {}
         self.writes = 0
+        self.reads = 0
 
     async def read(self, key):
+        self.reads += 1
         raw = self.data.get(key)
         return json.loads(raw) if raw else None
 
@@ -429,6 +432,75 @@ class TestRender(unittest.TestCase):
     def test_private_scene_label(self):
         engine, _, _ = make_engine()
         self.assertIn("对话场景：私聊", engine.render(self._state(), chat_key="onebot_v11-private_1"))
+
+
+class TestBlockFor(unittest.TestCase):
+    """B2：注入入口。三条硬约束 —— 关掉就空、跨天不阻塞、缓存期内不重复读库。"""
+
+    def _fresh(self, **cfg):
+        store = FakeStore()
+        engine, _, _ = make_engine(reply=good_plan_json(), cfg=FakeConfig(**cfg), store=store)
+        run(engine.ensure_today())          # 先把今天滚出来
+        store.writes = 0
+        store.reads = 0
+        return engine, store
+
+    def test_disabled_returns_empty(self):
+        engine, _ = self._fresh(LIFE_ENABLED=False)
+        self.assertEqual(run(engine.block_for("onebot_v11-group_1")), "")
+
+    def test_inject_off_returns_empty(self):
+        engine, _ = self._fresh(LIFE_INJECT_ENABLED=False)
+        self.assertEqual(run(engine.block_for("onebot_v11-group_1")), "")
+
+    def test_returns_block_when_on(self):
+        engine, _ = self._fresh()
+        text = run(engine.block_for("onebot_v11-group_1"))
+        self.assertIn("【你今天的生活】", text)
+        self.assertIn("能量", text)
+        self.assertIn("别写进笔记", text)
+
+    def test_cache_avoids_repeat_store_reads(self):
+        engine, store = self._fresh()
+        L._BLOCK_CACHE.clear()
+        first = run(engine.block_for("onebot_v11-group_1"))
+        reads_after_first = store.reads
+        second = run(engine.block_for("onebot_v11-group_1"))
+        self.assertEqual(first, second)
+        self.assertEqual(store.reads, reads_after_first, "缓存期内不该再读 store")
+
+    def test_cache_expires(self):
+        engine, store = self._fresh()
+        L._BLOCK_CACHE.clear()
+        now = L._now()
+        run(engine.block_for("onebot_v11-group_1", now=now))
+        reads_after_first = store.reads
+        run(engine.block_for("onebot_v11-group_1", now=now + L.BLOCK_CACHE_TTL + 1))
+        self.assertGreater(store.reads, reads_after_first, "过了 TTL 应该重新读")
+
+    def test_stale_day_does_not_block(self):
+        """跨天那一轮必须立刻返回空，把生成丢到后台 —— 不能拖慢回复。"""
+        store = FakeStore()
+        engine, _, _ = make_engine(reply=good_plan_json(), store=store)
+        stale = L.DayState(date="2020-01-01", plan=L.template_plan())
+        store.data[L.STATE_KEY] = json.dumps(stale.to_json(), ensure_ascii=False)
+        L._BLOCK_CACHE.clear()
+        L._ROLLING.clear()
+        out = run(engine.block_for("onebot_v11-group_1"))
+        self.assertEqual(out, "", "跨天当轮不注入")
+        self.assertTrue(L._ROLLING or store.writes > 0, "应当已经在后台滚动")
+
+    def test_never_raises_on_broken_store(self):
+        class Boom:
+            async def read(self, key):
+                raise RuntimeError("db down")
+
+            async def write(self, key, value):
+                raise RuntimeError("db down")
+
+        engine = L.Engine(store_read=Boom().read, store_write=Boom().write, config=FakeConfig())
+        L._BLOCK_CACHE.clear()
+        self.assertEqual(run(engine.block_for("onebot_v11-group_1")), "")
 
 
 class TestAttach(unittest.TestCase):

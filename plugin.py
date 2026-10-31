@@ -840,6 +840,13 @@ class FavorabilityConfig(ConfigBase):
         "追加给生成器的风格约束，例如「不安排上班场景」。留空则不加。",
         en_title="Plan Style Hint", en_desc="Extra style constraint for plan generation",
     )
+    LIFE_INJECT_ENABLED: bool = _fav_field(
+        True, "把生活状态注入对话",
+        "关闭后只生成不注入（数据仍可在 WebUI 查看）。仅在「启用生活时间轴」打开时有效。"
+        "注入的是一段 380 字以内的语气底子，不含具体台词。",
+        en_title="Inject Life State",
+        en_desc="Inject the life block into prompts; off means generate only",
+    )
 
 
 # 模块级单例：配置实例与插件存储句柄
@@ -1341,8 +1348,8 @@ async def _life_ask(prompt: str, *, system: str, task: str = "") -> str:
         api_key=group.API_KEY,
         base_url=group.BASE_URL,
         temperature=0.85,
-        max_tokens=1800,
-        max_wait_time=90,
+        max_tokens=2600,
+        max_wait_time=120,
     )
     return resp.response_content or ""
 
@@ -3993,7 +4000,22 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
     except Exception as e:  # noqa: BLE001
         plugin.logger.warning(f"[persona] 记忆块渲染失败，本轮跳过: {e}")
 
-    # ③ tier4 生长层：身份锚点（anchor · 全局）+ 频道笔记（note · 原备忘录）
+    # ③ 生活状态（她自己今天在过什么日子）
+    # 只做语气底子：此刻在做什么 / 能量 / 身上那点小状况。数据是**全局一份**（跨频道），
+    # 与 ①② 的 per-user 关系档案是两条线，别混。
+    # ⚠️ 跨天那一轮不在这里等生成（要调模型，好几秒）：life 侧当轮返回空并在后台滚一次，
+    #    下一轮就有。**回复延迟优先于"少一句生活背景"**。
+    try:
+        _life_engine = persona_life.engine()
+        if _life_engine is not None and _life_engine.on:
+            life_block = await _life_engine.block_for(_ctx.chat_key)
+            if life_block:
+                parts.append(life_block)
+                plugin.logger.info(f"[persona] 生活块注入：{len(life_block)} 字")
+    except Exception as e:  # noqa: BLE001
+        plugin.logger.warning(f"[persona] 生活状态注入失败，本轮跳过: {e}")
+
+    # ④ tier4 生长层：身份锚点（anchor · 全局）+ 频道笔记（note · 原备忘录）
     # 阶段 B：note 接替旧 memo 子系统；anchor 在前、note 在后（§9.3）。只读、不写。
     try:
         recent_text = await persona_memory._recent_text(_ctx)
@@ -4024,7 +4046,7 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
     except Exception as e:  # noqa: BLE001
         plugin.logger.warning(f"[persona] tier4 块渲染失败，本轮跳过: {e}")
 
-    # ④ 关系记忆（memory_log · 系统自动沉淀的事件史）
+    # ⑤ 关系记忆（memory_log · 系统自动沉淀的事件史）
     # 与 ③ 的 tier4 note 分工不同：note 是角色自己记的功能小抄（模型主动写），
     # 这里是后台从互动里归纳出来的「发生过什么」，模型不参与写入。
     try:

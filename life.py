@@ -59,6 +59,10 @@ ENERGY_TICK_SECONDS = 600
 BLOCK_LINE_CAP = 60
 BLOCK_BODY_CAP = 380
 
+# 注入路径的开销：每轮都读一次 store 不值得，渲染结果按频道缓存一会儿。
+# 60 秒足够覆盖同一轮的多条消息，又不至于让「此刻」明显落后于时间。
+BLOCK_CACHE_TTL = 60
+
 SALT = "persona-life-v1"           # 换掉它就换一整套抽签结果（内容包换代时用）
 
 
@@ -723,6 +727,9 @@ class Engine:
     def _parse_plan(self, raw: str, hi: int) -> Optional[DayPlan]:
         payload = _loose_json(raw)
         if not isinstance(payload, dict):
+            # 留证据：短输出=模型没听话，长输出被 max_tokens 截断=参数不够。
+            # 没有这两行，日志里只剩一句"模型不可用"，排查等于瞎猜。
+            logger.warning(f"[life] 日程 JSON 不可用：原始 {len(raw)} 字，开头 {raw[:80]!r}，结尾 {raw[-60:]!r}")
             return None
         segments: List[Segment] = []
         for item in payload.get("segments") or payload.get("events") or []:
@@ -742,6 +749,7 @@ class Engine:
             segments.append(Segment(start, end if end > start else end + 24 * 60, doing,
                                     _squeeze(item.get("feel") or item.get("mood"), 24)))
         if len(segments) < 3:
+            logger.warning(f"[life] 日程段数不足（{len(segments)} 段），原始 {len(raw)} 字")
             return None
         segments.sort(key=lambda s: s.start)
         return DayPlan(_squeeze(payload.get("summary"), 80) or "普通的一天",
@@ -832,10 +840,64 @@ class Engine:
                 "**别写进笔记或长期记忆**——它是会变的东西。)")
         return body + "\n" + tail
 
+    # ---- 注入入口（B2：接进 persona_prompt） ----
+    async def block_for(self, chat_key: str, *, now: Optional[float] = None) -> str:
+        """给 prompt 用的生活块。**永不抛异常、永不阻塞回复**。
+
+        两个设计约束：
+        - 跨天那一轮**不在这里等生成**（要调模型，几秒钟）：本轮先返回空，
+          后台滚一次，下一轮就有了。回复延迟比"少一句生活背景"重要得多。
+        - 渲染结果按频道缓存 ``BLOCK_CACHE_TTL`` 秒，免得每轮都读一遍 store。
+        """
+        if not self.on or not bool(self._cfg("LIFE_INJECT_ENABLED", True)):
+            return ""
+        ts = _now() if now is None else float(now)
+        date_key = _today()
+        cache_key = (chat_key, date_key)
+        cached = _BLOCK_CACHE.get(cache_key)
+        if cached is not None and ts - cached[0] < BLOCK_CACHE_TTL:
+            return cached[1]
+
+        state = await self.load()
+        if state.date != date_key or state.plan is None:
+            # 跨天：本轮不阻塞，后台滚一次（同一进程内同一频道只滚一次）
+            if cache_key not in _ROLLING:
+                _ROLLING.add(cache_key)
+
+                async def _roll() -> None:
+                    try:
+                        await self.ensure_today()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(f"[life] 后台滚动失败: {exc!r}")
+                    finally:
+                        _ROLLING.discard(cache_key)
+                        _BLOCK_CACHE.pop(cache_key, None)
+
+                try:
+                    asyncio.get_event_loop().create_task(_roll())
+                except Exception:  # noqa: BLE001
+                    _ROLLING.discard(cache_key)
+            _BLOCK_CACHE[cache_key] = (ts, "")
+            return ""
+
+        # 手感衰减：节流到 ENERGY_TICK_SECONDS，避免每轮都写库
+        global _LAST_TICK
+        if state.vitals is not None and ts - _LAST_TICK >= ENERGY_TICK_SECONDS:
+            _LAST_TICK = ts
+            if self.tick(state, now=ts):
+                await self.save(state)
+
+        text = self.render(state, chat_key=chat_key)
+        _BLOCK_CACHE[cache_key] = (ts, text)
+        return text
+
 
 # ---------------- 模块级装配 ----------------
 
 _ENGINE: Optional[Engine] = None
+_BLOCK_CACHE: Dict[Any, Tuple[float, str]] = {}
+_ROLLING: set = set()
+_LAST_TICK = 0.0
 
 
 def attach(engine: Optional[Engine]) -> None:
