@@ -182,6 +182,12 @@ class WorldPack:
         return bool(self.places and self.verbs)
 
 
+#: 内置默认禁词（"现代都市日常"口径）。可在 life.json 里整体替换。
+DEFAULT_FORBIDDEN: Tuple[str, ...] = (
+    "上班", "下班", "打卡", "通勤", "开会", "同事", "领导", "工位",
+    "加班", "公司", "办公室", "地铁", "公交", "外卖", "便利店", "工资", "房贷",
+)
+
 BUILTIN_WORLD = WorldPack(
     setting="普通人的日常：待在屋里、出门办点事、吃饭、发呆。",
     places=("屋子里", "窗边", "楼下", "街角", "常去的店", "半路的站台"),
@@ -214,6 +220,12 @@ def load_world_pack() -> WorldPack:
         except Exception:  # noqa: BLE001
             payload = {}
 
+    # ⚠️ 禁词表以**文件为准**：只要 life.json 里出现了 forbidden 键（哪怕是空数组），
+    #    就用文件里的，不再并内置那份。理由：内置那份是"现代都市日常"的默认值，
+    #    真要去演一个城市上班族时，这份禁词必须能整体换掉 —— 锁死就没法换。
+    #    键不存在（老文件/只写了别的字段）时才回落内置默认值。
+    has_forbidden = isinstance(payload.get("forbidden"), list)
+
     def words(key: str, fallback: Tuple[str, ...], cap: int = 40) -> Tuple[str, ...]:
         rows = []
         for item in (payload.get(key) or []):
@@ -231,8 +243,8 @@ def load_world_pack() -> WorldPack:
         verbs=words("verbs", BUILTIN_WORLD.verbs),
         feels=words("feels", BUILTIN_WORLD.feels),
         events=words("events", BUILTIN_WORLD.events),
-        # 禁词表**永远并上内置那份**：作者只补自己世界的，通用现代词不用重复写
-        forbidden=tuple(dict.fromkeys(words("forbidden", ()) + BUILTIN_WORLD.forbidden)),
+        forbidden=(tuple(dict.fromkeys(words("forbidden", ())))
+                   if has_forbidden else BUILTIN_WORLD.forbidden),
     )
 
 

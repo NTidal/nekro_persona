@@ -668,24 +668,15 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 .life-doing { font-size: 12.5px; color: var(--text-soft); line-height: 1.55; }
 .life-row.now .life-doing { color: var(--text); }
 .life-feel { font-size: 11px; color: var(--text-mute); white-space: nowrap; }
-.life-day-tabs { display: flex; flex-wrap: wrap; gap: 6px; }
-.life-day-tab {
-  border: 1px solid var(--line);
+.life-day { cursor: pointer; transition: background 0.14s ease, border-color 0.14s ease; }
+.life-day:hover { background: var(--surface-2); }
+.life-day.on {
+  border-left-color: var(--accent);
   background: var(--surface-2);
-  color: var(--text-mute);
-  border-radius: 999px;
-  padding: 3px 10px;
-  font-size: 11px;
-  cursor: pointer;
-  transition: all 0.14s ease;
-  font-variant-numeric: tabular-nums;
+  box-shadow: inset 0 0 0 1px var(--accent-border);
 }
-.life-day-tab:hover { color: var(--text-soft); border-color: var(--accent-border); }
-.life-day-tab.on {
-  color: var(--accent-strong);
-  border-color: var(--accent-border);
-  background: var(--accent-soft);
-}
+.life-day.on .life-day-sum { color: var(--text-soft); }
+.life-day:focus-visible { outline: 2px solid var(--accent-border); outline-offset: 2px; }
 .life-pack-grid { display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .life-field { display: grid; gap: 6px; }
 .life-field.full { grid-column: 1 / -1; }
@@ -2394,7 +2385,7 @@ body.is-scrolling .dialog-foot {
       <div class="page-head">
         <div>
           <h1 class="page-title">日程</h1>
-          <p class="page-desc">她今天在过什么日子：一整天的时间轴、此刻的状态、抽到的素材与昨夜余韵。</p>
+          <p class="page-desc">今天在过什么日子：一整天的时间轴、此刻的状态、抽到的素材与昨夜余韵。</p>
         </div>
         <div class="head-actions">
           <select class="input sm" id="lifeRebuildDays" title="一次重排几天">
@@ -2412,9 +2403,8 @@ body.is-scrolling .dialog-foot {
           <div class="card-head">
             <div>
               <h2 class="card-title">时间轴</h2>
-              <div class="card-subtitle" id="lifeTimelineHint">按段看她在做什么</div>
+              <div class="card-subtitle" id="lifeTimelineHint">按段看在做什么</div>
             </div>
-            <div class="life-day-tabs" id="lifeDayTabs"></div>
           </div>
           <div class="card-body" id="lifeTimeline"><div class="empty-inline">加载中…</div></div>
         </div>
@@ -2432,7 +2422,7 @@ body.is-scrolling .dialog-foot {
         <div class="card-head">
           <div>
             <h2 class="card-title">这几天</h2>
-            <div class="card-subtitle" id="lifeDaysHint">已排好的日子（含未来）</div>
+            <div class="card-subtitle" id="lifeDaysHint">点一行看那天的时间轴</div>
           </div>
         </div>
         <div class="card-body" id="lifeDays"><div class="empty-inline">加载中…</div></div>
@@ -2455,7 +2445,7 @@ body.is-scrolling .dialog-foot {
         <div class="card-head">
           <div>
             <h2 class="card-title">注入块</h2>
-            <div class="card-subtitle">她每轮实际拿到的那一段（原样）</div>
+            <div class="card-subtitle">每轮实际拿到的那一段（原样）</div>
           </div>
         </div>
         <div class="card-body"><pre class="life-block" id="lifeBlock"></pre></div>
@@ -3885,9 +3875,9 @@ const MOCK = (() => {
 
 /* ---------------- 日程：抽词配置（读 / 写） ---------------- */
 const LIFE_PACK_FIELDS = [
-  ['places', '地点', '每天抽一个：她可能待的地方'],
+  ['places', '地点', '每天抽一个：可能待的地方'],
   ['props', '手边', '抽一个：手里/身边的东西'],
-  ['verbs', '会做', '抽两个：她能做的事'],
+  ['verbs', '会做', '抽两个：能做的事'],
   ['feels', '体感', '抽两个：身体或心里的感觉'],
   ['events', '会发生', '抽两个：可能发生的小事'],
 ];
@@ -3905,9 +3895,7 @@ async function loadLifePack() {
 
 function renderLifePack(pack) {
   state.lifePack = pack;
-  const builtin = new Set(pack.builtin_forbidden || []);
-  // 禁词拆两栏：内置的锁死（删了等于放行通用现代词），自定义的才给编辑
-  const custom = (pack.forbidden || []).filter((w) => !builtin.has(w));
+  const defaults = pack.default_forbidden || [];
   const fields = LIFE_PACK_FIELDS.map(([key, label, hint]) => `
     <label class="life-field">
       <span class="life-field-label"><b>${esc(label)}</b>${esc(hint)}</span>
@@ -3920,13 +3908,12 @@ function renderLifePack(pack) {
         <input type="text" data-life-field="setting" value="${esc(pack.setting || '')}" spellcheck="false">
       </label>
       ${fields}
-      <label class="life-field full">
-        <span class="life-field-label"><b>禁词</b>这些词一旦出现，生成侧会重抽/改写（一行一个）</span>
-        <textarea data-life-field="forbidden" spellcheck="false">${esc(custom.join('\n'))}</textarea>
-      </label>
       <div class="life-field full">
-        <span class="life-field-label"><b>内置禁词</b>不可删（${builtin.size} 条）</span>
-        <div class="life-chips">${[...builtin].map((w) => `<span class="life-chip locked">${esc(w)}</span>`).join('')}</div>
+        <span class="life-field-label">
+          <b>禁词</b>一旦出现，生成侧会重抽/改写（一行一个；演城市上班族就把这份整体换掉）
+          <button class="mini-btn" type="button" id="lifePackDefaults">填入默认 ${defaults.length} 条</button>
+        </span>
+        <textarea data-life-field="forbidden" spellcheck="false">${esc((pack.forbidden || []).join('\n'))}</textarea>
       </div>
     </div>`;
   $('#lifePackHint').textContent = pack.path
@@ -4041,17 +4028,10 @@ function renderLife(d) {
     return;
   }
 
-  // ② 日签（跨天预览）+ 时间轴
-  $('#lifeDayTabs').innerHTML = plans.length > 1
-    ? plans.map((p) => {
-      const on = p.date === state.lifeDay;
-      const label = p.date === todayDate ? '今天' : p.date.slice(5);
-      return `<button class="life-day-tab${on ? ' on' : ''}" type="button" data-life-day="${esc(p.date)}">${esc(label)}</button>`;
-    }).join('')
-    : '';
+  // ② 时间轴（跨天预览的切换器是下面「这几天」的每一行）
   $('#lifeTimelineHint').textContent = isToday && now
     ? `此刻 ${now.window} · ${now.doing}`
-    : (curDay ? `${curDay.date} · ${curDay.source === 'model' ? '模型生成' : curDay.source === 'repaired' ? '修补后' : '兜底模板'}` : '按段看她在做什么');
+    : (curDay ? `${curDay.date} · ${curDay.source === 'model' ? '模型生成' : curDay.source === 'repaired' ? '修补后' : '兜底模板'}` : '按段看在做什么');
   if (!segs.length) {
     $('#lifeTimeline').innerHTML = '<div class="empty-inline">这一天还没有日程</div>';
   } else {
@@ -4091,14 +4071,16 @@ function renderLife(d) {
 
   // ④ 这几天
   $('#lifeDaysHint').textContent = days.length
-    ? `共 ${days.length} 天（含未来，一次排 ${d.horizon || 1} 天）`
-    : '已排好的日子（含未来）';
+    ? `共 ${days.length} 天 · 点一行看那天的时间轴`
+    : '点一行看那天的时间轴';
   $('#lifeDays').innerHTML = days.length
     ? '<div class="life-days">' + days.map((r) => {
       const badge = r.source === 'model' ? 'success' : (r.source === 'repaired' ? 'warning' : 'danger');
       const label = { model: '模型', repaired: '修补', template: '兜底' }[r.source] || r.source;
-      return `<div class="life-day${r.date === d.date ? ' today' : ''}">
-        <div class="life-day-date">${esc(r.date)}</div>
+      const on = r.date === state.lifeDay;
+      const isToday = r.date === todayDate;
+      return `<div class="life-day${isToday ? ' today' : ''}${on ? ' on' : ''}" data-life-day="${esc(r.date)}" role="button" tabindex="0">
+        <div class="life-day-date">${esc(r.date)}${isToday ? ' <span class="badge accent">今天</span>' : ''}</div>
         <div><span class="badge ${badge}">${esc(label)}</span> <span class="life-feel">${r.segments} 段</span></div>
         <div class="life-day-sum">${esc(r.summary || '')}</div>
       </div>`;
@@ -4195,17 +4177,38 @@ $('#lifeRefreshBtn').addEventListener('click', async () => {
   toast('正在刷新日程…', 'info', 1200);
   await loadLife();
 });
-$('#lifeDayTabs').addEventListener('click', (e) => {
-  const b = e.target.closest('[data-life-day]');
-  if (!b) return;
-  state.lifeDay = b.dataset.lifeDay;
+function pickLifeDay(date) {
+  if (!date) return;
+  state.lifeDay = date;
   renderLife(state.lifeCache || {});
+  // 切完把时间轴滚进视野：点的是下面那行，看的是上面那块
+  const card = $('#lifeTimeline');
+  if (card && card.scrollIntoView) card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+$('#lifeDays').addEventListener('click', (e) => {
+  const row = e.target.closest('[data-life-day]');
+  if (row) pickLifeDay(row.dataset.lifeDay);
+});
+$('#lifeDays').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const row = e.target.closest('[data-life-day]');
+  if (!row) return;
+  e.preventDefault();
+  pickLifeDay(row.dataset.lifeDay);
 });
 $('#lifeRebuildBtn').addEventListener('click', rebuildLife);
 $('#lifePackSave').addEventListener('click', saveLifePack);
 $('#lifePackReload').addEventListener('click', async () => {
   toast('已从 life.json 重载', 'info', 1600);
   await loadLifePack();
+});
+$('#lifePack').addEventListener('click', (e) => {
+  if (!e.target.closest('#lifePackDefaults')) return;
+  const box = document.querySelector('#lifePack [data-life-field="forbidden"]');
+  if (!box) return;
+  const defaults = (state.lifePack && state.lifePack.default_forbidden) || [];
+  box.value = defaults.join('\n');
+  toast(`已填入默认禁词 ${defaults.length} 条，记得点保存`, 'info', 2400);
 });
 
 $('#refreshBtn').addEventListener('click', async () => {

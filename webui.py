@@ -3560,9 +3560,9 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             "verbs": list(pack.verbs),
             "feels": list(pack.feels),
             "events": list(pack.events),
-            # 禁词分两份：内置那份不可删（改了等于放行通用现代词），自定义那份可编
+            # 禁词整份可编辑（演城市上班族时要能整体换掉）；默认值只作「填入默认」用
             "forbidden": list(pack.forbidden),
-            "builtin_forbidden": list(_life.BUILTIN_WORLD.forbidden),
+            "default_forbidden": list(_life.DEFAULT_FORBIDDEN),
             "path": path,
         }
 
@@ -3627,7 +3627,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                 "feels": list(pack.feels),
                 "events": list(pack.events),
                 "forbidden": list(pack.forbidden),
-                "builtin_forbidden": list(_life.BUILTIN_WORLD.forbidden),
+                "default_forbidden": list(_life.DEFAULT_FORBIDDEN),
             },
         }
 
