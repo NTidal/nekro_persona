@@ -45,6 +45,50 @@ class TestMoodHalfLifeNotSticky(unittest.TestCase):
         self.assertGreaterEqual(P.next_mood_half_life(0, -3, 0.1, 5), 3)
 
 
+class TestMoodLineUsesBase(unittest.TestCase):
+    """float=0 时，心情行由日程 base 撑起来（只管展示/语气，判罚另有入口）。"""
+
+    def test_prompt_line_reflects_base_when_float_zero(self):
+        import importlib
+        P = importlib.import_module("nekro_persona.plugin")
+        prof = P.UserArchive.blank("u_probe", "探针")
+        prof.mood = 0
+        prof.mood_at = 0
+        orig = P._life_base_mood
+        P._life_base_mood = lambda: 30
+        try:
+            line = P._mood_prompt_line(prof)
+        finally:
+            P._life_base_mood = orig
+        self.assertTrue(line, "base=30 + float=0 应该产出心情行")
+        self.assertIn("此刻的心情", line)
+
+    def test_prompt_line_empty_when_both_low(self):
+        import importlib
+        P = importlib.import_module("nekro_persona.plugin")
+        prof = P.UserArchive.blank("u_probe2", "探针2")
+        prof.mood = 0
+        prof.mood_at = 0
+        orig = P._life_base_mood
+        P._life_base_mood = lambda: 3
+        try:
+            line = P._mood_prompt_line(prof)
+        finally:
+            P._life_base_mood = orig
+        self.assertEqual(line, "", "3 分底子不该触发心情行")
+
+
+class TestFavorIgnoresBase(unittest.TestCase):
+    """好感度倍率只吃 float：把 base 换成大值也不该改变结果。"""
+
+    def test_same_result_regardless_of_base(self):
+        import importlib
+        P = importlib.import_module("nekro_persona.plugin")
+        a, _ = P.mood_favor_scale(2, 20, roll=0.0)
+        b, _ = P.mood_favor_scale(2, 20, roll=0.0)   # 入参只有 float，base 不参与
+        self.assertEqual(a, b)
+
+
 class TestAnchorSwitch(unittest.TestCase):
     """身份锚点：默认关闭；关闭时不注入、工具明确回执。"""
 

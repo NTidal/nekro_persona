@@ -869,6 +869,30 @@ class TestSalvage(unittest.TestCase):
         self.assertEqual(state.plans[dates[2]].source, "template")
 
 
+class TestComposeMood(unittest.TestCase):
+    """展示值 = weight×base + float；判罚另有入口（只看 float）。"""
+
+    def test_weight_one(self):
+        out = L.compose_mood(0, 30)
+        self.assertEqual(out["display"], 30)
+        self.assertEqual(out["base"], 30)
+        self.assertEqual(out["float"], 0)
+
+    def test_float_dominates_when_present(self):
+        self.assertEqual(L.compose_mood(-40, 20)["display"], -20)
+
+    def test_weight_zero_ignores_base(self):
+        self.assertEqual(L.compose_mood(5, 40, weight=0)["display"], 5)
+
+    def test_weight_half(self):
+        self.assertEqual(L.compose_mood(0, 30, weight=0.5)["display"], 15)
+
+    def test_cap_is_40(self):
+        self.assertEqual(L.MOOD_SEG_CAP, 40)
+        self.assertEqual(L._clip_seg_mood(99), 40)
+        self.assertEqual(L._clip_seg_mood(-99), -40)
+
+
 class TestBlockCachePrune(unittest.TestCase):
     """块缓存键里带日期：过期日期的条目必须被裁掉，否则随天数线性增长。"""
 
@@ -901,7 +925,7 @@ class TestBlockCachePrune(unittest.TestCase):
 
 
 class TestSegmentMood(unittest.TestCase):
-    """段级初始 mood：生成时就给，夹在 ±15，存得住、读得回、能用上。"""
+    """段级初始 mood：生成时就给，夹在 ±MOOD_SEG_CAP(40)，存得住、读得回、能用上。"""
 
     def test_clip_bounds(self):
         self.assertEqual(L._clip_seg_mood(0), 0)
@@ -922,13 +946,13 @@ class TestSegmentMood(unittest.TestCase):
         engine, _, _ = make_engine(reply=json.dumps({"summary": "s", "segments": [
             {"window": "00:00-07:30", "doing": "睡着", "feel": "沉", "mood": -8},
             {"window": "07:30-12:00", "doing": "听课", "feel": "平平的", "mood": 3},
-            {"window": "12:00-24:00", "doing": "做事", "feel": "松", "mood": 20},
+            {"window": "12:00-24:00", "doing": "做事", "feel": "松", "mood": 99},
         ]}, ensure_ascii=False))
         plan = engine._parse_plan(engine and '{"summary":"s","segments":[]}', 18)
         payload = {"summary": "s", "segments": [
             {"window": "00:00-07:30", "doing": "睡着", "feel": "沉", "mood": -8},
             {"window": "07:30-12:00", "doing": "听课", "feel": "平平的", "mood": 3},
-            {"window": "12:00-24:00", "doing": "做事", "feel": "松", "mood": 20},
+            {"window": "12:00-24:00", "doing": "做事", "feel": "松", "mood": 99},
         ]}
         parsed = engine._parse_one(payload, 18)
         self.assertEqual([s.mood for s in parsed.segments], [-8, 3, L.MOOD_SEG_CAP])

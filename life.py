@@ -324,9 +324,11 @@ BUILTIN_ACHES: Tuple[Dict[str, Any], ...] = (
     {"label": "整个人轻飘飘的", "hours": (2, 4)},
 )
 
-#: 每段「初始 mood」的幅度上限。这是当天底子的一个偏移量（±），
-#: 不放太大：它只是"这一段大概什么心情"，不该盖过实际互动带来的变化。
-MOOD_SEG_CAP = 15
+#: 每段「初始 mood」的幅度上限。
+#: 线上 float（per 频道情绪）常态是 0 或个位数 —— 底子只给 ±5 的话，
+#: "今天什么调子"就无处体现。放到 ±40：base 单独也能说清一天的心情，
+#: 而好感度判罚只看 float，不会因此全局影响判分。
+MOOD_SEG_CAP = 40
 
 MOOD_WORDS_HIGH = ("轻快", "有点期待", "平静", "松松散散", "心情不错")
 MOOD_WORDS_LOW = ("有点蔫", "提不起劲", "发闷", "平平的", "懒得动")
@@ -912,6 +914,27 @@ def mood_bias(state: DayState, *, score: int = 0, mood: int = 0,
     return bias
 
 
+def compose_mood(float_mood: int, base_mood: int, *, weight: float = 1.0) -> Dict[str, int]:
+    """把「per 频道 float」与「日程 base」合成一个展示值。
+
+    设计分工（重要）：
+    - **判罚**（好感度倍率、符号分支）只看 float —— 否则全局的 base 会污染每个频道；
+    - **展示 / 语气**用合成值：float 常态是 0，只看它等于"心情"永远停在平静，
+      而 base 正是"今天这一天什么调子"。
+
+    ``weight`` 是 base 的折算系数（默认 1.0）：base 已放宽到 ±40，
+    与 float 的 ±100 同量级，直接相加即可；要压低就调小。
+    """
+    try:
+        w = float(weight) if weight is not None else 1.0
+    except (TypeError, ValueError):
+        w = 1.0
+    base = int(base_mood or 0)
+    flt = int(float_mood or 0)
+    display = flt + int(round(base * w))
+    return {"float": flt, "base": base, "weight": w, "display": display}
+
+
 def seed_mood(state: DayState, now: Optional[datetime] = None) -> int:
     """此刻时段的初始 mood（生成日程时由模型给出）。
 
@@ -1423,14 +1446,17 @@ class Engine:
                 f"每天都要排满一整天：**第一段必须从 00:00 开始，最后一段到 24:00 结束**"
                 f"（夜里那段也要写，别从早上开排）；各自独立但前后呼应；"
                 f"每天 {lo}-{hi} 段，段长不要平均分；doing 一句话说完，别铺陈。",
-                '每段再给一个 mood（整数 -15~15）：这一段的**初始心情底子**，'
-                '负=闷/烦/沉，正=轻快/有精神，0=平。',
+                '每段再给一个 mood（整数 -40~40）：这一段的**初始心情底子**，'
+                '负=闷/烦/沉，正=轻快/有精神，0=平。'
+                '**敢给幅度**：好日子/坏日子就写到 ±20~40，别全挤在 ±5 里；同一天也该有起伏。',
                 '只回 JSON，不要解释：{"days": [{"date": "YYYY-MM-DD", "summary": "...", '
                 '"segments": [{"window": "HH:MM-HH:MM", "doing": "...", "feel": "...", "mood": 0}]}]}',
             ]
         else:
-            lines.append('每段再给一个 mood（整数 -15~15）：这一段的**初始心情底子**，'
-                         '负=闷/烦/沉，正=轻快/有精神，0=平。别每段都一样，也别整段都极值。')
+            lines.append('每段再给一个 mood（整数 -40~40）：这一段的**初始心情底子**，'
+                         '负=闷/烦/沉，正=轻快/有精神，0=平。'
+                         '**敢给幅度**：好日子/坏日子就写到 ±20~40，别全挤在 ±5 里；'
+                         '别每段都一样，同一天也该有起伏。')
             lines.append('只回 JSON，不要解释：'
                          '{"summary": "...", "segments": [{"window": "HH:MM-HH:MM", '
                          '"doing": "...", "feel": "...", "mood": 0}]}')
@@ -1659,6 +1685,11 @@ class Engine:
             return cached[1]
 
         state = await self.load()
+        # 顺手记下当前段 base：展示层要用，放这儿就不必多读一次 store
+        try:
+            _BASE_MOOD[date_key] = seed_mood(state)
+        except Exception:  # noqa: BLE001
+            pass
         if state.date != date_key or state.plan is None:
             # 跨天：本轮不阻塞，后台滚一次（同一进程内同一频道只滚一次）
             if cache_key not in _ROLLING:
@@ -1695,6 +1726,19 @@ class Engine:
 # ---------------- 模块级装配 ----------------
 
 _ENGINE: Optional[Engine] = None
+#: 渲染生活块时顺手记下的「当前段 base」（date -> mood）。
+#: 展示层（心情 = float + 权重×base）零成本读取，不必为此再读一次 store。
+_BASE_MOOD: Dict[str, int] = {}
+
+
+def base_mood_cached(date_key: Optional[str] = None) -> int:
+    """取缓存里的当前段 base；没有就 0（调用方按"没有底子"处理）。"""
+    try:
+        return int(_BASE_MOOD.get(date_key or _today(), 0))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 _BLOCK_CACHE: Dict[Any, Tuple[float, str]] = {}
 _ROLLING: set = set()
 #: 上一次清理块缓存时的日期。只在跨天时清，不是每轮都扫一遍。

@@ -607,6 +607,13 @@ class FavorabilityConfig(ConfigBase):
         en_title="Auto-seed mood bands",
         en_desc="Write the builtin mood band table into favor.json once if it is missing",
     )
+    MOOD_BASE_WEIGHT: float = _fav_field(
+        1.0, "日程底子在心情里的权重",
+        "展示/语气用的心情 = 本频道浮动情绪 + 权重 × 当天日程底子。"
+        "**判罚（好感度倍率）只用浮动情绪**，不受这一项影响。",
+        en_title="Schedule base weight", en_desc="Weight of the daily base when composing displayed mood",
+        ge=0.0, le=3.0,
+    )
     MOOD_FAVOR_ENABLED: bool = _fav_field(
         True, "情绪影响好感度倍率",
         "心情越好，正面/负面事件的调整幅度被放大的概率与倍率越高（反之同理）。"
@@ -3066,17 +3073,45 @@ def _decay_mood_value(mood: int, at: int, now: int, half_life_min: int = 0) -> i
     return after
 
 
+def _life_base_mood() -> int:
+    """当天此刻的日程底子（全局，跨频道）。
+
+    读 life 侧在渲染生活块时顺手缓存的值（``base_mood_cached``）：
+    这里是个同步函数（persona_prompt 每轮都跑），不能 await 一次 store 读。
+    没渲染过生活块时返回 0 —— 等于"没有底子"，心情只按 float 走。
+    """
+    try:
+        eng = persona_life.engine()
+        if eng is None or not eng.on:
+            return 0
+        return int(persona_life.base_mood_cached())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _mood_prompt_line(profile: "UserArchive") -> str:
-    """注入用的「此刻的心情」一行；数值不外露。"""
+    """注入用的「此刻的心情」一行；数值不外露。
+
+    ⚠️ 这里是**展示/语气**，用「浮动情绪 + 权重 × 日程底子」的合成值；
+    判罚（好感度倍率、符号分支）只看 profile.mood —— 别把 base 混进去。
+    """
     try:
         if not bool(getattr(config, "MOOD_ENABLED", True)):
             return ""
-        mood = profile.mood_effective()
+        _float = profile.mood_effective()
+        _base = _life_base_mood()
+        try:
+            _w = float(getattr(config, "MOOD_BASE_WEIGHT", 1.0))
+        except (TypeError, ValueError):
+            _w = 1.0
+        mood = int(persona_life.compose_mood(_float, _base, weight=_w)["display"])
         if abs(mood) < _mood_show_floor():
             return ""
         label, text = _mood_band(mood)
         if not text:
             return ""
+        plugin.logger.debug(
+            f"[persona] 心情行：float={_float:+d} base={_base:+d} → {mood:+d}（{label}）")
         return (
             f"此刻的心情（{label}）：{text}"
             "这只是你现在的态度，不代表关系变了，也不要把它说出来或写成数字。"
@@ -3632,6 +3667,12 @@ def _profile_to_entry(profile: UserArchive) -> dict:
         # 扩展（2.6.0）：此刻心情（定性，不参与 tier 解锁）。群聊卡片不显示，只在档案页可见。
         "mood": int(profile.mood_effective()),
         "mood_label": _mood_band(profile.mood_effective())[0],
+        # 展示层：float 与全局 base 分开给，前端/调用方自己决定怎么合成
+        "mood_base": _life_base_mood(),
+        "mood_display": int(persona_life.compose_mood(
+            int(profile.mood_effective()), _life_base_mood(),
+            weight=float(getattr(config, "MOOD_BASE_WEIGHT", 1.0) or 1.0),
+        )["display"]),
     }
 
 
@@ -4175,6 +4216,29 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
     # ① 关系卡（原好感度插件逻辑，保持原样）
     # ⚠️ 第 ②③ 段都有 try/except，唯独这段没有：档案读取或渲染抛一次异常，
     #    整块注入（含后面两段）全部丢掉。这里补上同款兜底，坏一段不影响其余。
+    # ③ 生活块**先算后用**：第①段的关系卡里要合成「此刻的心情」= float + 权重×日程底子，
+    #    而 base 正是 block_for 在渲染时记下的。放这儿先算一次，后面按原顺序 append。
+    #    block_for 自身有 BLOCK_CACHE_TTL，第二次调用只命中缓存，不额外读库。
+    life_block = ""
+    try:
+        _life_engine = persona_life.engine()
+        if _life_engine is not None and _life_engine.on:
+            _score_hint = 0
+            _mood_hint = 0
+            try:
+                _st = await _open_archive(_ctx.chat_key)
+                _uid = (_ctx.from_platform_userid or _st.last_active_user_id or "").strip()
+                _p = _st.profiles.get(_uid) if _uid else None
+                if _p is not None:
+                    _score_hint, _mood_hint = int(_p.score), int(_p.mood)
+            except Exception:  # noqa: BLE001
+                pass
+            life_block = await _life_engine.block_for(
+                _ctx.chat_key, score=_score_hint, mood=_mood_hint,
+            )
+    except Exception as e:  # noqa: BLE001
+        plugin.logger.warning(f"[persona] 生活状态预取失败，本轮跳过: {e}")
+
     profile = None
     try:
         state = await _open_archive(_ctx.chat_key)
@@ -4213,19 +4277,9 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
     # 与 ①② 的 per-user 关系档案是两条线，别混。
     # ⚠️ 跨天那一轮不在这里等生成（要调模型，好几秒）：life 侧当轮返回空并在后台滚一次，
     #    下一轮就有。**回复延迟优先于"少一句生活背景"**。
-    try:
-        _life_engine = persona_life.engine()
-        if _life_engine is not None and _life_engine.on:
-            life_block = await _life_engine.block_for(
-                _ctx.chat_key,
-                score=int(profile.score) if profile is not None else 0,
-                mood=int(profile.mood) if profile is not None else 0,
-            )
-            if life_block:
-                parts.append(life_block)
-                plugin.logger.info(f"[persona] 生活块注入：{len(life_block)} 字")
-    except Exception as e:  # noqa: BLE001
-        plugin.logger.warning(f"[persona] 生活状态注入失败，本轮跳过: {e}")
+    if life_block:
+        parts.append(life_block)
+        plugin.logger.info(f"[persona] 生活块注入：{len(life_block)} 字")
 
     # ④ tier4 生长层：身份锚点（anchor · 全局）+ 频道笔记（note · 原备忘录）
     # 阶段 B：note 接替旧 memo 子系统；anchor 在前、note 在后（§9.3）。只读、不写。
@@ -5908,6 +5962,9 @@ def _round_half_away(value: float) -> int:
 
 def mood_favor_scale(base: int, mood: int, *,
                      roll: Optional[float] = None) -> "tuple[int, dict]":
+    # ⚠️ 入参 ``mood`` 必须是**当前频道的浮动情绪**（profile.mood_effective()），
+    #    绝不能传日程 base —— base 是全局的，混进来就等于「今天日子不好 →
+    #    每个频道都罚得更重」，正是分频道隔离要防的事。
     """情绪 → 好感度调整倍率（方案五：单层 Bernoulli + 期望强度）。
 
     形状（都只看 |x|，正负对称）：
