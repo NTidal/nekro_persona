@@ -968,6 +968,18 @@ input[type="range"]::-moz-range-track { height: 4px; border-radius: 4px; backgro
 /* ---------- 注入预览 ---------- */
 .preview-control { display: grid; grid-template-columns: minmax(230px, 1fr) minmax(250px, 0.9fr) auto; gap: 18px; align-items: start; }
 .preview-control > .row-end { align-self: end; }
+
+/* 字体卡：三个下拉统一尺寸。
+   原来列宽是 minmax(230px,1fr) / minmax(250px,.9fr) / auto，下拉本身又是内容自适应宽
+   —— 三个框宽窄不一。这里改成三等分列、下拉撑满各自列、高度统一 34px。 */
+.preview-control.equal { grid-template-columns: repeat(3, minmax(0, 1fr)) auto; align-items: end; }
+.preview-control.equal > .field-label { min-width: 0; }
+.preview-control.equal > .field-label > .select {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  text-overflow: ellipsis;
+}
 .score-control { display: grid; gap: 8px; }
 .score-top { display: flex; align-items: center; justify-content: space-between; color: var(--text-soft); font-size: 11.5px; }
 .score-top output { color: var(--accent-strong); font-family: var(--font-serif); font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
@@ -1206,6 +1218,7 @@ dialog::backdrop { background: rgba(20, 18, 14, 0.55); }
   .three-col { grid-template-columns: 1fr; }
   .preview-control { grid-template-columns: 1fr 1fr; }
   .preview-control > .row-end { grid-column: 1 / -1; }
+  .preview-control.equal { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 860px) {
   .topbar { padding: 10px 16px; }
@@ -1242,6 +1255,7 @@ dialog::backdrop { background: rgba(20, 18, 14, 0.55); }
   .debug-grid { grid-template-columns: 1fr 1fr; }
   .field-row, .field-grid-3, .profile-grid { grid-template-columns: 1fr; }
   .preview-control { grid-template-columns: 1fr; }
+  .preview-control.equal { grid-template-columns: 1fr; }
   /* 原先这四条是死代码：.stage-row 是 block（内部 .stage-row-head 用 flex+wrap
      自己就能自适应）。2.2.16 起 .rubric-row 那条死规则（连同 rubric-dot 关键帧）已删除。
      真正需要移动端布局的是 .rubric-item（label / desc / 删除按钮）。 */
@@ -2776,7 +2790,7 @@ body.is-scrolling .dialog-foot {
           <span class="badge" id="cardFontBadge">—</span>
         </div>
         <div class="card-body">
-          <div class="preview-control">
+          <div class="preview-control equal">
             <div class="field-label">正文字体
               <select class="select" id="cardFontSelect"></select>
             </div>
@@ -2898,7 +2912,7 @@ body.is-scrolling .dialog-foot {
             <span class="badge" id="cardStyleBadge">默认</span>
           </div>
           <div class="card-body">
-            <div id="cardStyleList" class="hint" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:8px"></div>
+            <div id="cardStyleList" class="hint" style="grid-auto-rows:1fr;display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:8px"></div>
             <div class="row-end" style="margin-top:10px">
               <button class="btn" type="button" id="cardStyleReset">全部恢复默认</button>
               <button class="btn primary" type="button" id="cardStylePreview">按当前配色重渲</button>
@@ -5817,7 +5831,7 @@ function renderStyleList(styleInfo) {
   if (!box || !styleInfo) return;
   const toks = styleInfo.tokens || [];
   box.innerHTML = toks.map((t) => `
-    <div data-token-row="${t.key}" style="display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:8px;padding:6px 8px">
+    <div data-token-row="${t.key}" style="display:flex;align-items:center;gap:6px;min-height:46px;border:1px solid var(--line);border-radius:8px;padding:6px 8px">
       <input type="color" class="style-picker" data-token="${t.key}"
              value="${t.zero ? '#808080' : esc(t.value)}"
              style="width:34px;height:26px;padding:0;border:none;background:none;cursor:pointer">
