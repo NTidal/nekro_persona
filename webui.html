@@ -2503,7 +2503,6 @@ body.is-scrolling .dialog-foot {
           <button class="btn sm" type="button" id="lifeRefreshBtn">刷新</button>
         </div>
       </div>
-      <div class="metric-grid" id="lifeMetrics"></div>
       <div class="card">
         <div class="card-head">
           <div>
@@ -4164,8 +4163,7 @@ async function loadLife() {
     data = await load('life_state');
     if (!data) return;
   } catch (e) {
-    $('#lifeMetrics').innerHTML = '';
-    $('#lifeTimeline').innerHTML = `<div class="empty-inline">读取失败：${esc(e.message || '未知错误')}</div>`;
+      $('#lifeTimeline').innerHTML = `<div class="empty-inline">读取失败：${esc(e.message || '未知错误')}</div>`;
     $('#lifePack').innerHTML = `<div class="empty-inline">读取失败：${esc(e.message || '未知错误')}</div>`;
     return;
   }
@@ -4193,18 +4191,7 @@ function renderLife(d) {
   const seed = (d && d.seed) || null;
   const hits = (d && d.world_hits) || [];
 
-  // ① 指标
-  const cards = [
-    ['日期', on ? (d.date || '—') : '—', on ? '' : '未开启'],
-    ['段数', String((d && d.segments) || 0), `一次排 ${(d && d.horizon) || 1} 天`],
-    ['越界词', hits.length ? hits.join('、') : '无', hits.length ? '世界观校验未通过' : ''],
-  ];
-  $('#lifeMetrics').innerHTML = cards.map(([k, v, sub]) => `
-    <div class="metric">
-      <div class="metric-label">${esc(k)}</div>
-      <div class="metric-value${k === '越界词' ? ' wrap' : ''}">${esc(String(v))}</div>
-      ${sub ? `<div class="metric-sub">${esc(sub)}</div>` : ''}
-    </div>`).join('');
+  // 顶部三格指标已按需求移除（日期/段数/越界词）；越界词仍用于下方提示
 
   if (!on) {
     const why = esc((d && d.reason) || 'LIFE_ENABLED 未开启');

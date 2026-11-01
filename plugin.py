@@ -73,7 +73,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.6.0",
+    version="2.7.0",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -3073,6 +3073,45 @@ def _decay_mood_value(mood: int, at: int, now: int, half_life_min: int = 0) -> i
     return after
 
 
+_MOOD_SNAP_LAST = {"key": None, "ts": 0.0}
+
+
+def _mood_snapshot_path():
+    return plugin.get_plugin_data_dir() / "backgrounds" / "mood_snapshot.json"
+
+
+def _write_mood_snapshot(float_mood: int, base_mood: int, display: int) -> None:
+    """把合成后的心情写成**对外契约**（外部插件读它，别去读内部状态）。
+
+    位置：backgrounds/mood_snapshot.json
+    字段：float / base / display / mood(=display 的别名) / label / ts / version
+    节流：同一组值 10 分钟内不重复写；写失败一律吞掉（展示层不能因它报错）。
+    """
+    try:
+        key = (int(float_mood), int(base_mood), int(display))
+        now = time.time()
+        if _MOOD_SNAP_LAST["key"] == key and (now - float(_MOOD_SNAP_LAST["ts"] or 0)) < 600:
+            return
+        path = _mood_snapshot_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "float": key[0],
+            "base": key[1],
+            "display": key[2],
+            "mood": key[2],
+            "label": _mood_band(key[2])[0],
+            "ts": int(now),
+        }
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+        _MOOD_SNAP_LAST["key"] = key
+        _MOOD_SNAP_LAST["ts"] = now
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _life_base_mood() -> int:
     """当天此刻的日程底子（全局，跨频道）。
 
@@ -3105,6 +3144,9 @@ def _mood_prompt_line(profile: "UserArchive") -> str:
         except (TypeError, ValueError):
             _w = 1.0
         mood = int(persona_life.compose_mood(_float, _base, weight=_w)["display"])
+        # 对外契约：先写快照再判显示阈值 —— 否则心情偏轻时（<MOOD_SHOW_MIN）
+        # 快照永远不更新，外部插件读不到真实心情（实测踩到）。
+        _write_mood_snapshot(_float, _base, mood)
         if abs(mood) < _mood_show_floor():
             return ""
         label, text = _mood_band(mood)
