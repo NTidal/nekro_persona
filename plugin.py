@@ -73,7 +73,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.7.0",
+    version="2.7.1",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -5399,7 +5399,7 @@ async def get_favorability_profile(
         f"观察 {len(getattr(found, 'observations', []) or [])} 条 · "
         f"最近互动 {_rel_time_text(data.get('last_interaction_at'))}"
     )
-    return "\n".join(lines)
+    return ("【内部数据｜禁止原文转发】以下是你自己看的账本，不能整段或原文发给用户；要回答就用自己的话给结论，别报分数、额度、事件原文。" + "\n" + "\n".join(lines))
 
 
 @plugin.mount_sandbox_method(
