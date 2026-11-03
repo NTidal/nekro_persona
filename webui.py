@@ -1287,6 +1287,94 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         reload_state = await _reload_after_write()
         return {"ok": True, "persisted": True, "id": eid, "patch": patch, **reload_state}
 
+    @router.get("/api/longmem", summary="长期记忆（日摘要）")
+    async def longmem_list() -> Dict[str, Any]:
+        """列出已生成的日摘要 + 当前配置。"""
+        from . import longmem as _lm
+
+        data_dir = plugin.get_plugin_data_dir()
+        root = data_dir / "backgrounds" / "longmem" / "daily"
+        items: List[Dict[str, Any]] = []
+        if root.exists():
+            for f in sorted(root.glob("*.json")):
+                try:
+                    d = json.loads(f.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    continue
+                items.append({
+                    "date": d.get("date") or f.stem,
+                    "chars": len(d.get("summary") or ""),
+                    "msg_count": d.get("msg_count") or 0,
+                    "failed_chunks": d.get("failed_chunks"),
+                    "simulated": bool(d.get("simulated")),
+                    "chat_key": d.get("chat_key") or "",
+                    "head": (d.get("summary") or "")[:80],
+                })
+        items.reverse()
+        return {
+            "enabled": bool(getattr(config, "LONG_MEM_ENABLED", True)),
+            "inject_days": int(getattr(config, "LONG_MEM_INJECT_DAYS", 3) or 3),
+            "block": _lm.render_block(data_dir, days=int(getattr(config, "LONG_MEM_INJECT_DAYS", 3) or 3)),
+            "items": items,
+        }
+
+    @router.post("/api/longmem", summary="长期记忆：补齐/删除/模拟")
+    async def longmem_action(request: "Request") -> Dict[str, Any]:
+        from . import longmem as _lm
+
+        body = await _json_body(request)
+        action = str(body.get("action") or "rebuild").strip().lower()
+        data_dir = plugin.get_plugin_data_dir()
+
+        if action == "delete":
+            day = str(body.get("date") or "").strip()
+            if not day:
+                return {"ok": False, "error": "缺少 date"}
+            p = _lm.daily_path(data_dir, day)
+            try:
+                p.unlink()
+                return {"ok": True, "deleted": day}
+            except FileNotFoundError:
+                return {"ok": False, "error": "文件不存在"}
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": str(exc)}
+
+        if action == "fake":
+            day = str(body.get("date") or "").strip()
+            text = str(body.get("summary") or "").strip()
+            if not day or not text:
+                return {"ok": False, "error": "需要 date 与 summary"}
+            ok = _lm.save_daily(data_dir, day, {
+                "version": 1, "date": day, "chat_key": "SIM", "summary": text[:2000],
+                "entities": [], "msg_count": 0, "ts": 0, "simulated": True,
+            })
+            return {"ok": ok, "date": day}
+
+        # rebuild
+        from nekro_agent.models.db_chat_message import DBChatMessage
+
+        chat_key = str(body.get("chat_key") or "").strip()
+        if not chat_key:
+            return {"ok": False, "error": "需要 chat_key（群/私聊的会话键）"}
+        d_from = str(body.get("from") or "").strip() or None
+        d_to = str(body.get("to") or "").strip() or None
+        days = int(body.get("days") or getattr(config, "LONG_MEM_INJECT_DAYS", 3) or 3)
+        overwrite = bool(body.get("overwrite"))
+
+        def _ask(prompt: str, sysmsg: str, task: str):
+            import sys as _sys
+
+            mod = _sys.modules.get("nekro_persona.plugin") or plugin
+            fn = getattr(mod, "_life_ask", None)
+            if fn is None:
+                raise RuntimeError("_life_ask 不可用")
+            return fn(prompt, system=sysmsg, task=task, max_tokens=1200)
+
+        made = await _lm.ensure_days(data_dir, chat_key, _lm.build_fetcher(DBChatMessage), _ask,
+                                    days_back=days, start=d_from, end=d_to,
+                                    overwrite=overwrite)
+        return {"ok": True, "made": made, "days": days, "from": d_from, "to": d_to}
+
     @router.get("/api/trash", summary="背景记忆回收站")
     async def api_trash(request: Request) -> Dict[str, Any]:
         _check_key(request)

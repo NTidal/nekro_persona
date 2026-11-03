@@ -2385,6 +2385,10 @@ body.is-scrolling .dialog-foot {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11v17H6.5A2.5 2.5 0 0 0 4 22.5v-17Z"/><path d="M20 5.5A2.5 2.5 0 0 0 17.5 3H13v17h4.5a2.5 2.5 0 0 1 2.5 2.5v-17Z"/></svg>
         <span>背景记忆</span>
       </button>
+      <button class="nav-item" type="button" data-tab="longmem">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6.5A2.5 2.5 0 0 1 6.5 4H19v16H6.5A2.5 2.5 0 0 1 4 17.5z"/><path d="M8 8h7M8 12h7M8 16h4"/></svg>
+        <span>长期记忆</span>
+      </button>
       <button class="nav-item" type="button" data-tab="favor">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M16 20v-1.6a3.4 3.4 0 0 0-3.4-3.4H6.4A3.4 3.4 0 0 0 3 18.4V20"/><circle cx="9.5" cy="7" r="4"/><path d="M17 11.2a4 4 0 0 0 0-7.4M18 14.9a3.4 3.4 0 0 1 3 3.5V20"/></svg>
         <span>好感度档案</span>
@@ -2594,6 +2598,40 @@ body.is-scrolling .dialog-foot {
           </table>
         </div>
         <div class="pager" id="memoryPager"></div>
+      </div>
+    </section>
+    <section class="page" id="page-longmem" data-page="longmem">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">长期记忆</h1>
+          <p class="page-desc">按天把对话压成摘要永久保存，跨天注入最近几天；生成在后台跑，不阻塞回复。</p>
+        </div>
+        <div class="head-actions">
+          <label class="life-inline">注入最近
+            <select class="life-select" id="lmDays" style="width:84px">
+              <option value="3">3 天</option>
+              <option value="5">5 天</option>
+              <option value="7">7 天</option>
+              <option value="14">14 天</option>
+            </select>
+          </label>
+          <button class="btn" type="button" id="lmRefresh">刷新</button>
+        </div>
+      </div>
+      <div class="card">
+                    </div>
+        <div class="lm-controls">
+          <input class="input" id="lmChatKey" placeholder="会话键（如 onebot_v11-group_123456）" />
+          <input class="input" id="lmFrom" placeholder="起 2026-10-01" style="width:132px" />
+          <input class="input" id="lmTo" placeholder="止 2026-11-03" style="width:132px" />
+          <button class="btn primary" type="button" id="lmBuild">补齐</button>
+          <span class="lm-hint" id="lmMsg"></span>
+        </div>
+        <div class="lm-list" id="lmList"></div>
+        <details class="lm-block">
+          <summary>当前注入块</summary>
+          <pre id="lmBlock"></pre>
+        </details>
       </div>
     </section>
 
@@ -7509,6 +7547,103 @@ mutate = async function (...args) {
 
 FX.init();
 goto('overview');
+
+
+  /* ---------------- 长期记忆：列表 / 补齐 / 删除 ---------------- */
+  const LM = { loading: false };
+
+  function lmMsg(text, isErr) {
+    const el = $('#lmMsg');
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('err', !!isErr);
+  }
+
+  async function loadLongmem() {
+    if (LM.loading) return;
+    LM.loading = true;
+    try {
+      const data = await api('/longmem');
+      const daysSel = $('#lmDays');
+      if (daysSel && data.inject_days) daysSel.value = String(data.inject_days);
+      const block = $('#lmBlock');
+      if (block) block.textContent = data.block || '（还没有可注入的摘要）';
+      const list = $('#lmList');
+      if (list) {
+        const items = data.items || [];
+        if (!items.length) {
+          list.innerHTML = '<div class="lm-hint">还没有日摘要。填会话键后点「补齐」。</div>';
+        } else {
+          list.innerHTML = items.map((it) => `
+            <div class="lm-row" data-date="${it.date}">
+              <span class="lm-date">${it.date}</span>
+              <span class="lm-meta">${it.chars} 字</span>
+              <span class="lm-meta">${it.msg_count} 条</span>
+              <span class="lm-head">${it.simulated ? '[模拟] ' : ''}${(it.head || '').replace(/</g, '&lt;')}</span>
+              <button class="btn" type="button" data-lm-del="${it.date}" style="height:28px;padding:0 10px;font-size:12px">删除</button>
+            </div>`).join('');
+        }
+      }
+    } catch (e) {
+      lmMsg('读取失败：' + (e.message || e), true);
+    } finally {
+      LM.loading = false;
+    }
+  }
+
+  async function lmBuild() {
+    const ck = ($('#lmChatKey')?.value || '').trim();
+    if (!ck) { lmMsg('先填会话键（群/私聊）', true); return; }
+    const from = ($('#lmFrom')?.value || '').trim();
+    const to = ($('#lmTo')?.value || '').trim();
+    const days = Number($('#lmDays')?.value || 3);
+    lmMsg('补齐中，可能要几十秒…');
+    try {
+      const body = { action: 'rebuild', chat_key: ck, days };
+      if (from && to) { body.from = from; body.to = to; }
+      const r = await api('/longmem', { method: 'POST', body });
+      if (r && r.ok) {
+        const made = (r.made || []).join('、') || '（无新增，可能已存在或当天消息太少）';
+        lmMsg('完成：' + made);
+        loadLongmem();
+      } else {
+        lmMsg('失败：' + ((r && r.error) || '未知错误'), true);
+      }
+    } catch (e) {
+      lmMsg('失败：' + (e.message || e), true);
+    }
+  }
+
+  async function lmDelete(date) {
+    if (!date) return;
+    if (!confirm('删除 ' + date + ' 的日摘要？')) return;
+    try {
+      const r = await api('/longmem', { method: 'POST', body: { action: 'delete', date } });
+      lmMsg(r && r.ok ? ('已删除 ' + date) : ('删除失败：' + ((r && r.error) || '')), !(r && r.ok));
+      loadLongmem();
+    } catch (e) {
+      lmMsg('删除失败：' + (e.message || e), true);
+    }
+  }
+
+  document.addEventListener('click', (ev) => {
+    const del = ev.target.closest('[data-lm-del]');
+    if (del) { lmDelete(del.dataset.lmDel); return; }
+    if (ev.target.closest('#lmRefresh')) { lmMsg(''); loadLongmem(); return; }
+    if (ev.target.closest('#lmBuild')) { lmBuild(); }
+  });
+
+  document.addEventListener('change', (ev) => {
+    if (ev.target.id === 'lmDays') {
+      saveConfig({ LONG_MEM_INJECT_DAYS: Number(ev.target.value) })
+        .then(() => loadLongmem())
+        .catch((e) => lmMsg('保存失败：' + (e.message || e), true));
+    }
+  });
+
+  document.addEventListener('navigation', (ev) => {
+    if (ev.detail === 'longmem') loadLongmem();
+  });
 
 </script>
 </body>
