@@ -2618,9 +2618,9 @@ body.is-scrolling .dialog-foot {
       </div>
       <div class="card">
         <div class="card-head">
-          <div class="search-wrap" style="max-width:320px">
-            <input class="input" id="lmChatKey" placeholder="会话键，如 onebot_v11-group_123456" />
-          </div>
+          <select class="life-select" id="lmChatKey" title="选择要补哪个会话的记忆">
+            <option value="">选择会话…</option>
+          </select>
           <div class="head-actions">
             <input class="input" id="lmFrom" placeholder="起 2026-10-01" style="width:128px" />
             <input class="input" id="lmTo" placeholder="止 2026-11-03" style="width:128px" />
@@ -7569,6 +7569,14 @@ goto('overview');
       const data = await api('longmem');
       const daysSel = $('#lmDays');
       if (daysSel && data.inject_days) daysSel.value = String(data.inject_days);
+      const sel = $('#lmChatKey');
+      if (sel) {
+        const cur = sel.value;
+        const keys = data.chat_keys || [];
+        sel.innerHTML = '<option value="">选择会话…</option>' + keys.map((k) =>
+          `<option value="${esc(k.key)}">${esc(k.key)}（${k.count} 条）</option>`).join('');
+        if (cur && keys.some((k) => k.key === cur)) sel.value = cur;
+      }
       const block = $('#lmBlock');
       if (block) block.textContent = data.block || '（还没有可注入的摘要）';
       const list = $('#lmList');

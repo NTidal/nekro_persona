@@ -1311,8 +1311,22 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     "head": (d.get("summary") or "")[:80],
                 })
         items.reverse()
+
+        # 会话键候选：按最近活跃排序（给前端做下拉）
+        try:
+            from collections import Counter
+
+            from nekro_agent.models.db_chat_message import DBChatMessage
+
+            rows = await DBChatMessage.all().order_by("-id").limit(600)
+            cnt = Counter(str(getattr(r, "chat_key", "")) for r in rows)
+            chat_keys = [{"key": k, "count": n} for k, n in cnt.most_common(24) if k]
+        except Exception:  # noqa: BLE001
+            chat_keys = []
+
         return {
             "enabled": bool(getattr(config, "LONG_MEM_ENABLED", True)),
+            "chat_keys": chat_keys,
             "inject_days": int(getattr(config, "LONG_MEM_INJECT_DAYS", 3) or 3),
             "block": _lm.render_block(data_dir, days=int(getattr(config, "LONG_MEM_INJECT_DAYS", 3) or 3)),
             "items": items,
