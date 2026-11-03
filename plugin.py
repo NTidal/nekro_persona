@@ -73,7 +73,7 @@ plugin = NekroPlugin(
     name="人格记忆",
     module_name="nekro_persona",
     description="三档背景记忆（常驻身份 / 按需往事 / 世界知识）+ 好感度解锁门控 + tier4 生长层（身份锚点 / 频道笔记）+ 种子/生长导出分离",
-    version="2.7.1",
+    version="2.7.2",
     author="NTidal",
     url="https://github.com/NTidal/nekro_persona",
     i18n_name=i18n.i18n_text(
@@ -606,6 +606,15 @@ class FavorabilityConfig(ConfigBase):
         "（只写一次、不覆盖已有内容、留一份 .bak）。关掉则一直走代码内置文案，管理员改不了档位措辞",
         en_title="Auto-seed mood bands",
         en_desc="Write the builtin mood band table into favor.json once if it is missing",
+    )
+    LONG_MEM_ENABLED: bool = _fav_field(
+        True, "长期记忆（每日摘要）",
+        "按天把对话压成摘要永久保存，跨天注入最近几天。每天每频道一次 LLM 调用；"
+        "输入硬上限 30 万字符，成本约 ¥0.07/天/频道。",
+    )
+    LONG_MEM_INJECT_DAYS: int = _fav_field(
+        3, "注入最近几天", "注入最近 N 天的日摘要（默认 3 天，字符预算 1200）。",
+        ge=1, le=14,
     )
     MOOD_BASE_WEIGHT: float = _fav_field(
         1.0, "日程底子在心情里的权重",
@@ -1395,7 +1404,8 @@ from . import memory as persona_memory  # noqa: E402  # 阶梯记忆与好感度
 from . import tier4  # noqa: E402  # tier4 生长层（身份锚点，阶段 A）
 from . import consolidator as persona_consolidator  # noqa: E402  # 关系记忆归纳
 from . import memory_log as persona_memlog  # noqa: E402  # 关系记忆存储
-from . import life as persona_life  # noqa: E402  # 生活时间轴（日程/手感/梦）
+from . import life as persona_life
+from . import longmem as persona_longmem  # noqa: E402  # 生活时间轴（日程/手感/梦）
 
 # 背景记忆数据目录：**按访问解析**（多账号隔离）。
 # ⚠️ 绝不能在这里写下 `plugin.get_plugin_data_dir() / "backgrounds"` 的求值结果：
@@ -4417,6 +4427,34 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
             parts.append(_style)
     except Exception as e:  # noqa: BLE001
         plugin.logger.warning(f"[persona] 输出规范注入失败，本轮跳过: {e}")
+
+    # ⑦ 长期记忆：最近几天的日摘要（缺的天在后台补，不阻塞本轮）
+    try:
+        if bool(getattr(config, "LONG_MEM_ENABLED", True)):
+            _lm_dir = plugin.get_plugin_data_dir()
+            _lm_days = int(getattr(config, "LONG_MEM_INJECT_DAYS", 3) or 3)
+            _lm_block = persona_longmem.render_block(_lm_dir, days=_lm_days)
+            if _lm_block:
+                parts.append(_lm_block)
+            _lm_task = getattr(plugin, "_longmem_task", None)
+            if _lm_task is None or _lm_task.done():
+                from nekro_agent.models.db_chat_message import DBChatMessage as _DBMsg
+
+                async def _lm_job() -> None:
+                    try:
+                        made = await persona_longmem.ensure_days(
+                            _lm_dir, _ctx.chat_key,
+                            persona_longmem.build_fetcher(_DBMsg),
+                            lambda p, sysmsg, task: _life_ask(p, system=sysmsg, task=task, max_tokens=1200),
+                        )
+                        if made:
+                            plugin.logger.info(f"[persona] 长期记忆已生成: {made} chat={_ctx.chat_key}")
+                    except Exception as exc:  # noqa: BLE001
+                        plugin.logger.warning(f"[persona] 长期记忆补齐失败（忽略）: {exc}")
+
+                plugin._longmem_task = asyncio.get_event_loop().create_task(_lm_job())
+    except Exception as _lm_exc:  # noqa: BLE001
+        plugin.logger.warning(f"[persona] 长期记忆注入失败（忽略）: {_lm_exc}")
 
     return "\n\n".join(p for p in parts if p)
 
