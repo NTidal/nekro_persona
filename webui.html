@@ -2607,31 +2607,33 @@ body.is-scrolling .dialog-foot {
           <p class="page-desc">按天把对话压成摘要永久保存，跨天注入最近几天；生成在后台跑，不阻塞回复。</p>
         </div>
         <div class="head-actions">
-          <label class="life-inline">注入最近
-            <select class="life-select" id="lmDays" style="width:84px">
-              <option value="3">3 天</option>
-              <option value="5">5 天</option>
-              <option value="7">7 天</option>
-              <option value="14">14 天</option>
-            </select>
-          </label>
+          <select class="life-select" id="lmDays" title="注入最近几天">
+            <option value="3">注入最近 3 天</option>
+            <option value="5">注入最近 5 天</option>
+            <option value="7">注入最近 7 天</option>
+            <option value="14">注入最近 14 天</option>
+          </select>
           <button class="btn" type="button" id="lmRefresh">刷新</button>
         </div>
       </div>
       <div class="card">
-                    </div>
-        <div class="lm-controls">
-          <input class="input" id="lmChatKey" placeholder="会话键（如 onebot_v11-group_123456）" />
-          <input class="input" id="lmFrom" placeholder="起 2026-10-01" style="width:132px" />
-          <input class="input" id="lmTo" placeholder="止 2026-11-03" style="width:132px" />
-          <button class="btn primary" type="button" id="lmBuild">补齐</button>
-          <span class="lm-hint" id="lmMsg"></span>
+        <div class="card-head">
+          <div class="search-wrap" style="max-width:320px">
+            <input class="input" id="lmChatKey" placeholder="会话键，如 onebot_v11-group_123456" />
+          </div>
+          <div class="head-actions">
+            <input class="input" id="lmFrom" placeholder="起 2026-10-01" style="width:128px" />
+            <input class="input" id="lmTo" placeholder="止 2026-11-03" style="width:128px" />
+            <button class="btn primary" type="button" id="lmBuild">补齐</button>
+          </div>
         </div>
-        <div class="lm-list" id="lmList"></div>
-        <details class="lm-block">
-          <summary>当前注入块</summary>
-          <pre id="lmBlock"></pre>
-        </details>
+        <div class="card-body">
+          <div class="list-stack" id="lmList"></div>
+          <details class="lm-block">
+            <summary>当前注入块</summary>
+            <pre id="lmBlock"></pre>
+          </details>
+        </div>
       </div>
     </section>
 
@@ -4309,9 +4311,10 @@ function renderLife(d) {
 }
 
 /* ---------------- 导航 ---------------- */
-const PAGES = ['overview', 'life', 'memory', 'favor', 'rules', 'preview', 'cards', 'memo', 'anchor', 'memlog', 'trash', 'transfer', 'settings'];
+const PAGES = ['longmem', 'overview', 'life', 'memory', 'favor', 'rules', 'preview', 'cards', 'memo', 'anchor', 'memlog', 'trash', 'transfer', 'settings'];
 const LOADERS = {
-  overview: loadOverview, life: loadLife, memory: loadMemory, favor: loadFavor, rules: loadRules,
+  overview: loadOverview, life: loadLife, memory: loadMemory, longmem: loadLongmem,
+  favor: loadFavor, rules: loadRules,
   preview: loadPreview, cards: loadCards, memo: loadMemo, anchor: loadAnchor, memlog: loadMemlog,
   trash: loadTrash, transfer: loadTransfer, settings: loadSettings,
 };
@@ -7563,7 +7566,7 @@ goto('overview');
     if (LM.loading) return;
     LM.loading = true;
     try {
-      const data = await api('/longmem');
+      const data = await api('longmem');
       const daysSel = $('#lmDays');
       if (daysSel && data.inject_days) daysSel.value = String(data.inject_days);
       const block = $('#lmBlock');
@@ -7572,15 +7575,22 @@ goto('overview');
       if (list) {
         const items = data.items || [];
         if (!items.length) {
-          list.innerHTML = '<div class="lm-hint">还没有日摘要。填会话键后点「补齐」。</div>';
+          list.innerHTML = '<div class="empty-inline">还没有日摘要，填会话键后点「补齐」</div>';
         } else {
           list.innerHTML = items.map((it) => `
-            <div class="lm-row" data-date="${it.date}">
-              <span class="lm-date">${it.date}</span>
-              <span class="lm-meta">${it.chars} 字</span>
-              <span class="lm-meta">${it.msg_count} 条</span>
-              <span class="lm-head">${it.simulated ? '[模拟] ' : ''}${(it.head || '').replace(/</g, '&lt;')}</span>
-              <button class="btn" type="button" data-lm-del="${it.date}" style="height:28px;padding:0 10px;font-size:12px">删除</button>
+            <div class="list-item">
+              <div class="list-copy">
+                <strong>${it.date} <span class="badge">${it.chars} 字</span>
+                  ${it.simulated ? '<span class="badge">模拟</span>' : ''}
+                  ${it.failed_chunks ? `<span class="badge warn">丢 ${it.failed_chunks} 块</span>` : ''}</strong>
+                <p>${esc(it.head || '')}</p>
+                <div class="list-meta">
+                  <span class="muted" style="font-size:10px">消息 ${it.msg_count} 条 · ${esc(it.chat_key || '')}</span>
+                </div>
+              </div>
+              <div class="list-actions">
+                <button class="mini-btn danger" type="button" data-lm-del="${it.date}">删除</button>
+              </div>
             </div>`).join('');
         }
       }
@@ -7601,7 +7611,7 @@ goto('overview');
     try {
       const body = { action: 'rebuild', chat_key: ck, days };
       if (from && to) { body.from = from; body.to = to; }
-      const r = await api('/longmem', { method: 'POST', body });
+      const r = await api('longmem', { method: 'POST', body });
       if (r && r.ok) {
         const made = (r.made || []).join('、') || '（无新增，可能已存在或当天消息太少）';
         lmMsg('完成：' + made);
@@ -7618,7 +7628,7 @@ goto('overview');
     if (!date) return;
     if (!confirm('删除 ' + date + ' 的日摘要？')) return;
     try {
-      const r = await api('/longmem', { method: 'POST', body: { action: 'delete', date } });
+      const r = await api('longmem', { method: 'POST', body: { action: 'delete', date } });
       lmMsg(r && r.ok ? ('已删除 ' + date) : ('删除失败：' + ((r && r.error) || '')), !(r && r.ok));
       loadLongmem();
     } catch (e) {
@@ -7641,9 +7651,6 @@ goto('overview');
     }
   });
 
-  document.addEventListener('navigation', (ev) => {
-    if (ev.detail === 'longmem') loadLongmem();
-  });
 
 </script>
 </body>
