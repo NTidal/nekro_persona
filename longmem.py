@@ -202,6 +202,9 @@ async def ensure_days(data_dir: Path, chat_key: str, fetch_rows, ask,
     - overwrite=True 时重算已存在的日期。
     返回本次成功写入的日期列表。
     """
+    if not is_memory_chat(chat_key):
+        return []                       # 网页测试/沙盒会话不生成长期记忆
+
     if start and end:
         targets = _date_span(start, end)
     else:
@@ -289,6 +292,17 @@ def _save_session(data_dir: Path, chat_key: str, data: Dict[str, Any]) -> None:
 
 
 _SKIP_PREFIX = ("[Image", "[image", "[图片", "[表情", "[语音", "[文件", "/var/lib/docker")
+
+# 不参与长期记忆的会话前缀：网页测试会话、临时沙盒会话
+_SKIP_CHAT_PREFIX = ("web-session_", "sandbox_", "test_", "sim_")
+
+
+def is_memory_chat(chat_key: str) -> bool:
+    """网页测试/沙盒会话不进长期记忆。"""
+    k = str(chat_key or "").strip()
+    if not k:
+        return False
+    return not any(k.startswith(p) for p in _SKIP_CHAT_PREFIX)
 
 
 def extract_topic(text: str) -> str:
