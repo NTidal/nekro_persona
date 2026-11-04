@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -343,12 +344,35 @@ def render_answered(data_dir: Path, chat_key: str, exclude: str = "",
 
 
 async def search_messages(DBChatMessage, chat_key: str, keywords: List[str],
-                          days: int = RAW_DAYS_DEFAULT, limit: int = RAW_LIMIT_DEFAULT):
-    """在原始消息里按关键词检索，返回未改写的原文。"""
+                          days: int = RAW_DAYS_DEFAULT, limit: int = RAW_LIMIT_DEFAULT,
+                          context: int = 0):
+    """在原始消息里按关键词检索；context>0 时带回命中处前后的上下文消息。
+
+    返回 [{"time","who","text","match":bool,"offset":int}]，按时间正序。
+    """
     days = max(1, min(int(days or RAW_DAYS_DEFAULT), RAW_DAYS_MAX))
     limit = max(1, min(int(limit or RAW_LIMIT_DEFAULT), 8))
+    context = max(0, min(int(context or 0), 10))
     lo = int(time.time()) - days * 86400
-    seen = {}
+
+    def _clean(t: str) -> str:
+        t = re.sub(r"\[Image: [^\]]*\]", "[图片]", t)
+        t = re.sub(r"\[File: [^\]]*\]", "[文件]", t)
+        t = re.sub(r"\[Voice: [^\]]*\]", "[语音]", t)
+        t = re.sub(r"/var/lib/docker/\S+", "[文件]", t)
+        return " ".join(t.split())
+
+    def _row(r):
+        ts = int(getattr(r, "send_timestamp", 0) or 0)
+        return {
+            "id": getattr(r, "id", 0),
+            "time": datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "--",
+            "who": str(getattr(r, "sender_nickname", "") or getattr(r, "sender_name", "") or "?")[:12],
+            "text": _clean(str(getattr(r, "content_text", "") or ""))[:RAW_TEXT_MAX],
+            "ts": ts,
+        }
+
+    hits: Dict[int, Dict[str, Any]] = {}
     for kw in [str(k).strip() for k in (keywords or []) if str(k).strip()][:4]:
         try:
             rows = await DBChatMessage.filter(
@@ -358,26 +382,64 @@ async def search_messages(DBChatMessage, chat_key: str, keywords: List[str],
         except Exception:  # noqa: BLE001
             continue
         for r in rows:
-            mid = getattr(r, "id", None) or id(r)
-            if mid in seen:
+            mid = getattr(r, "id", None)
+            if mid is None or mid in hits:
                 continue
-            ts = int(getattr(r, "send_timestamp", 0) or 0)
-            seen[mid] = {
-                "time": datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "--",
-                "who": str(getattr(r, "sender_nickname", "") or getattr(r, "sender_name", "") or "?")[:12],
-                "text": " ".join(str(getattr(r, "content_text", "") or "").split())[:RAW_TEXT_MAX],
-                "_ts": ts,
-            }
-    out = sorted(seen.values(), key=lambda x: -x["_ts"])[:limit]
-    for x in out:
-        x.pop("_ts", None)
-    return out
+            hits[mid] = _row(r)
+
+    if not hits:
+        return []
+
+    picked = sorted(hits.values(), key=lambda x: -x["ts"])[:limit]
+
+    if context <= 0:
+        picked.sort(key=lambda x: x["ts"])
+        for x in picked:
+            x["match"] = True
+            x["offset"] = 0
+        return picked
+
+    # 带上下文：只对最近 2 个命中展开，避免灌太多
+    out: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for h in sorted(picked, key=lambda x: -x["ts"])[:2]:
+        try:
+            rows = await DBChatMessage.filter(
+                chat_key=chat_key, id__gte=max(1, h["id"] - context),
+                id__lte=h["id"] + context,
+            ).order_by("id").limit(context * 2 + 1).all()
+        except Exception:  # noqa: BLE001
+            rows = []
+        if not rows:
+            h["match"], h["offset"] = True, 0
+            if h["id"] not in seen_ids:
+                out.append(h)
+                seen_ids.add(h["id"])
+            continue
+        for r in rows:
+            row = _row(r)
+            if row["id"] in seen_ids:
+                continue
+            seen_ids.add(row["id"])
+            row["match"] = row["id"] == h["id"]
+            row["offset"] = int(row["id"]) - int(h["id"])
+            out.append(row)
+    out.sort(key=lambda x: (x.get("ts") or 0, x.get("id") or 0))
+    # 总字符预算 2600：先丢离命中最远的行
+    budget = 2600
+    while out and sum(len(x["text"]) + 32 for x in out) > budget:
+        far = max(out, key=lambda x: abs(int(x.get("offset") or 0)))
+        if abs(int(far.get("offset") or 0)) == 0:
+            break
+        out.remove(far)
+    return out[:40]
 
 
 def render_raw(items: List[Dict[str, Any]]) -> str:
     if not items:
         return "没找到相关原话。"
-    lines = ["【以下为未经改写的原始发言，可直接引用；不要整段念成档案】"]
+    lines = ["【以下为未经改写的原始发言；▶ 是命中的那条，其余为它前后的上下文。可直接引用，不要整段念成档案】"]
     for it in items:
-        lines.append(f"[{it.get('time')}] {it.get('who')}: {it.get('text')}")
+        mark = "▶ " if it.get("match") else "  "
+        lines.append(f"{mark}[{it.get('time')}] {it.get('who')}: {it.get('text')}")
     return "\n".join(lines)

@@ -1382,7 +1382,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             fn = getattr(mod, "_life_ask", None)
             if fn is None:
                 raise RuntimeError("_life_ask 不可用")
-            return fn(prompt, system=sysmsg, task=task, max_tokens=1200)
+            return fn(prompt, system=sysmsg, task=task, max_tokens=3000)
 
         made = await _lm.ensure_days(data_dir, chat_key, _lm.build_fetcher(DBChatMessage), _ask,
                                     days_back=days, start=d_from, end=d_to,

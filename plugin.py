@@ -1444,12 +1444,15 @@ LLM_NO_THINKING = dict(persona_consolidator.DISABLE_THINKING)
 
 
 async def _life_ask(prompt: str, *, system: str, task: str = "",
-                    max_tokens: Optional[int] = None) -> str:
+                    max_tokens: Optional[int] = None,
+                    model_group: Optional[str] = None) -> str:
     """日程 / 梦境的一次性模型调用：独立于对话回合，不经过 agent。"""
     from nekro_agent.core.config import config as _na_cfg
     from nekro_agent.services.agent.openai import gen_openai_chat_response
 
-    name = str(getattr(config, "LIFE_MODEL_GROUP", "") or "").strip() or _na_cfg.USE_MODEL_GROUP
+    name = (str(model_group or "").strip()
+            or str(getattr(config, "LIFE_MODEL_GROUP", "") or "").strip()
+            or _na_cfg.USE_MODEL_GROUP)
     group = _na_cfg.get_model_group_info(name)
     resp = await gen_openai_chat_response(
         model=group.CHAT_MODEL,
@@ -4466,7 +4469,9 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
                         made = await persona_longmem.ensure_days(
                             _lm_dir, _ctx.chat_key,
                             persona_longmem.build_fetcher(_DBMsg),
-                            lambda p, sysmsg, task: _life_ask(p, system=sysmsg, task=task, max_tokens=1200),
+                            lambda p, sysmsg, task: _life_ask(p, system=sysmsg, task=task,
+                                              max_tokens=3000,
+                                              model_group=str(getattr(config, "LONG_MEM_MODEL_GROUP", "") or "沉淀")),
                         )
                         if made:
                             plugin.logger.info(f"[persona] 长期记忆已生成: {made} chat={_ctx.chat_key}")
@@ -5412,6 +5417,7 @@ async def anchor_memory(
         "用户提到「上次/那天/我说过/你当时怎么说的」这类需要精确引用时调用。"
         "query 传 2~6 字关键词（人名、地名、事件词），多个词用逗号分隔。"
         "返回每条带时间与发言人，可以直接引用，但不要整段念成档案。"
+        "context 参数控制每个命中前后的上下文条数（5~10 适合还原当时完整对话）。"
     ),
 )
 async def recall_messages(
@@ -5419,16 +5425,18 @@ async def recall_messages(
     query: str,
     days: int = 30,
     limit: int = 6,
+    context: int = 3,
 ) -> str:
-    """按关键词检索原始发言（未改写）。
+    """按关键词检索原始发言（未改写），并带回命中处前后的上下文。
 
     Args:
         query (str): 关键词，2~6 字，多个用逗号分隔。
         days (int): 回溯天数，默认 30，最大 90。
-        limit (int): 返回条数，默认 6，最大 8。
+        limit (int): 最多返回几个命中，默认 6，最大 8。
+        context (int): 每个命中前后带几条上下文（5~10 常用），默认 3，最大 10；0 表示只给命中原文。
 
     Returns:
-        str: 原话列表（含时间与发言人）。
+        str: 原话列表（含时间与发言人，▶ 标出命中的那条）。
     """
     from nekro_agent.models.db_chat_message import DBChatMessage
 
@@ -5438,7 +5446,7 @@ async def recall_messages(
     data_dir = plugin.get_plugin_data_dir()
     try:
         items = await persona_longmem.search_messages(
-            DBChatMessage, _ctx.chat_key, kws, days=days, limit=limit)
+            DBChatMessage, _ctx.chat_key, kws, days=days, limit=limit, context=context)
     except Exception as exc:  # noqa: BLE001
         plugin.logger.warning(f"[persona] 回忆原话失败: {exc}")
         return "检索失败，暂时查不到原话。"
