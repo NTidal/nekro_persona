@@ -246,3 +246,138 @@ def build_fetcher(DBChatMessage, max_rows: int = MAX_MESSAGES):
             send_timestamp__lt=end_ts,
         ).order_by("id").limit(max_rows).all())
     return _fetch
+
+
+# ────────────────────────── 会话级：已答清单 / 原话检索 ──────────────────────────
+
+SESSION_MAX_TOPICS = 6
+SESSION_TOPIC_TTL = 3600          # 1 小时内有效
+RAW_LIMIT_DEFAULT = 6
+RAW_DAYS_DEFAULT = 30
+RAW_DAYS_MAX = 90
+RAW_TEXT_MAX = 200
+
+_QUESTION_HINTS = ("什么", "为什么", "怎么", "哪", "吗", "?", "？", "是不是", "能不能", "多少", "谁")
+
+
+def _session_file(data_dir: Path, chat_key: str) -> Path:
+    import hashlib
+
+    h = hashlib.sha1(chat_key.encode("utf-8")).hexdigest()[:16]
+    return Path(data_dir) / "backgrounds" / "longmem" / "session" / f"{h}.json"
+
+
+def _load_session(data_dir: Path, chat_key: str) -> Dict[str, Any]:
+    p = _session_file(data_dir, chat_key)
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_session(data_dir: Path, chat_key: str, data: Dict[str, Any]) -> None:
+    try:
+        p = _session_file(data_dir, chat_key)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(p)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_SKIP_PREFIX = ("[Image", "[image", "[图片", "[表情", "[语音", "[文件", "/var/lib/docker")
+
+
+def extract_topic(text: str) -> str:
+    """只把**提问**抽成话题；陈述、附和、图片占位符一律忽略。
+
+    判据：句子里必须出现问号或疑问词，且长度 >= 4、不含媒体占位符。
+    """
+    t = " ".join(str(text or "").split())
+    if not t or len(t) < 4:
+        return ""
+    if any(t.startswith(p) for p in _SKIP_PREFIX):
+        return ""
+    if not any(k in t for k in _QUESTION_HINTS):
+        return ""
+    for sep in ("。", "！", "？", "!", "?", "\n"):
+        if sep in t:
+            t = t.split(sep)[0]
+            break
+    t = t.strip().strip("，,、 ")
+    if len(t) < 4:
+        return ""
+    return t[:24]
+
+
+def remember_topic(data_dir: Path, chat_key: str, text: str, now: Optional[float] = None) -> None:
+    """把本轮用户提过的话题记下来（下一轮起视为“已回应过”）。"""
+    topic = extract_topic(text)
+    if len(topic) < 2:
+        return
+    now = now or time.time()
+    d = _load_session(data_dir, chat_key)
+    topics = [x for x in (d.get("topics") or []) if isinstance(x, dict)]
+    topics = [x for x in topics if now - float(x.get("ts") or 0) < SESSION_TOPIC_TTL]
+    if not any(x.get("t") == topic for x in topics):
+        topics.append({"t": topic, "ts": now})
+    d["topics"] = topics[-SESSION_MAX_TOPICS:]
+    _save_session(data_dir, chat_key, d)
+
+
+def render_answered(data_dir: Path, chat_key: str, exclude: str = "",
+                    now: Optional[float] = None) -> str:
+    """已答话题清单：告诉模型别再重复回答。"""
+    now = now or time.time()
+    d = _load_session(data_dir, chat_key)
+    cur = extract_topic(exclude)
+    items = [x.get("t") for x in (d.get("topics") or [])
+             if isinstance(x, dict) and now - float(x.get("ts") or 0) < SESSION_TOPIC_TTL]
+    items = [t for t in items if t and t != cur]
+    if not items:
+        return ""
+    return ("## 已回应过的话题\n以下话题你已经回应过了，用户再发新内容时**不要重复回答**，"
+            "只回应新内容：\n" + "；".join(items[-SESSION_MAX_TOPICS:]))
+
+
+async def search_messages(DBChatMessage, chat_key: str, keywords: List[str],
+                          days: int = RAW_DAYS_DEFAULT, limit: int = RAW_LIMIT_DEFAULT):
+    """在原始消息里按关键词检索，返回未改写的原文。"""
+    days = max(1, min(int(days or RAW_DAYS_DEFAULT), RAW_DAYS_MAX))
+    limit = max(1, min(int(limit or RAW_LIMIT_DEFAULT), 8))
+    lo = int(time.time()) - days * 86400
+    seen = {}
+    for kw in [str(k).strip() for k in (keywords or []) if str(k).strip()][:4]:
+        try:
+            rows = await DBChatMessage.filter(
+                chat_key=chat_key, send_timestamp__gte=lo,
+                content_text__icontains=kw,
+            ).order_by("-send_timestamp").limit(limit).all()
+        except Exception:  # noqa: BLE001
+            continue
+        for r in rows:
+            mid = getattr(r, "id", None) or id(r)
+            if mid in seen:
+                continue
+            ts = int(getattr(r, "send_timestamp", 0) or 0)
+            seen[mid] = {
+                "time": datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "--",
+                "who": str(getattr(r, "sender_nickname", "") or getattr(r, "sender_name", "") or "?")[:12],
+                "text": " ".join(str(getattr(r, "content_text", "") or "").split())[:RAW_TEXT_MAX],
+                "_ts": ts,
+            }
+    out = sorted(seen.values(), key=lambda x: -x["_ts"])[:limit]
+    for x in out:
+        x.pop("_ts", None)
+    return out
+
+
+def render_raw(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return "没找到相关原话。"
+    lines = ["【以下为未经改写的原始发言，可直接引用；不要整段念成档案】"]
+    for it in items:
+        lines.append(f"[{it.get('time')}] {it.get('who')}: {it.get('text')}")
+    return "\n".join(lines)

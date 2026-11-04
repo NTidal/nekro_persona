@@ -4434,6 +4434,27 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
             _lm_dir = plugin.get_plugin_data_dir()
             _lm_days = int(getattr(config, "LONG_MEM_INJECT_DAYS", 3) or 3)
             _lm_block = persona_longmem.render_block(_lm_dir, days=_lm_days)
+            _lm_ans = persona_longmem.render_answered(_lm_dir, _ctx.chat_key)
+            if _lm_ans:
+                parts.append(_lm_ans)
+                plugin.logger.debug(
+                    f"[persona] 已答清单注入: {_lm_ans.count('；') + 1} 条 chat={_ctx.chat_key}")
+            try:
+                from nekro_agent.models.db_chat_message import DBChatMessage as _DBM
+
+                _bot_id = str(getattr(_ctx, "bot_id", "") or "")
+                _rows = await _DBM.filter(chat_key=_ctx.chat_key).order_by("-id").limit(8).all()
+                for _r in _rows:
+                    if bool(getattr(_r, "is_bot", False)):
+                        continue
+                    if _bot_id and str(getattr(_r, "sender_id", "")) == _bot_id:
+                        continue
+                    _txt = str(getattr(_r, "content_text", "") or "").strip()
+                    if _txt:
+                        persona_longmem.remember_topic(_lm_dir, _ctx.chat_key, _txt)
+                    break
+            except Exception as _lm_e:  # noqa: BLE001
+                plugin.logger.debug(f"[persona] 话题记录跳过: {_lm_e}")
             if _lm_block:
                 parts.append(_lm_block)
             _lm_task = getattr(plugin, "_longmem_task", None)
@@ -5382,6 +5403,46 @@ async def anchor_memory(
         f"今日 {res.get('day_count')} 条）。{_tail}"
     )
 
+
+@plugin.mount_sandbox_method(
+    SandboxMethodType.TOOL,
+    name="回忆原话",
+    description=(
+        "在最近 30 天（可指定）的**原始消息**里按关键词找回未被改写的原话。"
+        "用户提到「上次/那天/我说过/你当时怎么说的」这类需要精确引用时调用。"
+        "query 传 2~6 字关键词（人名、地名、事件词），多个词用逗号分隔。"
+        "返回每条带时间与发言人，可以直接引用，但不要整段念成档案。"
+    ),
+)
+async def recall_messages(
+    _ctx: schemas.AgentCtx,
+    query: str,
+    days: int = 30,
+    limit: int = 6,
+) -> str:
+    """按关键词检索原始发言（未改写）。
+
+    Args:
+        query (str): 关键词，2~6 字，多个用逗号分隔。
+        days (int): 回溯天数，默认 30，最大 90。
+        limit (int): 返回条数，默认 6，最大 8。
+
+    Returns:
+        str: 原话列表（含时间与发言人）。
+    """
+    from nekro_agent.models.db_chat_message import DBChatMessage
+
+    kws = [x.strip() for x in str(query or "").replace("，", ",").split(",") if x.strip()]
+    if not kws:
+        return "请给出关键词（2~6 字）。"
+    data_dir = plugin.get_plugin_data_dir()
+    try:
+        items = await persona_longmem.search_messages(
+            DBChatMessage, _ctx.chat_key, kws, days=days, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        plugin.logger.warning(f"[persona] 回忆原话失败: {exc}")
+        return "检索失败，暂时查不到原话。"
+    return persona_longmem.render_raw(items)
 
 @plugin.mount_sandbox_method(
     SandboxMethodType.TOOL,
