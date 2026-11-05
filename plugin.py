@@ -1405,6 +1405,7 @@ from . import tier4  # noqa: E402  # tier4 生长层（身份锚点，阶段 A�
 from . import consolidator as persona_consolidator  # noqa: E402  # 关系记忆归纳
 from . import memory_log as persona_memlog  # noqa: E402  # 关系记忆存储
 from . import life as persona_life
+from . import commitments as persona_commitments
 from . import longmem as persona_longmem  # noqa: E402  # 生活时间轴（日程/手感/梦）
 
 # 背景记忆数据目录：**按访问解析**（多账号隔离）。
@@ -4437,6 +4438,24 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
             _lm_dir = plugin.get_plugin_data_dir()
             _lm_days = int(getattr(config, "LONG_MEM_INJECT_DAYS", 3) or 3)
             _lm_block = persona_longmem.render_block(_lm_dir, days=_lm_days)
+            if bool(getattr(config, "COMMIT_ENABLED", True)):
+                try:
+                    _cm_dir = _lm_dir
+                    persona_commitments.harvest_from_memory_log(
+                        _cm_dir, _cm_dir / "backgrounds" / "memory_log.json", _ctx.chat_key)
+                    _cm_data = persona_commitments.load(_cm_dir)
+                    if persona_commitments.expire_scan(_cm_data):
+                        persona_commitments.save(_cm_dir, _cm_data)
+                    _cm_block = persona_commitments.render_pending(_cm_data, _ctx.chat_key)
+                    if _cm_block:
+                        parts.append(_cm_block)
+                    _cm_hint = persona_commitments.render_expired_hint(_cm_data, _ctx.chat_key)
+                    if _cm_hint:
+                        parts.append(_cm_hint)
+                    plugin._commit_cache = _cm_data
+                except Exception as _cm_exc:  # noqa: BLE001
+                    plugin.logger.warning(f"[persona] 约定注入失败（忽略）: {_cm_exc}")
+
             _lm_ans = persona_longmem.render_answered(_lm_dir, _ctx.chat_key)
             if _lm_ans:
                 parts.append(_lm_ans)
@@ -5408,6 +5427,77 @@ async def anchor_memory(
         f"今日 {res.get('day_count')} 条）。{_tail}"
     )
 
+
+@plugin.mount_sandbox_method(
+    SandboxMethodType.TOOL,
+    name="约定管理",
+    description=(
+        "管理与用户的**约定**（答应过的事、约好的时间地点）。"
+        "约定有状态：pending(待了结) / done(已完成) / cancelled(已取消) / expired(已过期) / superseded(已改约)。"
+        "每轮开头会提醒你没了结的约定——**那些是待办，不是已经发生的事**。"
+        "当约定已经做了、要取消、或要改期时，必须调用本工具更新状态，否则它会一直被当成待约重复提起。\n"
+        "action 取值：\n"
+        "- done：了结（需要 id + note 写结果，如「周四真一起去吃了」）\n"
+        "- cancel：取消（id + note 原因）\n"
+        "- reschedule：改约（id + text 新说法 + due 新日期 YYYY-MM-DD）\n"
+        "- revive：过期后再提起，重新变成待了结（id）\n"
+        "- list：查看本会话全部约定（含已过期/已完成）"
+    ),
+)
+async def manage_commitments(
+    _ctx: schemas.AgentCtx,
+    action: str,
+    id: str = "",
+    text: str = "",
+    due: str = "",
+    note: str = "",
+) -> str:
+    """管理约定状态（待了结 / 已完成 / 已取消 / 已过期 / 已改约）。
+
+    Args:
+        action (str): done / cancel / reschedule / revive / list
+        id (str): 约定 id（list 可空）
+        text (str): 改约时的新说法
+        due (str): 改约时的新日期，YYYY-MM-DD
+        note (str): 结果或原因
+
+    Returns:
+        str: 操作结果说明。
+    """
+    data_dir = plugin.get_plugin_data_dir()
+    d = persona_commitments.load(data_dir)
+    act = str(action or "").strip().lower()
+    if act == "list":
+        rows = [x for x in d["items"] if x.get("scope") == _ctx.chat_key]
+        if not rows:
+            return "本会话还没有记录任何约定。"
+        out = []
+        for x in rows[-12:]:
+            tail = f"，约在 {x['due']}" if x.get("due") else ""
+            extra = f"（{x.get('result') or x.get('reason')}）" if (x.get("result") or x.get("reason")) else ""
+            out.append(f"- [{x.get('status')}] {x.get('id')} · {x.get('text')}{tail}{extra}")
+        return "本会话的约定：\n" + "\n".join(out)
+    if not id:
+        return "请提供约定 id（可先 action=list 查看）。"
+    if act == "done":
+        item = persona_commitments.set_status(d, id, "done", note)
+        persona_commitments.save(data_dir, d)
+        return f"已了结：{item['text']}" if item else "没找到这条约定。"
+    if act == "cancel":
+        item = persona_commitments.set_status(d, id, "cancelled", note)
+        persona_commitments.save(data_dir, d)
+        return f"已取消：{item['text']}" if item else "没找到这条约定。"
+    if act == "revive":
+        item = persona_commitments.set_status(d, id, "pending", "复活：" + (note or ""))
+        if item:
+            item["revive_count"] = int(item.get("revive_count") or 0) + 1
+        persona_commitments.save(data_dir, d)
+        return f"已复活为待了结：{item['text']}" if item else "没找到这条约定。"
+    if act == "reschedule":
+        item = persona_commitments.reschedule(d, id, new_text=text, new_due=due or None)
+        persona_commitments.save(data_dir, d)
+        return f"已改约：{item['text']}（约在 {item.get('due') or '未定'}）" if item else "没找到这条约定。"
+    return "未知 action，请用 done / cancel / reschedule / revive / list。"
 
 @plugin.mount_sandbox_method(
     SandboxMethodType.TOOL,
