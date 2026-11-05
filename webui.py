@@ -1309,6 +1309,8 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     "simulated": bool(d.get("simulated")),
                     "chat_key": d.get("chat_key") or "",
                     "head": (d.get("summary") or "")[:80],
+                    "summary": d.get("summary") or "",
+                    "entities": d.get("entities") or [],
                 })
         items.reverse()
 

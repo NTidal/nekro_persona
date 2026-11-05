@@ -7590,14 +7590,15 @@ goto('overview');
       }
       const block = $('#lmBlock');
       if (block) block.textContent = data.block || '（还没有可注入的摘要）';
+      LM.items = data.items || [];
       const list = $('#lmList');
       if (list) {
-        const items = data.items || [];
+        const items = LM.items;
         if (!items.length) {
           list.innerHTML = '<div class="empty-inline">还没有日摘要，填会话键后点「补齐」</div>';
         } else {
           list.innerHTML = items.map((it) => `
-            <div class="list-item">
+            <div class="list-item" data-lm-view="${it.date}" style="cursor:pointer" title="点击查看完整摘要">
               <div class="list-copy">
                 <strong>${it.date} <span class="badge">${it.chars} 字</span>
                   ${it.simulated ? '<span class="badge">模拟</span>' : ''}
@@ -7655,9 +7656,32 @@ goto('overview');
     }
   }
 
+  function lmView(date) {
+    const it = (LM.items || []).find((x) => x.date === date);
+    if (!it) return;
+    const ents = (it.entities || []).length
+      ? `<div class="list-meta"><span class="muted" style="font-size:10px">实体：${esc((it.entities || []).join('、'))}</span></div>`
+      : '';
+    openDialog({
+      title: it.date + ' 的日摘要',
+      subtitle: `消息 ${it.msg_count} 条 · ${it.chars} 字 · 来源 ${it.chat_key || '未知'}`,
+      body: `<div class="list-item" style="display:block">
+               <div class="list-copy">
+                 <p style="white-space:pre-wrap;line-height:1.75">${esc(it.summary || it.head || '')}</p>
+                 ${ents}
+               </div>
+             </div>`,
+      foot: '<div class="dialog-foot-right"><button class="btn" type="button" id="lmViewClose">关闭</button></div>',
+    });
+    const btn = document.getElementById('lmViewClose');
+    if (btn) btn.addEventListener('click', () => closeDialog());
+  }
+
   document.addEventListener('click', (ev) => {
     const del = ev.target.closest('[data-lm-del]');
     if (del) { lmDelete(del.dataset.lmDel); return; }
+    const view = ev.target.closest('[data-lm-view]');
+    if (view) { lmView(view.dataset.lmView); return; }
     if (ev.target.closest('#lmRefresh')) { lmMsg(''); loadLongmem(); return; }
     if (ev.target.closest('#lmBuild')) { lmBuild(); }
   });
