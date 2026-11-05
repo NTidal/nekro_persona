@@ -134,7 +134,7 @@ def _keywords(text: str) -> set:
         chunk = chunk.strip()
         if len(chunk) < 2:
             continue
-        for i in range(0, max(1, len(chunk) - 1), 2):
+        for i in range(0, max(1, len(chunk) - 1)):
             out.add(chunk[i:i + 2])
     return out
 
@@ -351,3 +351,109 @@ def harvest_from_memory_log(data_dir: Path, log_path: Path, scope: str,
     if touched:
         save(data_dir, d)
     return touched
+
+
+def match_pending(d: Dict[str, Any], scope: str, text: str,
+                  limit: int = 2, min_overlap: int = 1) -> List[Dict[str, Any]]:
+    """按本轮发言关键词找出相关约定（检索式注入用；比去重宽松，1 个关键词即可）。"""
+    ka = _keywords(text)
+    if not ka:
+        return []
+    scored = []
+    for x in d["items"]:
+        if x.get("scope") != scope or x.get("status") != "pending":
+            continue
+        kb = _keywords(x.get("text") or "")
+        ov = len(ka & kb)
+        if ov >= min_overlap:
+            scored.append((ov, float(x.get("last_mentioned_at") or 0), x))
+    scored.sort(key=lambda t: (-t[0], -t[1]))
+    out = [t[2] for t in scored[:limit]]
+    for x in out:
+        x["last_mentioned_at"] = int(time.time())
+    return out
+
+
+def render_matched(items: List[Dict[str, Any]], now: Optional[float] = None) -> str:
+    """只注入“这轮提到了”的约定，并给出更新建议。"""
+    if not items:
+        return ""
+    now_ts = now or time.time()
+    lines = []
+    for it in items:
+        age = _age_days(it, now_ts)
+        due = f"，约在 {it['due']}" if it.get("due") else ""
+        lines.append(f"- [{age} 天前] {it.get('text')}{due}")
+    return ("## 相关的未了结约定\n"
+            "下面这条和你刚才提到的事有关，它**还没了结**：\n" + "\n".join(lines) +
+            "\n（如果已经发生、取消或改期，调用「约定管理」更新状态，别当成还没做）")
+
+
+RECONCILE_PROMPT = (
+    "下面是一天的聊天记录，以及当前还没了结的约定列表。请判断：这些约定里，"
+    "哪些在今天已经被履行、被取消、或被改期？只输出 JSON，不要解释：\n"
+    '{"actions":[{"id":"cmt_xxx","action":"done|cancel|reschedule","due":"YYYY-MM-DD",'
+    '"evidence":"记录里的原句片段"}]}\n'
+    "要求：\n"
+    "1. 没有证据就不要输出该条；evidence 必须是从下面记录里**逐字复制**的片段；\n"
+    "2. 只有明确发生（做了/说取消/说改期）才输出，不确定就不输出；\n"
+    "3. 最多 5 条；reschedule 必须给新 due；done/cancel 不用给 due。"
+)
+
+
+def _norm(t: str) -> str:
+    import re
+
+    return re.sub(r"[\s，。！？、；：「」“”()（）,.!?;:\"'`]", "", str(t or ""))
+
+
+def reconcile(d: Dict[str, Any], scope: str, day_text: str, ask,
+              max_actions: int = 5, now: Optional[float] = None) -> List[str]:
+    """日对账：根据当天原文更新约定状态。ask(prompt, system, task) -> str。"""
+    pend = pending_items(d, scope)
+    if not pend or not day_text:
+        return []
+    listing = "\n".join(
+        f"- id={x['id']} | {x.get('text')}" + (f" | 约在 {x['due']}" if x.get("due") else "")
+        for x in pend[:20])
+    try:
+        raw = ask(RECONCILE_PROMPT,
+                  f"【当前未了结约定】\n{listing}\n\n【当天记录】\n{day_text[:20000]}",
+                  "commitment_reconcile")
+    except Exception:  # noqa: BLE001
+        return []
+    if not raw:
+        return []
+    body = str(raw)
+    import json as _json
+
+    try:
+        data = _json.loads(body[body.find("{"): body.rfind("}") + 1])
+    except Exception:  # noqa: BLE001
+        return []
+    flat_day = _norm(day_text)
+    applied: List[str] = []
+    for act in (data.get("actions") or [])[:max_actions]:
+        if not isinstance(act, dict):
+            continue
+        item_id = str(act.get("id") or "").strip()
+        action = str(act.get("action") or "").strip().lower()
+        evidence = _norm(act.get("evidence") or "")
+        if not item_id or action not in ("done", "cancel", "reschedule"):
+            continue
+        if not evidence or evidence not in flat_day:
+            continue                     # 护栏：证据必须能在原文里找到
+        target = next((x for x in d["items"] if x.get("id") == item_id), None)
+        if target is None or target.get("status") not in ("pending", "expired"):
+            continue
+        if action == "reschedule":
+            new_due = str(act.get("due") or "").strip() or None
+            item = reschedule(d, item_id, new_due=new_due, now=now)
+            if item:
+                applied.append(f"reschedule:{item_id}->{new_due}")
+        else:
+            st = "done" if action == "done" else "cancelled"
+            item = set_status(d, item_id, st, f"日对账：{act.get('evidence') or ''}"[:100], now)
+            if item:
+                applied.append(f"{st}:{item_id}")
+    return applied

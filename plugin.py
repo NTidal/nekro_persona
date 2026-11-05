@@ -4446,7 +4446,10 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
                     _cm_data = persona_commitments.load(_cm_dir)
                     if persona_commitments.expire_scan(_cm_data):
                         persona_commitments.save(_cm_dir, _cm_data)
-                    _cm_block = persona_commitments.render_pending(_cm_data, _ctx.chat_key)
+                    _cm_hit = persona_commitments.match_pending(
+                        _cm_data, _ctx.chat_key,
+                        str(getattr(plugin, "_commit_last_user", "") or ""))
+                    _cm_block = persona_commitments.render_matched(_cm_hit)
                     if _cm_block:
                         parts.append(_cm_block)
                     _cm_hint = persona_commitments.render_expired_hint(_cm_data, _ctx.chat_key)
@@ -4466,6 +4469,7 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
 
                 _bot_id = str(getattr(_ctx, "bot_id", "") or "")
                 _rows = await _DBM.filter(chat_key=_ctx.chat_key).order_by("-id").limit(8).all()
+                _last_user_txt = ""
                 for _r in _rows:
                     if bool(getattr(_r, "is_bot", False)):
                         continue
@@ -4473,8 +4477,10 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
                         continue
                     _txt = str(getattr(_r, "content_text", "") or "").strip()
                     if _txt:
+                        _last_user_txt = _txt
                         persona_longmem.remember_topic(_lm_dir, _ctx.chat_key, _txt)
                     break
+                plugin._commit_last_user = _last_user_txt
             except Exception as _lm_e:  # noqa: BLE001
                 plugin.logger.debug(f"[persona] 话题记录跳过: {_lm_e}")
             if _lm_block:

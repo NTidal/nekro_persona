@@ -238,6 +238,16 @@ async def ensure_days(data_dir: Path, chat_key: str, fetch_rows, ask,
         })
         if ok:
             made.append(day)
+            # 日对账：用当天原文更新已有约定（失败只记日志，不影响摘要）
+            try:
+                from . import commitments as _cm
+
+                _cd = _cm.load(data_dir)
+                _acts = _cm.reconcile(_cd, chat_key, text, ask)
+                if _acts:
+                    _cm.save(data_dir, _cd)
+            except Exception:  # noqa: BLE001
+                pass
     return made
 
 
