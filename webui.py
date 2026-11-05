@@ -2665,6 +2665,26 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
                     json.dumps(doc.to_raw(), ensure_ascii=False, indent=1),
                 )
                 counts["tier4_entries"] = len(doc.entries)
+            # ── 新增：长期记忆、已答话题、约定、世界抽词包（2.7.3 起）──
+            for name, label in (("commitments.json", "commitments"),
+                                ("life.json", "life_pack")):
+                fp2 = t4.bg_dir() / name
+                if fp2.is_file():
+                    zf.writestr(f"backgrounds/{name}", fp2.read_bytes())
+                    try:
+                        obj2 = json.loads(fp2.read_bytes().decode("utf-8"))
+                        counts[label] = len(obj2.get("items") or []) if label == "commitments" else 1
+                    except Exception:  # noqa: BLE001
+                        counts[label] = -1
+            for sub, label in (("daily", "longmem_daily"), ("session", "longmem_session")):
+                d2 = t4.bg_dir() / "longmem" / sub
+                if d2.is_dir():
+                    n = 0
+                    for f2 in sorted(d2.glob("*.json")):
+                        zf.writestr(f"backgrounds/longmem/{sub}/{f2.name}", f2.read_bytes())
+                        n += 1
+                    counts[label] = n
+
             for name in ("_migrations.json", "_channel_index.json"):
                 p = t4.bg_dir() / name
                 if p.is_file():
@@ -2681,7 +2701,7 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             zf.writestr("archives.json", json.dumps(arch_objs, ensure_ascii=False))
             counts["archives"] = len(arch_objs)
             meta = {
-                "bundle_version": 1,
+                "bundle_version": 2,
                 "type": "growth",
                 "plugin": str(plugin.key),
                 "exported_at": _datetime.now().isoformat(timespec="seconds"),
@@ -2732,8 +2752,13 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         names = set(zf.namelist())
         t4 = helpers["tier4"]
 
-        if not any(n.endswith("tier4.json") or n == "archives.json" for n in names):
-            raise HTTPException(status_code=400, detail="包里没有可导入的生长数据（tier4.json / archives.json）")
+        _IMPORTABLE = ("tier4.json", "archives.json", "commitments.json", "life.json")
+        if not any(n.endswith("tier4.json") or n == "archives.json"
+                   or n.endswith("commitments.json") or n.endswith("life.json")
+                   or n.startswith("backgrounds/longmem/") for n in names):
+            raise HTTPException(
+                status_code=400,
+                detail="包里没有可导入的生长数据（tier4 / archives / commitments / life / longmem）")
 
         # 导入前备份当前生长状态到 _growth_import_backups/<stamp>/
         # ⚠️ archives.json 会**整 blob 覆写**各频道关系档案（分数 / 标签 / 稳定印象），
@@ -2744,6 +2769,16 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         bdir.mkdir(parents=True, exist_ok=True)
         if t4.tier4_path().is_file():
             shutil.copy2(t4.tier4_path(), bdir / "tier4.json")
+        for name in ("commitments.json", "life.json"):
+            fp3 = t4.bg_dir() / name
+            if fp3.is_file():
+                shutil.copy2(fp3, bdir / name)
+        for sub in ("daily", "session"):
+            d3 = t4.bg_dir() / "longmem" / sub
+            if d3.is_dir():
+                (bdir / "longmem" / sub).mkdir(parents=True, exist_ok=True)
+                for f3 in d3.glob("*.json"):
+                    shutil.copy2(f3, bdir / "longmem" / sub / f3.name)
         backed_arch = 0
         try:
             _cur_arch = await helpers["enumerate_archives"]()
@@ -2844,6 +2879,44 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
             n_arch += 1
         if arch_items:
             applied.append(f"关系档案（{n_arch} 频道）")
+
+        # 2.5) 新增：约定 / 世界包 / 长期记忆（逐个校验 JSON 后原子写入）
+        def _write_json_member(zip_name: str, dest, validator) -> bool:
+            raw3 = _zip_read(zf, zip_name)
+            try:
+                obj3 = json.loads(raw3.decode("utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(
+                    status_code=400,
+                    detail=_public_detail(f"{zip_name} 不是合法 JSON：{exc}")) from exc
+            bad3 = validator(obj3)
+            if bad3:
+                raise HTTPException(status_code=400, detail=f"{zip_name} 结构不对：{bad3}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp3 = dest.with_suffix(dest.suffix + ".tmp")
+            tmp3.write_bytes(raw3)
+            os.replace(tmp3, dest)
+            return True
+
+        for zip_name, dest, label, validator in (
+            ("backgrounds/commitments.json", t4.bg_dir() / "commitments.json", "约定",
+             lambda o: "" if isinstance(o, dict) and isinstance(o.get("items"), list) else "缺 items 数组"),
+            ("backgrounds/life.json", t4.bg_dir() / "life.json", "世界抽词包",
+             lambda o: "" if isinstance(o, dict) and isinstance(o.get("world"), dict) else "缺 world 对象"),
+        ):
+            if zip_name in names and _write_json_member(zip_name, dest, validator):
+                applied.append(label)
+
+        n_lm = 0
+        for zip_name in sorted(n for n in names if n.startswith("backgrounds/longmem/")):
+            rel = zip_name[len("backgrounds/longmem/"):]
+            if not rel.endswith(".json") or ".." in rel:
+                continue
+            dest3 = t4.bg_dir() / "longmem" / rel
+            if _write_json_member(zip_name, dest3, lambda o: "" if isinstance(o, (dict, list)) else "顶层必须是对象或数组"):
+                n_lm += 1
+        if n_lm:
+            applied.append(f"长期记忆（{n_lm} 份）")
 
         # 3) 热度（.hit_stats.json）**不迁移** —— 见 api_growth_export 的说明。
         #    旧包里若带了这个文件，直接忽略（向后兼容）。
