@@ -2620,6 +2620,36 @@ body.is-scrolling .dialog-foot {
         </div>
         <div class="card">
           <div class="card-head">
+            <div>
+              <h2 class="card-title">固定式日程</h2>
+              <p class="card-sub">人工填入的周期区块。某天只要填了区块，这天就不再自动生成日程；只在区块时间内注入，没填的时段不注入。</p>
+            </div>
+            <div class="head-actions">
+              <button class="btn sm primary" type="button" id="fxAddBtn">新增区块</button>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="list-stack" id="fxList"></div>
+            <div id="fxForm" hidden>
+              <div class="fx-grid">
+                <input class="field" id="fxDoing" placeholder="在做什么（必填，如：上共鸣理论课）">
+                <input class="field" id="fxLabel" placeholder="名称（可空）">
+                <input class="field" id="fxPlace" placeholder="地点（可空）">
+                <input class="field" id="fxStart" placeholder="开始 09:00" style="max-width:130px">
+                <input class="field" id="fxEnd" placeholder="结束 11:30" style="max-width:130px">
+                <input class="field" id="fxMood" type="number" placeholder="心情 -40~40" style="max-width:140px">
+              </div>
+              <div class="fx-week" id="fxWeek"></div>
+              <div class="head-actions" style="margin-top:10px">
+                <button class="btn sm primary" type="button" id="fxSave">保存</button>
+                <button class="btn sm" type="button" id="fxCancel">取消</button>
+                <span class="lm-hint" id="fxMsg"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head">
             <div class="toolbar" style="flex:1">
               <div class="search-wrap">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -4328,7 +4358,8 @@ function renderLife(d) {
 /* ---------------- 导航 ---------------- */
 const PAGES = ['longmem', 'overview', 'life', 'memory', 'favor', 'rules', 'preview', 'cards', 'memo', 'anchor', 'memlog', 'trash', 'transfer', 'settings'];
 const LOADERS = {
-  overview: loadOverview, life: loadLife, memory: loadMemory, longmem: loadLongmem,
+  overview: loadOverview, life: () => { loadLife(); fxLoad(); },
+  memory: loadMemory, longmem: loadLongmem,
   favor: loadFavor, rules: loadRules,
   preview: loadPreview, cards: loadCards, memo: loadMemo, anchor: loadAnchor, memlog: loadMemlog,
   trash: loadTrash, transfer: loadTransfer, settings: loadSettings,
@@ -7699,6 +7730,132 @@ goto('overview');
     }
   });
 
+
+
+  /* ---------------- 固定式日程 ---------------- */
+  const FXS = { items: [], editing: null, week: new Set() };
+  const FX_WEEK = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+
+  function fxMsg(t, err) {
+    const el = $('#fxMsg');
+    if (!el) return;
+    el.textContent = t || '';
+    el.classList.toggle('err', !!err);
+  }
+
+  function fxRenderWeek() {
+    const box = $('#fxWeek');
+    if (!box) return;
+    box.innerHTML = FX_WEEK.map((w, i) =>
+      `<button type="button" data-fx-wd="${i}" class="${FXS.week.has(i) ? 'on' : ''}">${w}</button>`).join('');
+  }
+
+  function fxOpenForm(item) {
+    FXS.editing = item || null;
+    FXS.week = new Set(item ? (item.weekdays || []) : []);
+    $('#fxDoing').value = item ? (item.doing || '') : '';
+    $('#fxLabel').value = item ? (item.label || '') : '';
+    $('#fxPlace').value = item ? (item.place || '') : '';
+    $('#fxStart').value = item ? (item.start || '') : '09:00';
+    $('#fxEnd').value = item ? (item.end || '') : '11:30';
+    $('#fxMood').value = item && item.mood !== null && item.mood !== undefined ? item.mood : '';
+    fxRenderWeek();
+    $('#fxForm').hidden = false;
+    fxMsg('');
+  }
+
+  function fxCloseForm() {
+    $('#fxForm').hidden = true;
+    FXS.editing = null;
+  }
+
+  async function fxLoad() {
+    try {
+      const d = await api('life_fixed');
+      FXS.items = d.items || [];
+      const list = $('#fxList');
+      if (!list) return;
+      if (!FXS.items.length) {
+        list.innerHTML = '<div class="empty-inline">还没有固定区块。填了区块的日期不再自动生成日程。</div>';
+        return;
+      }
+      list.innerHTML = FXS.items.map((it) => {
+        const wd = (it.weekdays || []).map((i) => FX_WEEK[i]).join('、');
+        return `<div class="list-item" data-fx-id="${it.id}">
+          <div class="list-copy">
+            <strong>${esc(it.doing)}
+              <span class="badge">${it.start}-${it.end}</span>
+              <span class="badge">${wd}</span>
+              ${it.enabled === false ? '<span class="badge warn">已停用</span>' : ''}</strong>
+            <p>${esc(it.label || '')}${it.place ? ' · ' + esc(it.place) : ''}${it.mood !== null && it.mood !== undefined ? ' · 心情 ' + it.mood : ''}</p>
+          </div>
+          <div class="list-actions">
+            <button class="mini-btn" type="button" data-fx-act="edit" data-id="${it.id}">编辑</button>
+            <button class="mini-btn" type="button" data-fx-act="toggle" data-id="${it.id}">${it.enabled === false ? '启用' : '停用'}</button>
+            <button class="mini-btn danger" type="button" data-fx-act="del" data-id="${it.id}">删除</button>
+          </div>
+        </div>`;
+      }).join('');
+    } catch (e) {
+      fxMsg('读取失败：' + (e.message || e), true);
+    }
+  }
+
+  async function fxSave() {
+    const doing = ($('#fxDoing').value || '').trim();
+    if (!doing) { fxMsg('「在做什么」不能为空', true); return; }
+    if (!FXS.week.size) { fxMsg('至少选一个星期几', true); return; }
+    const item = {
+      id: FXS.editing ? FXS.editing.id : '',
+      doing,
+      label: ($('#fxLabel').value || '').trim(),
+      place: ($('#fxPlace').value || '').trim(),
+      start: ($('#fxStart').value || '').trim(),
+      end: ($('#fxEnd').value || '').trim(),
+      weekdays: [...FXS.week],
+      mood: ($('#fxMood').value || '').trim() === '' ? null : Number($('#fxMood').value),
+    };
+    try {
+      const r = await api('life_fixed', { method: 'POST', body: { item } });
+      if (r && r.ok) { fxMsg('已保存'); fxCloseForm(); fxLoad(); }
+      else fxMsg('保存失败：' + ((r && r.error) || '未知错误'), true);
+    } catch (e) {
+      fxMsg('保存失败：' + (e.message || e), true);
+    }
+  }
+
+  document.addEventListener('click', async (ev) => {
+    if (ev.target.closest('#fxAddBtn')) { fxOpenForm(null); return; }
+    if (ev.target.closest('#fxCancel')) { fxCloseForm(); return; }
+    if (ev.target.closest('#fxSave')) { fxSave(); return; }
+    const wdBt = ev.target.closest('[data-fx-wd]');
+    if (wdBt) {
+      const i = Number(wdBt.dataset.fxWd);
+      if (FXS.week.has(i)) FXS.week.delete(i); else FXS.week.add(i);
+      fxRenderWeek();
+      return;
+    }
+    const act = ev.target.closest('[data-fx-act]');
+    if (!act) return;
+    const id = act.dataset.id;
+    const kind = act.dataset.fxAct;
+    if (kind === 'edit') {
+      const item = FXS.items.find((x) => x.id === id);
+      if (item) fxOpenForm(item);
+      return;
+    }
+    try {
+      if (kind === 'del') {
+        if (!confirm('删除这个固定区块？')) return;
+        await api('life_fixed', { method: 'POST', body: { op: 'delete', id } });
+      } else if (kind === 'toggle') {
+        await api('life_fixed', { method: 'POST', body: { op: 'toggle', id } });
+      }
+      fxLoad();
+    } catch (e) {
+      fxMsg('操作失败：' + (e.message || e), true);
+    }
+  });
 
 </script>
 </body>
