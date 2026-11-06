@@ -1405,6 +1405,7 @@ from . import tier4  # noqa: E402  # tier4 生长层（身份锚点，阶段 A�
 from . import consolidator as persona_consolidator  # noqa: E402  # 关系记忆归纳
 from . import memory_log as persona_memlog  # noqa: E402  # 关系记忆存储
 from . import life as persona_life
+from . import life_fixed as persona_life_fixed
 from . import commitments as persona_commitments
 from . import longmem as persona_longmem  # noqa: E402  # 生活时间轴（日程/手感/梦）
 
@@ -4289,9 +4290,17 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
                     _score_hint, _mood_hint = int(_p.score), int(_p.mood)
             except Exception:  # noqa: BLE001
                 pass
-            life_block = await _life_engine.block_for(
-                _ctx.chat_key, score=_score_hint, mood=_mood_hint,
-            )
+            # 固定式：当天若有手工填入的周期区块，**不再使用生成日程**，
+            # 只在"此刻落在某个区块内"时注入；没落在任何区块 → 不注入。
+            _fx = persona_life_fixed.load(plugin.get_plugin_data_dir())
+            _fx_today = persona_life_fixed.blocks_for(_fx)
+            if _fx_today:
+                life_block = persona_life_fixed.render_block(
+                    persona_life_fixed.current_blocks(_fx_today))
+            else:
+                life_block = await _life_engine.block_for(
+                    _ctx.chat_key, score=_score_hint, mood=_mood_hint,
+                )
     except Exception as e:  # noqa: BLE001
         plugin.logger.warning(f"[persona] 生活状态预取失败，本轮跳过: {e}")
 

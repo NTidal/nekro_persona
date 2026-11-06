@@ -3657,6 +3657,62 @@ def build_router(plugin: Any, config: Any, memory: Any, helpers: Dict[str, Any])
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=f"统计失败: {exc}") from exc
 
+    @router.get("/api/life_fixed", summary="固定式日程：读取周期区块")
+    async def api_life_fixed_get(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        from . import life_fixed as _fx
+
+        d = _fx.load(plugin.get_plugin_data_dir())
+        today = _fx.blocks_for(d)
+        return {
+            "items": d.get("items") or [],
+            "today": today,
+            "now": _fx.current_blocks(today),
+            "block": _fx.render_block(_fx.current_blocks(today)),
+        }
+
+    @router.post("/api/life_fixed", summary="固定式日程：新增/修改/删除周期区块")
+    async def api_life_fixed_post(request: Request) -> Dict[str, Any]:
+        _check_key(request)
+        from . import life_fixed as _fx
+
+        body = await _json_body(request)
+        d = _fx.load(plugin.get_plugin_data_dir())
+        items = d.get("items") or []
+        op = str(body.get("op") or "save").strip().lower()
+
+        if op == "delete":
+            fid = str(body.get("id") or "").strip()
+            if not fid:
+                return {"ok": False, "error": "缺少 id"}
+            d["items"] = [x for x in items if x.get("id") != fid]
+            _fx.save(plugin.get_plugin_data_dir(), d)
+            return {"ok": True, "deleted": fid}
+
+        if op == "toggle":
+            fid = str(body.get("id") or "").strip()
+            for x in items:
+                if x.get("id") == fid:
+                    x["enabled"] = not bool(x.get("enabled", True))
+                    _fx.save(plugin.get_plugin_data_dir(), d)
+                    return {"ok": True, "enabled": x["enabled"]}
+            return {"ok": False, "error": "没找到该条目"}
+
+        item, err = _fx.validate_item(body.get("item") or {})
+        if err:
+            return {"ok": False, "error": err}
+        replaced = False
+        for i, x in enumerate(items):
+            if x.get("id") == item["id"]:
+                items[i] = item
+                replaced = True
+                break
+        if not replaced:
+            items.append(item)
+        d["items"] = items
+        ok = _fx.save(plugin.get_plugin_data_dir(), d)
+        return {"ok": ok, "item": item, "replaced": replaced}
+
     @router.get("/api/life_state", summary="生活时间轴：今天的日程 / 当前时段 / 手感（只读）")
     async def api_life_state(request: Request) -> Dict[str, Any]:
         """看「她现在在过什么日子」。开关关掉时返回 enabled=false，不生成任何东西。"""
