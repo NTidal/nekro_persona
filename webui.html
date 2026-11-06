@@ -2057,6 +2057,12 @@ input[type="range"] { background-color: color-mix(in srgb, var(--surface-3) 82%,
 .file-row input[type="file"] {
   font-size: 11.5px; color: var(--text-soft); max-width: 200px;
 }
+/* transfer 窄屏：file input 不可压缩（flex:0 0 auto + ~200px 固有宽），
+   420px 下会把 .list-item 撑出 62px；让条目换行、文件行独占整行。 */
+.transfer-zone .list-item { flex-wrap: wrap; }
+.transfer-zone .list-item > .file-row { flex: 0 0 100%; }
+.transfer-zone .file-row input[type="file"] { max-width: 100%; }
+.status-value .mono { overflow-wrap: anywhere; }
 .list-meta .badge.warning { color: var(--gold); border-color: var(--gold-border); background: var(--gold-soft); }
 
 /* ---------- GPU：表格内容里的徽章/标签不做无限动画 ----------
@@ -7771,7 +7777,7 @@ goto('overview');
 
   async function fxLoad() {
     try {
-      const d = await api('life_fixed');
+      const d = await load('life_fixed');
       FXS.items = d.items || [];
       const list = $('#fxList');
       if (!list) return;
@@ -7816,7 +7822,7 @@ goto('overview');
       mood: ($('#fxMood').value || '').trim() === '' ? null : Number($('#fxMood').value),
     };
     try {
-      const r = await api('life_fixed', { method: 'POST', body: { item } });
+      const r = await postAction('life_fixed', { item });
       if (r && r.ok) { fxMsg('已保存'); fxCloseForm(); fxLoad(); }
       else fxMsg('保存失败：' + ((r && r.error) || '未知错误'), true);
     } catch (e) {
@@ -7847,9 +7853,9 @@ goto('overview');
     try {
       if (kind === 'del') {
         if (!confirm('删除这个固定区块？')) return;
-        await api('life_fixed', { method: 'POST', body: { op: 'delete', id } });
+        await postAction('life_fixed', { op: 'delete', id });
       } else if (kind === 'toggle') {
-        await api('life_fixed', { method: 'POST', body: { op: 'toggle', id } });
+        await postAction('life_fixed', { op: 'toggle', id });
       }
       fxLoad();
     } catch (e) {
