@@ -2509,6 +2509,36 @@ body.is-scrolling .dialog-foot {
           <button class="btn sm" type="button" id="lifeRefreshBtn">刷新</button>
         </div>
       </div>
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">固定式日程</h2>
+              <p class="card-sub">人工填入的周期区块。某天只要填了区块，这天就不再自动生成日程；只在区块时间内注入，没填的时段不注入。</p>
+            </div>
+            <div class="head-actions">
+              <button class="btn sm primary" type="button" id="fxAddBtn">新增区块</button>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="list-stack" id="fxList"></div>
+            <div id="fxForm" hidden>
+              <div class="fx-grid">
+                <input class="field" id="fxDoing" placeholder="在做什么（必填，如：上共鸣理论课）">
+                <input class="field" id="fxLabel" placeholder="名称（可空）">
+                <input class="field" id="fxPlace" placeholder="地点（可空）">
+                <input class="field" id="fxStart" placeholder="开始 09:00" style="max-width:130px">
+                <input class="field" id="fxEnd" placeholder="结束 11:30" style="max-width:130px">
+                <input class="field" id="fxMood" type="number" placeholder="心情 -40~40" style="max-width:140px">
+              </div>
+              <div class="fx-week" id="fxWeek"></div>
+              <div class="head-actions" style="margin-top:10px">
+                <button class="btn sm primary" type="button" id="fxSave">保存</button>
+                <button class="btn sm" type="button" id="fxCancel">取消</button>
+                <span class="lm-hint" id="fxMsg"></span>
+              </div>
+            </div>
+          </div>
+        </div>
       <div class="card">
         <div class="card-head">
           <div>
@@ -2616,36 +2646,6 @@ body.is-scrolling .dialog-foot {
               <option value="14">注入最近 14 天</option>
             </select>
             <button class="btn" type="button" id="lmRefresh">刷新</button>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-head">
-            <div>
-              <h2 class="card-title">固定式日程</h2>
-              <p class="card-sub">人工填入的周期区块。某天只要填了区块，这天就不再自动生成日程；只在区块时间内注入，没填的时段不注入。</p>
-            </div>
-            <div class="head-actions">
-              <button class="btn sm primary" type="button" id="fxAddBtn">新增区块</button>
-            </div>
-          </div>
-          <div class="card-body">
-            <div class="list-stack" id="fxList"></div>
-            <div id="fxForm" hidden>
-              <div class="fx-grid">
-                <input class="field" id="fxDoing" placeholder="在做什么（必填，如：上共鸣理论课）">
-                <input class="field" id="fxLabel" placeholder="名称（可空）">
-                <input class="field" id="fxPlace" placeholder="地点（可空）">
-                <input class="field" id="fxStart" placeholder="开始 09:00" style="max-width:130px">
-                <input class="field" id="fxEnd" placeholder="结束 11:30" style="max-width:130px">
-                <input class="field" id="fxMood" type="number" placeholder="心情 -40~40" style="max-width:140px">
-              </div>
-              <div class="fx-week" id="fxWeek"></div>
-              <div class="head-actions" style="margin-top:10px">
-                <button class="btn sm primary" type="button" id="fxSave">保存</button>
-                <button class="btn sm" type="button" id="fxCancel">取消</button>
-                <span class="lm-hint" id="fxMsg"></span>
-              </div>
-            </div>
           </div>
         </div>
         <div class="card">
