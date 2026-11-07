@@ -4471,7 +4471,7 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
             _lm_ans = persona_longmem.render_answered(_lm_dir, _ctx.chat_key)
             if _lm_ans:
                 parts.append(_lm_ans)
-                plugin.logger.debug(
+                plugin.logger.info(
                     f"[persona] 已答清单注入: {_lm_ans.count('；') + 1} 条 chat={_ctx.chat_key}")
             try:
                 from nekro_agent.models.db_chat_message import DBChatMessage as _DBM

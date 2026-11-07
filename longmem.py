@@ -156,7 +156,11 @@ async def summarize_day(ask, chat_key: str, day: str, text: str, msg_count: int)
 
 
 def render_block(data_dir: Path, days: int = 3, budget: int = INJECT_BUDGET) -> str:
-    """最近 N 天的摘要，按时间正序拼接，受字符预算约束。"""
+    """最近 N 天的摘要，**按天均分字符预算**，保证每天都能露头。
+
+    以前是把 budget 顺序消耗：一天 2600 字的摘要会把 1200 预算一次性吃满，
+    后面几天永远进不了注入（实测 NA1 只注入了 1 天）。
+    """
     today = date.today()
     picked: List[Dict[str, Any]] = []
     for i in range(1, max(1, days) + 1):
@@ -166,29 +170,20 @@ def render_block(data_dir: Path, days: int = 3, budget: int = INJECT_BUDGET) -> 
             picked.append(d)
     if not picked:
         return ""
-    picked.reverse()
+    picked.reverse()                                  # 从旧到新
+    per_day = max(120, budget // max(1, len(picked)))  # 每天至少给 120 字
     out: List[str] = []
     used = 0
     for d in picked:
-        line = f"{d.get('date')}：{d.get('summary')}"
-        if used + len(line) > budget:
-            line = line[: max(0, budget - used)] + "…"
+        summ = str(d.get("summary") or "")
+        line = f"{d.get('date')}：{summ}"
+        if len(line) > per_day:
+            line = line[: max(0, per_day - 1)] + "…"
         out.append(line)
         used += len(line)
         if used >= budget:
             break
     return "## 你记得的这几天\n" + "\n".join(out)
-
-
-def _date_span(start: str, end: str):
-    """[start, end] 闭区间 → 日期列表（含首末）。"""
-    d0 = datetime.strptime(start, "%Y-%m-%d").date()
-    d1 = datetime.strptime(end, "%Y-%m-%d").date()
-    out = []
-    while d0 <= d1:
-        out.append(d0.isoformat())
-        d0 += timedelta(days=1)
-    return out
 
 
 async def ensure_days(data_dir: Path, chat_key: str, fetch_rows, ask,
