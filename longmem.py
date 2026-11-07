@@ -159,7 +159,7 @@ def render_block(data_dir: Path, days: int = 3, budget: int = INJECT_BUDGET) -> 
     """最近 N 天的摘要，**按天均分字符预算**，保证每天都能露头。
 
     以前是把 budget 顺序消耗：一天 2600 字的摘要会把 1200 预算一次性吃满，
-    后面几天永远进不了注入（实测 NA1 只注入了 1 天）。
+    后面几天永远进不了注入（线上实测只注入了 1 天）。
     """
     today = date.today()
     picked: List[Dict[str, Any]] = []
