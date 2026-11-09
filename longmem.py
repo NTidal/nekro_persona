@@ -457,7 +457,8 @@ async def search_messages(DBChatMessage, chat_key: str, keywords: List[str],
 def render_raw(items: List[Dict[str, Any]]) -> str:
     if not items:
         return "没找到相关原话。"
-    lines = ["【以下为未经改写的原始发言；▶ 是命中的那条，其余为它前后的上下文。可直接引用，不要整段念成档案】"]
+    lines = ["【检索结果 · 内部参考】下面是未改写的原始发言（▶ 为命中）。"
+             "**不要整段转发给用户**：挑一两句原话、用自己的口吻回应即可。"]
     for it in items:
         mark = "▶ " if it.get("match") else "  "
         lines.append(f"{mark}[{it.get('time')}] {it.get('who')}: {it.get('text')}")
