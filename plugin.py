@@ -4255,6 +4255,74 @@ def _style_note() -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+async def _quote_context_block(_ctx: schemas.AgentCtx, range_n: int = 3,
+                            msg_row=None) -> str:
+    """用户引用回复某条消息时，把它和它前后几条原话取出来做上下文。
+
+    为什么必须做：引用回复的行为里，NA 历史只带 ref_msg_id（元数据），不带被引用内容；
+    模型看不到"自己刚说过什么"，于是回答前言不搭后语。
+    """
+    import json as _json
+
+    from nekro_agent.models.db_chat_message import DBChatMessage
+
+    try:
+        rows = await DBChatMessage.filter(chat_key=_ctx.chat_key).order_by("-id").limit(10).all()
+    except Exception:  # noqa: BLE001
+        return ""
+    mine = str(getattr(_ctx, "bot_id", "") or "")
+    last_in = msg_row
+    for r in ([] if msg_row is not None else rows):
+        if bool(getattr(r, "is_bot", False)):
+            continue
+        if mine and str(getattr(r, "sender_id", "")) == mine:
+            continue
+        last_in = r
+        break
+    if last_in is None:
+        return ""
+    try:
+        ext = _json.loads(str(getattr(last_in, "ext_data", "") or "{}"))
+    except Exception:  # noqa: BLE001
+        return ""
+    ref = str((ext or {}).get("ref_msg_id") or "").strip()
+    if not ref:
+        return ""
+    try:
+        quoted = await DBChatMessage.filter(message_id=ref).first()
+    except Exception:  # noqa: BLE001
+        quoted = None
+    if quoted is None:
+        return f"## 用户在引用回复\n（引用的是一条系统找不到的旧消息，原 id {ref[:16]}）"
+    rn = max(1, min(6, int(range_n or 3)))
+    try:
+        neigh = await DBChatMessage.filter(
+            chat_key=_ctx.chat_key, id__gte=max(1, int(quoted.id) - rn),
+            id__lte=int(quoted.id) + rn,
+        ).order_by("id").limit(rn * 2 + 1).all()
+    except Exception:  # noqa: BLE001
+        neigh = [quoted]
+
+    def _fmt(r) -> str:
+        import datetime as _dt
+
+        ts = int(getattr(r, "send_timestamp", 0) or 0)
+        hhmm = _dt.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "--"
+        who = str(getattr(r, "sender_nickname", "") or getattr(r, "sender_name", "") or "?")[:12]
+        if mine and str(getattr(r, "sender_id", "")) == mine:
+            who = "你"
+        body = " ".join(str(getattr(r, "content_text", "") or "").split())[:160]
+        return f"[{hhmm}] {who}: {body}"
+
+    lines = [f"- {_fmt(quoted)}  ← 被引用的这条"]
+    around = [x for x in neigh if int(x.id) != int(quoted.id)]
+    for x in around:
+        lines.append(f"- {_fmt(x)}")
+    head = ("## 用户在引用回复\n"
+            "用户引用的内容如下（未改写原话），回答前先看懂这段语境，不要答非所问：")
+    return head + "\n" + "\n".join(lines)
+
+
 @plugin.mount_prompt_inject_method("persona_prompt")
 async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
     """统一注入：关系卡 + 阶梯记忆（含好感度门控）+ 好感度增减参考。
@@ -4263,6 +4331,18 @@ async def persona_prompt(_ctx: schemas.AgentCtx) -> str:
     现合并为单一插件，注入也合并为一块，避免职责重叠与隐式耦合。
     """
     parts: List[str] = []
+
+    # ⓪ 引用回复还原语境：用户引用了某条消息时，把那条及其前后原话带进来
+    if bool(getattr(config, "QUOTE_CONTEXT_ENABLED", True)):
+        try:
+            persona_quote_block = await _quote_context_block(
+                _ctx, int(getattr(config, "QUOTE_CONTEXT_RANGE", 3) or 3))
+            if persona_quote_block:
+                parts.append(persona_quote_block)
+                plugin.logger.info(
+                    f"[persona] 引用语境已还原: chat={_ctx.chat_key}")
+        except Exception as _q_exc:  # noqa: BLE001
+            plugin.logger.warning(f"[persona] 引用语境还原失败（忽略）: {_q_exc}")
 
     # 登记「本账号见过这个频道」，供关系记忆的素材扫描做归属过滤
     try:
