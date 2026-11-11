@@ -1452,10 +1452,20 @@ async def _life_ask(prompt: str, *, system: str, task: str = "",
     from nekro_agent.core.config import config as _na_cfg
     from nekro_agent.services.agent.openai import gen_openai_chat_response
 
+    # 日程生成是结构化 JSON 任务：聊天组开了 thinking 时会「思考把 max_tokens 吃满、
+    # 正文为空」→ 每天走兜底模板（实测 NA1 每天 00:00 都这样）。
+    # 因此空配置时优先落到「沉淀」组（同模型、关 thinking）；该组不存在就退回默认组。
     name = (str(model_group or "").strip()
             or str(getattr(config, "LIFE_MODEL_GROUP", "") or "").strip()
+            or "沉淀"
             or _na_cfg.USE_MODEL_GROUP)
-    group = _na_cfg.get_model_group_info(name)
+    try:
+        group = _na_cfg.get_model_group_info(name)
+    except Exception:  # noqa: BLE001
+        name = str(_na_cfg.USE_MODEL_GROUP or "")
+        group = _na_cfg.get_model_group_info(name)
+    if name != str(_na_cfg.USE_MODEL_GROUP or ""):
+        plugin.logger.debug(f"[life] 日程生成使用模型组: {name}")
     resp = await gen_openai_chat_response(
         model=group.CHAT_MODEL,
         messages=[
