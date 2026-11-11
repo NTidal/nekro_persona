@@ -4303,10 +4303,45 @@ async def _quote_context_block(_ctx: schemas.AgentCtx, range_n: int = 3,
         quoted = await DBChatMessage.filter(message_id=ref).first()
     except Exception:  # noqa: BLE001
         quoted = None
-    if quoted is None:
-        return f"## 用户在引用回复\n（引用的是一条系统找不到的旧消息，原 id {ref[:16]}）"
-
     rn = max(1, min(6, int(range_n or 3)))
+
+    if quoted is None:
+        # 兜底：被引用的消息不在库里（实测约 25% 的 bot 定向引用会这样）。
+        # 用「引用发生时刻之前最近几条带文字的原话」重建语境，好过只写一句"找不到"。
+        plugin.logger.info(
+            f"[persona] 引用语境：被引用消息不在库 ref={ref[:20]} chat={_ctx.chat_key}")
+        try:
+            import datetime as _dt
+
+            ts = int(getattr(last_in, "send_timestamp", 0) or 0)
+            lo = ts - 900
+            near = await DBChatMessage.filter(
+                chat_key=_ctx.chat_key, send_timestamp__gte=lo, send_timestamp__lte=ts,
+            ).order_by("-id").limit(40).all()
+        except Exception:  # noqa: BLE001
+            near = []
+
+        def _fmt2(r) -> str:
+            import datetime as _dt2
+
+            t2 = int(getattr(r, "send_timestamp", 0) or 0)
+            hhmm = _dt2.datetime.fromtimestamp(t2).strftime("%m-%d %H:%M") if t2 else "--"
+            who2 = str(getattr(r, "sender_nickname", "") or getattr(r, "sender_name", "") or "?")[:12]
+            if mine and str(getattr(r, "sender_id", "")) == mine:
+                who2 = "你"
+            body2 = " ".join(str(getattr(r, "content_text", "") or "").split())[:160]
+            return f"[{hhmm}] {who2}: {body2}"
+
+        picked = [x for x in near
+                  if not _is_media_text(getattr(x, "content_text", ""))][: max(3, rn * 2)]
+        picked.reverse()
+        head2 = ("## 用户在引用回复\n"
+                 f"用户引用了一条**系统里找不到的消息**（原 id {ref[:20]}）。"
+                 "下面是引用发生前最近的原话，供你判断语境；回答时不要答非所问：")
+        if not picked:
+            return head2 + "\n（引用前后也没有可用的文字记录）"
+        return head2 + "\n" + "\n".join(f"- {_fmt2(x)}" for x in picked)
+
     quoted_media = _is_media_text(getattr(quoted, "content_text", ""))
 
     def _fmt(r) -> str:
