@@ -1453,7 +1453,7 @@ async def _life_ask(prompt: str, *, system: str, task: str = "",
     from nekro_agent.services.agent.openai import gen_openai_chat_response
 
     # 日程生成是结构化 JSON 任务：聊天组开了 thinking 时会「思考把 max_tokens 吃满、
-    # 正文为空」→ 每天走兜底模板（实测 NA1 每天 00:00 都这样）。
+    # 正文为空」→ 每天走兜底模板（线上实测每天 00:00 都这样）。
     # 因此空配置时优先落到「沉淀」组（同模型、关 thinking）；该组不存在就退回默认组。
     name = (str(model_group or "").strip()
             or str(getattr(config, "LIFE_MODEL_GROUP", "") or "").strip()
