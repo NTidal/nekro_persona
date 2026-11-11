@@ -4255,12 +4255,23 @@ def _style_note() -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+_MEDIA_PREFIX = ("[图片]", "[语音]", "[表情]", "[文件]", "[视频]", "[CQ:", "[/")
+
+
+def _is_media_text(text: str) -> bool:
+    body = str(text or "").strip()
+    return (not body) or any(body.startswith(p) for p in _MEDIA_PREFIX)
+
+
 async def _quote_context_block(_ctx: schemas.AgentCtx, range_n: int = 3,
-                            msg_row=None) -> str:
+                               msg_row=None) -> str:
     """用户引用回复某条消息时，把它和它前后几条原话取出来做上下文。
 
     为什么必须做：引用回复的行为里，NA 历史只带 ref_msg_id（元数据），不带被引用内容；
     模型看不到"自己刚说过什么"，于是回答前言不搭后语。
+
+    被引用的若是图片/语音等媒体消息（content_text 只有占位符），
+    自动扩大搜索范围、跳过占位符，只取**带文字的**消息，保证还原出的语境有内容。
     """
     import json as _json
 
@@ -4294,14 +4305,9 @@ async def _quote_context_block(_ctx: schemas.AgentCtx, range_n: int = 3,
         quoted = None
     if quoted is None:
         return f"## 用户在引用回复\n（引用的是一条系统找不到的旧消息，原 id {ref[:16]}）"
+
     rn = max(1, min(6, int(range_n or 3)))
-    try:
-        neigh = await DBChatMessage.filter(
-            chat_key=_ctx.chat_key, id__gte=max(1, int(quoted.id) - rn),
-            id__lte=int(quoted.id) + rn,
-        ).order_by("id").limit(rn * 2 + 1).all()
-    except Exception:  # noqa: BLE001
-        neigh = [quoted]
+    quoted_media = _is_media_text(getattr(quoted, "content_text", ""))
 
     def _fmt(r) -> str:
         import datetime as _dt
@@ -4314,9 +4320,38 @@ async def _quote_context_block(_ctx: schemas.AgentCtx, range_n: int = 3,
         body = " ".join(str(getattr(r, "content_text", "") or "").split())[:160]
         return f"[{hhmm}] {who}: {body}"
 
+    if quoted_media:
+        # 媒体消息没有文字 → 扩大范围、跳过占位符，取前后各 rn 条**带文字**的消息
+        span = min(24, max(8, rn * 4))
+        try:
+            wide = await DBChatMessage.filter(
+                chat_key=_ctx.chat_key, id__gte=max(1, int(quoted.id) - span),
+                id__lte=int(quoted.id) + span,
+            ).order_by("id").limit(span * 2 + 1).all()
+        except Exception:  # noqa: BLE001
+            wide = [quoted]
+        before = [x for x in wide
+                  if int(x.id) < int(quoted.id) and not _is_media_text(getattr(x, "content_text", ""))][-rn:]
+        after = [x for x in wide
+                 if int(x.id) > int(quoted.id) and not _is_media_text(getattr(x, "content_text", ""))][:rn]
+        head = ("## 用户在引用回复\n"
+                f"用户引用的是**一条媒体消息**（{str(getattr(quoted, 'content_text', '') or '[媒体]')[:12]}），"
+                "没有文字内容；下面是它前后的原话，回答前先看懂这段语境，不要答非所问：\n"
+                f"- 〔被引用：{_fmt(quoted)}〕")
+        lines = [_fmt(x) for x in before + after]
+        return head + ("\n" + "\n".join(lines) if lines else "")
+
+    try:
+        neigh = await DBChatMessage.filter(
+            chat_key=_ctx.chat_key, id__gte=max(1, int(quoted.id) - rn),
+            id__lte=int(quoted.id) + rn,
+        ).order_by("id").limit(rn * 2 + 1).all()
+    except Exception:  # noqa: BLE001
+        neigh = [quoted]
     lines = [f"- {_fmt(quoted)}  ← 被引用的这条"]
-    around = [x for x in neigh if int(x.id) != int(quoted.id)]
-    for x in around:
+    for x in neigh:
+        if int(x.id) == int(quoted.id):
+            continue
         lines.append(f"- {_fmt(x)}")
     head = ("## 用户在引用回复\n"
             "用户引用的内容如下（未改写原话），回答前先看懂这段语境，不要答非所问：")
